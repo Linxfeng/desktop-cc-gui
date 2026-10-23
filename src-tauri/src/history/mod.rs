@@ -5,6 +5,8 @@ mod extract;
 pub mod reader;
 pub mod scanner;
 pub mod search;
+/// 本机 WSL 工作区的会话发现(在发行版内扫描,见模块文档)。
+pub mod wsl_sessions;
 
 pub use extract::{
     internal_frame_hash, parse_session_file, recordable_internal_frame_hash, scan_summary_file,

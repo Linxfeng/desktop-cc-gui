@@ -22,7 +22,16 @@ vi.mock("@/lib/ipc", async (importOriginal) => ({
     getAppSettings: vi.fn(async () => ({})),
     updateAppSettings: vi.fn(async () => {}),
     // 无工作区时 handleAddWorkspace 会走这条链路：登记目录 + 重读列表。
-    addWorkspace: vi.fn(async () => {}),
+    // 返回登记行本身：store.addWorkspace 把它的 path 交回调用方（后端会归一
+    // 路径，所以调用方不能用自己选中的原始路径）。
+    addWorkspace: vi.fn(async (path: string) => ({
+      id: "w-added",
+      path,
+      name: path,
+      lastOpenedAt: null,
+      sortOrder: 0,
+      groupId: null,
+    })),
     listWorkspaces: vi.fn(async () => []),
 
   
@@ -209,6 +218,44 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0]?.labelSuffix).toBe("WSL");
   });
 
+  it("本机 WSL 工作区的徽标是发行版名,不需要插件", async () => {
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [
+          {
+            ...WS,
+            id: "wsl",
+            path: "\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\proj",
+            name: "proj",
+          },
+        ],
+        sessions: [],
+      });
+    });
+    expect(captured[0]?.labelSuffix).toBe("Ubuntu-24.04");
+    // `\\wsl$\` 旧别名与正斜杠混写同样识别。
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [{ ...WS, id: "wsl", path: "//wsl$/Debian/home/u/proj" }],
+      });
+    });
+    expect(captured[0]?.labelSuffix).toBe("Debian");
+    // 设计稿 §5.9:钩子槽位只有一个,本机 UNC 工作区由宿主给徽标,插件
+    // 钩子不得覆盖(装了「WSL 管理器」插件后仍显示发行版名)。
+    await act(async () => {
+      window.__ccguiWorkspaceUI?.registerHooks({
+        allowedEngines: () => null,
+        labelSuffix: () => "PLUGIN",
+      });
+    });
+    expect(captured[0]?.labelSuffix).toBe("Debian");
+    // 非 WSL 工作区仍以插件后缀为准(宿主没有内建徽标)。
+    await act(async () => {
+      useChatStore.setState({ workspaces: [WS], sessions: [] });
+    });
+    expect(captured[0]?.labelSuffix).toBe("PLUGIN");
+  });
+
   it("maps retrying state to the matching sidebar thread", async () => {
     await act(async () => {
       useChatStore.setState({
@@ -379,6 +426,35 @@ describe("首启无工作区时的新建会话", () => {
     });
     expect(useChatStore.getState().openTabs).toEqual([
       { engine: "codex", sessionId: null, workspacePath: picked },
+    ]);
+  });
+
+  it("按登记行归一化后的路径开会话（\\wsl$ 与 \\wsl.localhost 不是同一个字符串）", async () => {
+    const picked = "\\\\wsl$\\Ubuntu-24.04\\home\\me";
+    const registered = "\\\\wsl.localhost\\Ubuntu-24.04\\home\\me";
+    vi.mocked(platform.pickDirectory).mockResolvedValue(picked);
+    vi.mocked(ipc.addWorkspace).mockResolvedValueOnce({
+      id: "w-wsl",
+      path: registered,
+      name: "me",
+      lastOpenedAt: null,
+      sortOrder: 0,
+      groupId: null,
+    });
+
+    await act(async () => {
+      sidebar.handleNewSession();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(ipc.addWorkspace).toHaveBeenCalledWith(picked, undefined);
+    // 绑在原始路径上的会话存下来后对不上任何工作区行（后端归一化过），
+    // 侧栏就再也列不出它——页签必须用登记行交回的路径。
+    expect(useChatStore.getState().active?.workspacePath).toBe(registered);
+    expect(useChatStore.getState().openTabs).toEqual([
+      { engine: "codex", sessionId: null, workspacePath: registered },
     ]);
   });
 

@@ -36,6 +36,8 @@ import { EmptyState } from "@/components/base/empty-state";
 import { parseUsage } from "../usage";
 import { rememberContextWindow, resolveContextMax } from "../context-window-memory";
 import { useWorkspaceUIHooks, workspaceAllowedEngines } from "../workspace-ui-bridge";
+import { useWslEngineAvailability } from "./use-wsl-engine-availability";
+import { isWslUncWorkspace } from "@/lib/wsl-path";
 import { ConversationModePane, ConversationModePicker } from "@/features/plugins/conversation/ConversationModeHost";
 import { SessionScope } from "../split/session-scope";
 import { usePlanReviewGateActive } from "./PlanReviewDock";
@@ -148,6 +150,7 @@ function useConversationMenus({
   refreshModels,
   loadingEngines,
   allowedEngines,
+  enginesDelegated,
 }: {
   engines: EngineInfo[];
   engineInfo: EngineInfo | undefined;
@@ -174,6 +177,9 @@ function useConversationMenus({
   loadingEngines: readonly string[];
   /** 接管工作区(桥返回非 null):仅列允许表内引擎(null = 不过滤)。 */
   allowedEngines: string[] | null;
+  /** 判断权已交给后端(本机 WSL 或插件桥),即使允许表暂时为空也不能
+   *  回落到本机 `command -v`(§10 P1-1)。 */
+  enginesDelegated: boolean;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -184,8 +190,12 @@ function useConversationMenus({
   // 拖动时这里通过 useCliNavOrder 的 change 事件同步更新。
   const cliNavOrder = useCliNavOrder();
   const cliOptions = useMemo(
-    () => orderEngineOptions(filterEngineOptions(engines, allowedEngines, t), cliNavOrder),
-    [engines, allowedEngines, t, cliNavOrder],
+    () =>
+      orderEngineOptions(
+        filterEngineOptions(engines, allowedEngines, t, enginesDelegated),
+        cliNavOrder,
+      ),
+    [engines, allowedEngines, t, cliNavOrder, enginesDelegated],
   );
   // Every CLI is switched off in settings: swap the picker for a placeholder
   // that deep-links to the CLI config page.
@@ -477,17 +487,35 @@ export const ChatConversation = memo(function ChatConversation({
   // 插件桥给出该工作区的引擎允许表(meta 形状留在插件侧,宿主不解释);
   // null = 非接管工作区,按本机探针展示。
   const uiHooks = useWorkspaceUIHooks();
-  const allowedEngines = useMemo(
+  const pluginAllowed = useMemo(
     // uiHooks 进依赖:插件 activate/热重载换 hooks 后允许表及时重算。
     () => workspaceAllowedEngines(active?.workspacePath),
     [uiHooks, active?.workspacePath],
   );
+  // 本机 WSL 工作区:可用性改由发行版内探测决定(设计稿 §5.4)。
+  // 设计稿 §5.9:钩子槽位只有一个,宿主内建判断不得注册进去,所以在这里
+  // 先判断是不是本机 UNC —— 是则用宿主结果,否则交给插件钩子。
+  // 路径形似 UNC 还不够:带 `meta.wsl` 的插件工作区仍归插件/SSH(§10 P1-3)。
+  const activeWorkspaceMeta = useMemo(
+    () => workspaces.find((w) => w.path === active?.workspacePath)?.meta,
+    [workspaces, active?.workspacePath],
+  );
+  const wslWorkspace =
+    isWslUncWorkspace(active?.workspacePath) && !activeWorkspaceMeta?.wsl;
+  const wslEngines = useWslEngineAvailability(
+    wslWorkspace ? active?.workspacePath : undefined,
+  );
+  const allowedEngines = wslWorkspace ? wslEngines : pluginAllowed;
+  // 探测未完成/失败时 wslEngines 为 null,但判断权仍在本机 WSL 后端:
+  // 不能让 filterEngineOptions 回落到本机探针,否则会隐藏发行版内的 CLI。
+  const enginesDelegated = wslWorkspace || allowedEngines !== null;
   const { addMenu, cliMenu, permissionMenu, noEnabledEngines } =
     useConversationMenus({
       engines,
       engineInfo,
       activeEngine,
       allowedEngines,
+      enginesDelegated,
       modelsByEngine,
       onPickFiles: handleAddAttachments,
       onPickSkills: handlePickSkills,

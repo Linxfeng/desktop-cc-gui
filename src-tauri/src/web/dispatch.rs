@@ -871,13 +871,16 @@ pub(super) async fn dispatch(
         }
         "add_workspace" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::history::reader::add_workspace(
-                app.state(),
-                a.path,
-                a.meta,
-                a.kind,
-                a.parent_id,
-            ))
+            ser(
+                crate::history::reader::add_workspace(
+                    app.state(),
+                    a.path,
+                    a.meta,
+                    a.kind,
+                    a.parent_id,
+                )
+                .await,
+            )
         }
         "plugin_add_workspace" => {
             let a: PluginAddWorkspaceArgs = parse_args(&raw)?;

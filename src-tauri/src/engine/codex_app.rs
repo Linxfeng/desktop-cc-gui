@@ -1978,6 +1978,7 @@ pub(crate) async fn run_plan_decision(
         stdin: None,
         questions: Arc::new(Mutex::new(HashMap::new())),
         plans: Arc::new(Mutex::new(HashMap::new())),
+        wsl_local: None,
     };
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
@@ -2218,6 +2219,7 @@ mod tests {
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
                 plans: Arc::new(Mutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
         let core = TurnCore {

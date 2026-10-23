@@ -42,6 +42,11 @@ mod qoder_session;
 mod reader;
 mod registry;
 pub mod resolve;
+pub mod wsl_availability;
+pub mod wsl_index;
+pub mod wsl_notice;
+pub mod wsl_path;
+pub mod wsl_probe;
 pub mod wsl_transport;
 
 pub(crate) use resolve::command_for_binary;
@@ -513,6 +518,28 @@ struct Launch {
     built: BuiltCommand,
     engine_impl: Box<dyn Engine>,
 }
+/// 额外的可读目录(用户在 Windows 侧授权的根目录)只在**本机**引擎上有效。
+///
+/// WSL 工作区里 CLI 跑在发行版内,`C:\Users\…` 在那里不是一个路径,原样塞进
+/// `--add-dir` 只会让远端 CLI 收到一个不存在的目录;`/mnt/c/…` 能不能用又
+/// 取决于 `wsl.conf` 的 automount,不能替用户假设。所以 WSL 启动只发 Linux
+/// 绝对路径;Windows 授权仍留在 db 里,回到本机工作区照旧生效。
+fn launch_additional_dirs(dirs: Vec<String>, wsl: bool) -> Vec<String> {
+    dirs.into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| {
+            if d.is_empty() {
+                false
+            } else if wsl {
+                d.starts_with('/')
+            } else {
+                Path::new(d).is_absolute()
+            }
+        })
+        .take(32)
+        .collect()
+}
+
 fn prepare_launch(
     engine: &str,
     workspace_path: &str,
@@ -600,12 +627,7 @@ fn prepare_launch(
         permission: permission.filter(|p| !p.trim().is_empty()),
         // Cap defensively: the list lands on a command line, and a
         // hand-edited db should not produce an argv bomb.
-        additional_dirs: additional_dirs
-            .into_iter()
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
-            .take(32)
-            .collect(),
+        additional_dirs: launch_additional_dirs(additional_dirs, wsl),
         provider_id,
         // Only honored by engines that can actually mount the driver.
         computer_use: computer_use.filter(|on| *on && engine_impl.supports_computer_use()),
@@ -964,6 +986,7 @@ async fn send_message_inner_with_sink(
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
                 plans: Arc::new(Mutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
     }
@@ -1055,8 +1078,43 @@ async fn send_reserved(
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<SendResult, String> {
-    // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
-    let wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path);
+    // WSL 工作区:引擎进程在发行版内执行(见 wsl_transport)。本机 UNC 工作区
+    // 走 `wsl.exe` 后端,插件 meta.wsl 走既有 ssh 后端。
+    let mut wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path)?;
+    // 本机后端要先有探测结果(发行版内 CLI 绝对路径 + 交互 PATH):裸命令名
+    // 在 nvm 环境里找不到(V2)。首次约 2.4s,之后走进程内缓存。
+    if let Some(tp) = wsl_tp.as_mut().filter(|tp| tp.is_local()) {
+        wsl_transport::ensure_local_probe(tp).await.map_err(|code| {
+            // 稳定错误前缀 → 前端映射成 i18n 文案(与 wsl_probe::ProbeError 同源)。
+            format!("{code}")
+        })?;
+        // §5.4「失效」的另一半:缓存里的 CLI 路径可能已失效(CLI 被卸载、
+        // 改名、去掉执行位),而缓存 TTL 是 5 分钟。启动器只在**跑完**之后
+        // 才能报 127/126,那时整条链路已建、事件流已收敛,重跑要重建一切;
+        // 这里在 spawn 之前先验证一次,代价只是命令已解析、进程尚未起。
+        // 刚探测过的路径直接信任:每个回合固定 +0.7s 不值得(§10 P1-17)。
+        let freshly_probed = crate::engine::wsl_probe::probe_age(&tp.distro)
+            .is_some_and(|age| age < std::time::Duration::from_secs(60));
+        if !freshly_probed {
+            if let Err(code) = wsl_transport::verify_local_cli(tp, &engine).await {
+                wsl_transport::invalidate_local_probe(tp);
+                let mut code = Some(code);
+                if let Some(tp) = wsl_tp.as_mut() {
+                    // 重新探测一次后重试一次:装好/改回 CLI 的用户不必手动点
+                    // 「重新检测」。仍失败就把这一次的原因交给用户(§5.8)。
+                    match wsl_transport::ensure_local_probe(tp).await {
+                        Ok(_) => {
+                            code = wsl_transport::verify_local_cli(tp, &engine).await.err();
+                        }
+                        Err(probe_error) => code = Some(probe_error),
+                    }
+                }
+                if let Some(code) = code {
+                    return Err(code);
+                }
+            }
+        }
+    }
     let mut launch = prepare_launch(
         &engine,
         &workspace_path,
@@ -1099,42 +1157,48 @@ async fn send_reserved(
         }
         return send_host_stream(state, launch, engine, run_id, killed, reader_abort).await;
     }
-    let (mut command, extra_cleanup, skip_local_cwd) = match &wsl_tp {
-        Some(tp) => {
-            // 注入的是本机 .omp/mcp.json 与本机 exe:WSL 远端 omp 都用不上,
-            // 先恢复再拒绝,不留下被改过的工作区文件。
-            if let Some(restore) = &launch.built.mcp_restore {
-                restore.restore();
-                return Err("操作电脑/记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
-            }
-            // 依赖本机 staging 文件的引擎(grok 等 cleanup_files 非空):
-            // 远端 CLI 读不到本机文件,直接拒绝而非跑出莫名其妙的失败;
-            // 已写盘的 staging 文件顺手清掉,不 strand。
-            if !launch.built.cleanup_files.is_empty() {
-                for path in &launch.built.cleanup_files {
-                    let _ = std::fs::remove_file(path);
+    // wsl_launch:本机后端的退出码翻译(reader 结束路径)用它判定 61/126/127,
+    // 并把「CLI 已失效」反馈到探测缓存;ssh 后端为 None。正常结束时读取任务
+    // 也用它拿到发行版名,删掉发行版内的启动器与 pidfile。
+    let (mut command, extra_cleanup, skip_local_cwd, wsl_local, wsl_launch) =
+        match &wsl_tp {
+            Some(tp) => {
+                // 注入的是本机 .omp/mcp.json 与本机 exe:WSL 远端 omp 都用不上,
+                // 先恢复再拒绝,不留下被改过的工作区文件。
+                if let Some(restore) = &launch.built.mcp_restore {
+                    restore.restore();
+                    return Err("操作电脑/记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
                 }
-                return Err(format!(
-                    "引擎 {engine} 不支持远程工作区(WSL):依赖本机临时文件"
-                ));
-            }
-            match wsl_transport::wrap(launch.built.command, tp).await {
-                Ok(wrapped) => (
-                    wrapped.command,
-                    wrapped.cleanup_files,
-                    wrapped.skip_local_cwd,
-                ),
-                Err(error) => {
-                    // wrap 失败(ssh 上传失败等)同样不许 strand staging 文件。
+                // 依赖本机 staging 文件的引擎(grok 等 cleanup_files 非空):
+                // 远端 CLI 读不到本机文件,直接拒绝而非跑出莫名其妙的失败;
+                // 已写盘的 staging 文件顺手清掉,不 strand。
+                if !launch.built.cleanup_files.is_empty() {
                     for path in &launch.built.cleanup_files {
                         let _ = std::fs::remove_file(path);
                     }
-                    return Err(error);
+                    return Err(format!(
+                        "引擎 {engine} 不支持远程工作区(WSL):依赖本机临时文件"
+                    ));
+                }
+                match wsl_transport::wrap(launch.built.command, tp, &run_id).await {
+                    Ok(wrapped) => (
+                        wrapped.command,
+                        wrapped.cleanup_files,
+                        wrapped.skip_local_cwd,
+                        wrapped.local_run,
+                        wrapped.local_launch,
+                    ),
+                    Err(error) => {
+                        // wrap 失败(ssh 上传失败等)同样不许 strand staging 文件。
+                        for path in &launch.built.cleanup_files {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return Err(error);
+                    }
                 }
             }
-        }
-        None => (launch.built.command, Vec::new(), false),
-    };
+            None => (launch.built.command, Vec::new(), false, None, None),
+        };
     let mut cleanup_files = launch.built.cleanup_files;
     cleanup_files.extend(extra_cleanup);
     // 本地 env 不跨 ssh:WSL 分支的 command 是本地 ssh 进程,apply 无意义
@@ -1173,8 +1237,11 @@ async fn send_reserved(
     // is a stale launchd snapshot and an absolute shim path alone cannot
     // find the interpreter. Same dirs find_cli_binary searched; appended
     // after the process PATH, so normal resolution order is unchanged.
-    // Harmless for the WSL/ssh-wrapped command (local env doesn't cross).
-    command.env("PATH", resolve::cli_search_path());
+    // 本机 WSL 后端不能带 Windows PATH:WSL 会把它翻译成 `/mnt/c/…` 追加到
+    // Linux PATH,短调用可能解析到 Windows 同名程序(§10 P1-14)。
+    if !wsl_tp.as_ref().is_some_and(|tp| tp.is_local()) {
+        command.env("PATH", resolve::cli_search_path());
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -1183,6 +1250,15 @@ async fn send_reserved(
             cleanup_staged_files(&cleanup_files);
             if let Some(restore) = &launch.built.mcp_restore {
                 restore.restore();
+            }
+            // 启动器在 spawn 之前就已落到发行版 `/tmp`(本机 WSL 分支):
+            // spawn 失败时没有读取任务会接手清理,这里自己删掉。
+            if let Some(launch_wsl) = wsl_launch.as_ref() {
+                let _ = wsl_transport::cleanup_local_launcher(
+                    &launch_wsl.distro,
+                    &run_id,
+                )
+                .await;
             }
             return Err(format!("failed to spawn {}: {error}", launch.bin));
         }
@@ -1218,6 +1294,11 @@ async fn send_reserved(
                 if let Some(restore) = &launch.built.mcp_restore {
                     restore.restore();
                 }
+                // 同上,但进程可能已经起来了:除了删启动器,还要按会话回收,
+                // 否则这条没有 registry 条目的运行会留下 Linux 侧进程。
+                if let Some(launch_wsl) = wsl_launch.as_ref() {
+                    let _ = wsl_transport::kill_local_run(&launch_wsl.distro, &run_id, true).await;
+                }
                 return Err("missing stdout/stderr pipe after spawn".to_string());
             }
         }
@@ -1234,6 +1315,7 @@ async fn send_reserved(
             stdin: kept_stdin.clone(),
             questions: Arc::clone(&questions),
             plans: Arc::clone(&plans),
+            wsl_local: wsl_local.clone(),
         },
     );
     if let Some(session_id) = launch.built.preassigned_session_id.as_deref() {
@@ -1248,6 +1330,7 @@ async fn send_reserved(
                 stdin: kept_stdin.clone(),
                 questions: Arc::clone(&questions),
                 plans: Arc::clone(&plans),
+                wsl_local: wsl_local.clone(),
             },
         );
     }
@@ -1299,6 +1382,7 @@ async fn send_reserved(
         mcp_restore: launch.built.mcp_restore,
         stderr_buf,
         stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+        wsl_launch,
         #[cfg(windows)]
         _tree_guard: tree_guard,
     };
@@ -1335,6 +1419,7 @@ async fn send_host_stream(
         stdin: None,
         questions: Arc::new(Mutex::new(HashMap::new())),
         plans: Arc::new(Mutex::new(HashMap::new())),
+        wsl_local: None,
     };
     state.processes.insert(run_id.clone(), entry.clone());
     if let Some(session_id) = launch.req.session_id.as_deref() {
@@ -2622,6 +2707,31 @@ mod permission_tests {
     }
 
     #[test]
+    fn wsl_launch_drops_windows_granted_dirs() {
+        // WSL 工作区里 CLI 在发行版内跑:Windows 授权根目录在那边不存在,
+        // 发给它只会让 CLI 收到一个无效的 `--add-dir`。
+        let dirs = vec![
+            "C:\\Users\\me\\shared".to_string(),
+            "/home/me/shared".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(
+            launch_additional_dirs(dirs.clone(), true),
+            vec!["/home/me/shared"]
+        );
+
+        // 本机路径的判定沿用平台语义(Windows 上 `C:\…`,其他地方 `/…`),
+        // 原有行为不变。
+        #[cfg(windows)]
+        assert_eq!(
+            launch_additional_dirs(dirs, false),
+            vec!["C:\\Users\\me\\shared"]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(launch_additional_dirs(dirs, false), vec!["/home/me/shared"]);
+    }
+
+    #[test]
     fn grok_always_approves_regardless_of_request() {
         let e = grok::GrokEngine;
         for mode in [
@@ -2796,6 +2906,7 @@ mod retry_lifecycle_tests {
             mcp_restore: None,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            wsl_launch: None,
             // Windows-only guard field the production constructor fills; this
             // test spawns a plain child, so there is no job object to hold.
             #[cfg(windows)]
@@ -2847,6 +2958,7 @@ mod retry_lifecycle_tests {
             mcp_restore: None,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            wsl_launch: None,
             // See the pipe-retry constructor above.
             #[cfg(windows)]
             _tree_guard: None,
@@ -3060,6 +3172,7 @@ mod retry_lifecycle_tests {
                 stdin: Some(stdin),
                 questions: Arc::new(Mutex::new(HashMap::new())),
                 plans: Arc::new(Mutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
         registry.set_awaiting_followup(session_id, run_id, test_followup_prefs());
@@ -3295,6 +3408,7 @@ mod retry_lifecycle_tests {
                     stdin: None,
                     questions: Arc::new(Mutex::new(HashMap::new())),
                     plans: Arc::new(Mutex::new(HashMap::new())),
+                    wsl_local: None,
                 },
             );
         }
@@ -3319,6 +3433,7 @@ mod retry_lifecycle_tests {
             mcp_restore: None,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            wsl_launch: None,
             // See the pipe-retry constructor above.
             #[cfg(windows)]
             _tree_guard: None,
@@ -3493,6 +3608,7 @@ mod plan_respond_tests {
                 stdin,
                 questions: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 plans: Arc::new(Mutex::new(plans)),
+                wsl_local: None,
             },
         );
     }

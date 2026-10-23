@@ -214,6 +214,11 @@ pub struct AppSettings {
     /// Last screen position of the pet overlay, in logical desktop pixels.
     #[serde(default)]
     pub pet_position: Option<PetPosition>,
+    /// 本机 WSL 发行版内的 CLI 绝对路径覆盖。键形如
+    /// `Ubuntu-24.04:codex`,值是发行版内路径(见
+    /// [`wsl_engine_overrides`]);探测不到的 CLI 可在这里手工指定。
+    #[serde(default)]
+    pub wsl_engine_paths: HashMap<String, String>,
     /// Per-engine binary overrides. flatten keeps the legacy flat shape
     /// (`"claudeBin": …`) the frontend depends on; keys stay camelCase and
     /// unknown extra fields round-trip untouched.
@@ -423,6 +428,7 @@ impl Default for AppSettings {
             pet_id: default_pet_id(),
             pet_scale: default_pet_scale(),
             pet_position: None,
+            wsl_engine_paths: HashMap::new(),
             bin_overrides: HashMap::new(),
         }
     }
@@ -433,6 +439,175 @@ impl AppSettings {
         self.bin_overrides
             .get(&bin_override_key(engine))
             .and_then(Value::as_str)
+    }
+}
+
+/// 设置 → WSL 里手工指定的发行版内 CLI 路径(§5.9)。
+///
+/// 与本机 bin override 分开:值是**发行版内**的绝对路径,由
+/// [`super::engine::wsl_transport`] 在解析 CLI 时优先于探测结果使用 —— 用户
+/// 显式指定的路径不能被 `command -v` 找到的旧版本盖掉。
+///
+/// 写入即校验:不合规的键/值整条拒绝并说明原因,不落盘一个永远读不出来的
+/// 条目。清空(`path` 为空)表示删除该覆盖,退回探测结果。
+/// 稳定错误前缀:设置页的 CLI 路径覆盖不合法。细节是
+/// [`OverrideReject::reason`] 的键后缀,前端映射成 `wsl.cliPathReason.*`。
+const WSL_CLI_PATH_INVALID_PREFIX: &str = "WSL_CLI_PATH_INVALID:";
+
+#[tauri::command]
+pub fn set_wsl_engine_path(
+    distro: String,
+    engine: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    set_wsl_engine_path_at(
+        &crate::paths::settings_path(),
+        distro.trim(),
+        engine.trim(),
+        path.as_deref(),
+    )
+}
+
+/// Read→validate→modify→persist for one CLI override. Holds the write lock
+/// across the whole cycle and uses [`persist_settings_locked`] (not
+/// `persist_settings`) so the non-re-entrant lock is taken exactly once.
+fn set_wsl_engine_path_at(
+    settings_path: &std::path::Path,
+    distro: &str,
+    engine: &str,
+    path: Option<&str>,
+) -> Result<(), String> {
+    let key = format!("{distro}:{engine}");
+    let value = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(value) => Some(
+            wsl_engine_override_entry(&key, value)
+                .map_err(|reason| format!("{WSL_CLI_PATH_INVALID_PREFIX}{}", reason.reason()))?,
+        ),
+        None => {
+            // 删除:只校验键的形状(不需要值),否则"删不掉"会表现得像
+            // "删掉了"。
+            validate_wsl_override_key(&key)
+                .map_err(|reason| format!("{WSL_CLI_PATH_INVALID_PREFIX}{}", reason.reason()))?;
+            None
+        }
+    };
+    let _guard = settings_write_lock();
+    // 损坏的设置文件不能当作空设置覆盖:返回错误,让用户先修复文件。
+    let mut settings = read_settings_at(settings_path)?;
+    match value {
+        Some(value) => {
+            settings.wsl_engine_paths.insert(key, value);
+        }
+        None => {
+            if settings.wsl_engine_paths.remove(&key).is_none() {
+                return Ok(());
+            }
+        }
+    }
+    persist_settings_locked(&mut settings, settings_path)
+}
+
+/// 设置 → WSL 展示用:某发行版已登记的 CLI 覆盖(引擎 id → 绝对路径)。
+#[tauri::command]
+pub fn get_wsl_engine_paths(distro: String) -> Result<Vec<(String, String)>, String> {
+    let settings = read_settings()?;
+    Ok(wsl_engine_overrides(&settings, distro.trim()))
+}
+
+/// 某发行版的 CLI 路径覆盖:`engine id → 发行版内绝对路径`。
+///
+/// 键形如 `Ubuntu-24.04:codex`(发行版名本身允许 `._- ` 与字母数字,不含
+/// `:`,所以第一个 `:` 就是分隔符)。值在写入时校验,读侧仍过一遍
+/// [`wsl_engine_override_entry`] —— 设置文件可能被手工改过。
+pub(crate) fn wsl_engine_overrides(settings: &AppSettings, distro: &str) -> Vec<(String, String)> {
+    let prefix = format!("{distro}:");
+    settings
+        .wsl_engine_paths
+        .iter()
+        .filter_map(|(key, value)| {
+            let engine = key.strip_prefix(&prefix)?;
+            let path = wsl_engine_override_entry(key, value).ok()?;
+            Some((engine.to_string(), path))
+        })
+        .collect()
+}
+
+/// 校验并规范一条发行版内 CLI 覆盖:返回去掉首尾空白的绝对路径。
+///
+/// 路径作为独立 argv 交给 `--exec`(不经 shell),空格/中文都合法;拒绝
+/// `/mnt/` 下的 Windows 程序与相对路径 —— 前者会被 `wsl.exe` 当 Windows
+/// 可执行文件启动,后者取决于启动时 cwd,两者都不是用户想指定的东西。
+fn wsl_engine_override_entry(key: &str, value: &str) -> Result<String, OverrideReject> {
+    validate_wsl_override_key(key)?;
+    let trimmed = value.trim();
+    if !trimmed.starts_with('/') {
+        return Err(OverrideReject::NotAbsolute);
+    }
+    if trimmed.starts_with("/mnt/") {
+        return Err(OverrideReject::MntPath);
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(OverrideReject::ControlChars);
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `<distro>:<engine>` 键的形状校验(写入与删除两侧共用):删一条形状不对
+/// 的键永远删不掉,却会返回成功 —— 逐项校验不能只挂在写入那一侧。
+fn validate_wsl_override_key(key: &str) -> Result<(), OverrideReject> {
+    let (distro, engine) = key.split_once(':').ok_or(OverrideReject::BadKey)?;
+    if !crate::engine::wsl_path::is_safe_distro(distro) {
+        return Err(OverrideReject::BadDistro);
+    }
+    if engine.is_empty()
+        || !engine
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(OverrideReject::BadEngine);
+    }
+    Ok(())
+}
+
+/// 一条 CLI 覆盖被拒的原因。
+///
+/// 设置命令把它翻成稳定错误码(`WSL_CLI_PATH_INVALID:<reason>`),前端据此
+/// 走 i18n;设置文件的整体校验(`persist_settings_to`)仍用 [`Display`] 拼
+/// 人类可读的告警 —— 两条通道的读者不同,不能共用一句英文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideReject {
+    NotAbsolute,
+    MntPath,
+    ControlChars,
+    BadKey,
+    BadDistro,
+    BadEngine,
+}
+
+impl OverrideReject {
+    /// 前端 `wsl.cliPathReason.*` 的键后缀。
+    fn reason(self) -> &'static str {
+        match self {
+            OverrideReject::NotAbsolute => "notAbsolute",
+            OverrideReject::MntPath => "mntPath",
+            OverrideReject::ControlChars => "controlChars",
+            OverrideReject::BadKey => "badKey",
+            OverrideReject::BadDistro => "badDistro",
+            OverrideReject::BadEngine => "badEngine",
+        }
+    }
+}
+
+impl std::fmt::Display for OverrideReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OverrideReject::NotAbsolute => write!(f, "not an absolute path inside the distro"),
+            OverrideReject::MntPath => write!(f, "/mnt paths launch Windows binaries"),
+            OverrideReject::ControlChars => write!(f, "contains control characters"),
+            OverrideReject::BadKey => write!(f, "key must be <distro>:<engine>"),
+            OverrideReject::BadDistro => write!(f, "unsupported distro name"),
+            OverrideReject::BadEngine => write!(f, "unsupported engine id"),
+        }
     }
 }
 
@@ -536,12 +711,17 @@ pub(crate) fn apply_codex_home(settings: &AppSettings) {
 }
 
 pub fn read_settings() -> Result<AppSettings, String> {
-    let path = crate::paths::settings_path();
+    read_settings_at(&crate::paths::settings_path())
+}
+
+/// Path-parameterised read used by the real command and by tests that must
+/// not touch the user's settings file.
+fn read_settings_at(path: &std::path::Path) -> Result<AppSettings, String> {
     if !path.exists() {
         return Ok(AppSettings::default());
     }
     let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     if content.trim().is_empty() {
         return Ok(AppSettings::default());
     }
@@ -788,7 +968,17 @@ pub fn update_app_settings<R: tauri::Runtime>(
 /// fields as an error, even though the sanitized snapshot was committed.
 pub fn persist_settings(settings: &mut AppSettings) -> Result<(), String> {
     let _guard = settings_write_lock();
-    match persist_settings_committed(settings)? {
+    persist_settings_locked(settings, &crate::paths::settings_path())
+}
+
+/// Write half for callers that already hold [`settings_write_lock`].
+/// `persist_settings` itself must not be called while holding the lock:
+/// `parking_lot::Mutex` is not re-entrant and the command would never return.
+fn persist_settings_locked(
+    settings: &mut AppSettings,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    match persist_settings_to(settings, path)? {
         Some(warning) => Err(warning),
         None => Ok(()),
     }
@@ -874,6 +1064,17 @@ fn persist_settings_to(
             }
         }
     }
+    // 发行版内 CLI 覆盖:键是 `发行版:CLI`,值是发行版内绝对路径。校验失败
+    // 的条目丢弃并在同一通道里报告,不阻断其余设置落盘。
+    settings.wsl_engine_paths.retain(|key, value| {
+        match wsl_engine_override_entry(key, value) {
+            Ok(_) => true,
+            Err(reason) => {
+                rejected.push(format!("wslEnginePaths.{key}: {reason}"));
+                false
+            }
+        }
+    });
     let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     // Reject before persisting: an invalid proxy URL must not be saved (the
     // frontend rolls its drafts back on this error).
@@ -1009,6 +1210,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Regression for the re-entrant write lock: this call must return, not
+    /// deadlock, and must persist/remove exactly one override.
+    #[test]
+    fn wsl_engine_path_override_round_trips_without_self_deadlock() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        set_wsl_engine_path_at(
+            &path,
+            "Ubuntu-24.04",
+            "claude",
+            Some("/home/me/bin/claude"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_settings_at(&path)
+                .unwrap()
+                .wsl_engine_paths
+                .get("Ubuntu-24.04:claude")
+                .map(String::as_str),
+            Some("/home/me/bin/claude")
+        );
+        set_wsl_engine_path_at(&path, "Ubuntu-24.04", "claude", None).unwrap();
+        assert!(read_settings_at(&path).unwrap().wsl_engine_paths.is_empty());
+        assert!(set_wsl_engine_path_at(
+            &path,
+            "Ubuntu-24.04",
+            "claude",
+            Some("/mnt/c/claude")
+        )
+        .is_err());
     }
 
     fn insert_workspace(db: &crate::db::Db, id: &str, path: &str) {

@@ -66,6 +66,28 @@ const EMPTY_META = {
   remote: true,
 } as const;
 
+/** 一条外部行 → SessionMeta(字段类型防御 + 缺省补全)。必填字段缺失或
+ *  类型不合规时返回 null。宿主内建源(本机 WSL)与插件源共用这条路径,
+ *  侧栏因此只有一种远程行形态。 */
+export function externalRowToMeta(row: ExternalSessionRow): SessionMeta | null {
+  if (!row?.engine || !row?.sessionId || !row?.workspacePath) return null;
+  // 插件输入的字段类型防御:不合规字段回落缺省,不透传进 SessionMeta。
+  const updatedAt = typeof row.updatedAt === "number" ? row.updatedAt : null;
+  const title = typeof row.title === "string" && row.title ? row.title : row.sessionId.slice(0, 8);
+  const remotePath =
+    typeof row.remotePath === "string" && row.remotePath ? row.remotePath : undefined;
+  return {
+    engine: row.engine,
+    sessionId: row.sessionId,
+    workspacePath: row.workspacePath,
+    ...EMPTY_META,
+    fileMtimeMs: updatedAt ?? 0,
+    title,
+    updatedAt,
+    remotePath,
+  };
+}
+
 /** 收集所有源的行并补全成 SessionMeta。任一源抛错只丢该源,不上抛。 */
 export async function listExternalSessionMetas(): Promise<SessionMeta[]> {
   if (sources.size === 0) return [];
@@ -90,21 +112,8 @@ export async function listExternalSessionMetas(): Promise<SessionMeta[]> {
       const key = `${row.engine}/${row.sessionId}/${row.workspacePath}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      // 插件输入的字段类型防御:不合规字段回落缺省,不透传进 SessionMeta。
-      const updatedAt = typeof row.updatedAt === "number" ? row.updatedAt : null;
-      const title = typeof row.title === "string" && row.title ? row.title : row.sessionId.slice(0, 8);
-      const remotePath =
-        typeof row.remotePath === "string" && row.remotePath ? row.remotePath : undefined;
-      out.push({
-        engine: row.engine,
-        sessionId: row.sessionId,
-        workspacePath: row.workspacePath,
-        ...EMPTY_META,
-        fileMtimeMs: updatedAt ?? 0,
-        title,
-        updatedAt,
-        remotePath,
-      });
+      const meta = externalRowToMeta(row);
+      if (meta) out.push(meta);
     }
   }
   return out;

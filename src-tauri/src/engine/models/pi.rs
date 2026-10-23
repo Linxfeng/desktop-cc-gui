@@ -6,12 +6,25 @@ pub(super) fn configured_models(engine: &str) -> Result<Vec<EngineModel>, String
         return Ok(Vec::new());
     };
     let value = crate::engine::pi_family_auth::validate_models_config_text(engine, &text)?;
+    Ok(models_from_config_value(&value))
+}
+
+/// `models.json` 的解析结果 → 菜单模型。纯函数:本机读文件与 WSL 远程
+/// `cat` 共用同一套规则。
+pub(super) fn models_from_config_text(engine: &str, text: &str) -> Vec<EngineModel> {
+    let Ok(value) = crate::engine::pi_family_auth::validate_models_config_text(engine, text) else {
+        return Vec::new();
+    };
+    models_from_config_value(&value)
+}
+
+fn models_from_config_value(value: &serde_json::Value) -> Vec<EngineModel> {
     let mut models = Vec::new();
     let Some(providers) = value
         .get("providers")
         .and_then(serde_json::Value::as_object)
     else {
-        return Ok(models);
+        return models;
     };
     for (provider_id, provider) in providers {
         let Some(entries) = provider.get("models").and_then(serde_json::Value::as_array) else {
@@ -42,7 +55,7 @@ pub(super) fn configured_models(engine: &str) -> Result<Vec<EngineModel>, String
             });
         }
     }
-    Ok(models)
+    models
 }
 
 pub(super) fn merge_configured_models(
@@ -221,6 +234,17 @@ kimi-code      k3             262.1K    32.8K    yes       no
         assert_eq!(parse_token_count("1M"), Some(1_000_000));
         assert_eq!(parse_token_count("8192"), Some(8192));
         assert_eq!(parse_token_count("—"), None);
+    }
+
+    /// WSL 远程模型目录回退读 `models.json` 时与本机共用这套解析。
+    #[test]
+    fn parses_models_config_text_for_remote_catalog() {
+        let text = r#"{"providers":{"new-api":{"models":[{"id":"glm-5.3-flash","name":"GLM-5.3 Flash","contextWindow":256000}]}}}"#;
+        let models = models_from_config_text("pi", text);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "new-api/glm-5.3-flash");
+        assert_eq!(models[0].name.as_deref(), Some("GLM-5.3 Flash"));
+        assert_eq!(models[0].context_window, Some(256_000));
     }
 
     #[test]

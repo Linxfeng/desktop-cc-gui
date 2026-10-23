@@ -6,6 +6,7 @@ import type {
   SessionMeta,
   Workspace,
   WorkspaceGroup,
+  WslNotice,
 } from "@/lib/ipc";
 import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
 import type { ComposerPermission } from "@/components/application/ai-chat/permission-menu";
@@ -100,6 +101,9 @@ export interface ChatStore {
   /** Last failed store action (add/remove workspace, delete/pin/rename
    * session); surfaced as a dismissable banner in ChatPage. */
   actionError: string | null;
+  /** 本机 WSL 的运行期提示(回收未确认 / 缺 ripgrep)。后端队列取走即清,
+   *  这里只是本次会话的展示副本;按 kind+distro 合并,用户关闭即移除。 */
+  wslNotices: WslNotice[];
   initialized: boolean;
   /** Session lifecycle events already emitted for the current frontend lifetime. */
   restoredSessionKeys: Record<string, true>;
@@ -125,9 +129,11 @@ export interface ChatStore {
    * history list, migrating the engine pref off a disabled CLI. */
   refreshEngines: () => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
-  /** 登记工作区。返回是否登记成功——失败时只留 actionError，「新建会话」
-   *  据此决定要不要接着开待发会话（见 use-chat-sidebar 的 handleAddWorkspace）。 */
-  addWorkspace: (path: string, meta?: Record<string, unknown>) => Promise<boolean>;
+  /** 登记工作区。成功时返回**登记后的路径**（后端会把 `\\wsl$` 归一成
+   *  `\\wsl.localhost`，两者不是同一个字符串），失败返回 null 并只留
+   *  actionError。调用方要接着开会话时必须用返回值，不能用自己手里的原始
+   *  路径，否则页签指向一个没有登记行的目录（见 handleAddWorkspace）。 */
+  addWorkspace: (path: string, meta?: Record<string, unknown>) => Promise<string | null>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
   removeWorkspace: (id: string) => Promise<void>;
   selectSession: (
@@ -201,6 +207,10 @@ export interface ChatStore {
   requestMention: (path: string) => void;
   clearPendingMention: () => void;
   dismissActionError: () => void;
+  /** 取走后端排队的本机 WSL 运行期提示;刷新会话时调用,取走即清。 */
+  drainWslNotices: () => Promise<void>;
+  /** 关闭一条 WSL 运行期提示(后端已取走,这里只移除展示副本)。 */
+  dismissWslNotice: (notice: WslNotice) => void;
   /** Clear a session's turn/load error banner. */
   dismissSessionError: (key: string) => void;
   /** Surface a banner on a session without a send (e.g. a refused

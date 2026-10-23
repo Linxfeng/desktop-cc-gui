@@ -2,6 +2,7 @@
 //! interrupt routing, and teardown sweeps.
 
 use super::reader::READER_SETTLE_GRACE;
+use super::wsl_transport::WslRun;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,6 +50,10 @@ pub struct ChildEntry {
     /// 后端,永不下发前端;由 respond_plan_review 按 planId+revision 消费,
     /// 运行结束时随进程一并过期(与 questions 同生命周期)。
     pub plans: Arc<Mutex<HashMap<String, Value>>>,
+    /// 本机 WSL 会话(发行版 + run id):杀本地 `wsl.exe` 只会给 Linux 会话
+    /// 发 SIGHUP,忽略 HUP 的后台进程(nohup 起的 dev server)会存活(实机
+    /// V13),所以中断/退出后还要按会话 `pkill -s` 回收。None = 非本机 WSL。
+    pub wsl_local: Option<WslRun>,
 }
 
 /// Launch-time settings of a run parked for a background follow-up turn.
@@ -420,6 +425,7 @@ impl ProcessRegistry {
             Option<Arc<TokioMutex<tokio::process::Child>>>,
             Arc<std::sync::atomic::AtomicBool>,
             Arc<std::sync::OnceLock<tokio::task::AbortHandle>>,
+            Option<WslRun>,
         )> = match self.0.lock() {
             Ok(map) => {
                 let mut seen_pids = std::collections::HashSet::new();
@@ -433,6 +439,7 @@ impl ProcessRegistry {
                             e.child.clone(),
                             Arc::clone(&e.killed),
                             Arc::clone(&e.reader_abort),
+                            e.wsl_local.clone(),
                         )
                     })
                     .collect()
@@ -442,14 +449,17 @@ impl ProcessRegistry {
         // The registry keys one child under BOTH its session id and run id
         // (rekey copies): de-duplicate by pid so one stop fires one
         // taskkill, not one per key.
-        entries.sort_by_key(|(pid, _, _, _, _)| *pid);
-        entries.dedup_by_key(|(pid, _, _, _, _)| *pid);
+        entries.sort_by_key(|(pid, _, _, _, _, _)| *pid);
+        entries.dedup_by_key(|(pid, _, _, _, _, _)| *pid);
         // No Iterator::any here: it short-circuits on the first true, which
         // would leave every later parallel run alive — the exact bug this
         // aggregate kill exists to fix.
         let mut killed_any = false;
-        for (pid, _, child, killed, _) in &entries {
+        for (pid, _, child, killed, _, wsl_local) in &entries {
             killed_any |= Self::kill_entry(child.as_ref(), *pid, killed);
+            if let Some(run) = wsl_local {
+                reclaim_wsl_session(&run.distro, &run.run_id);
+            }
         }
         // Backstop for a child that ignores SIGKILL (uninterruptible
         // sleep): its reader parks on wait() after EOF, pinning the Arcs it
@@ -458,7 +468,7 @@ impl ProcessRegistry {
         // on an already-finished task abort is a no-op, so normal stop
         // semantics are unchanged. kill() only runs inside a runtime
         // (spawn_blocking callers), so tokio::spawn is safe here.
-        for (pid, run_id, _, _, reader_abort) in &entries {
+        for (pid, run_id, _, _, reader_abort, _) in &entries {
             if let Some(handle) = reader_abort.get() {
                 let handle = handle.clone();
                 // The abort skips the reader's own remove_if_pid cleanup:
@@ -505,6 +515,9 @@ impl ProcessRegistry {
             if let Some(handle) = entry.reader_abort.get() {
                 handle.abort();
             }
+            if let Some(run) = entry.wsl_local.as_ref() {
+                reclaim_wsl_session(&run.distro, &run.run_id);
+            }
         }
     }
 }
@@ -527,7 +540,49 @@ impl Drop for ProcessRegistry {
                     let _ = guard.start_kill();
                 }
             }
+            if let Some(run) = entry.wsl_local.as_ref() {
+                reclaim_wsl_session(&run.distro, &run.run_id);
+            }
         }
+    }
+}
+
+/// 本机 WSL 会话回收:杀掉本地 `wsl.exe` 之后,发行版里的 Linux 会话可能
+/// 还活着 —— 忽略 SIGHUP 的后台进程(nohup 的 dev server)实测存活(V13)。
+/// 这里按 pidfile 里的会话 id `pkill -s`,只碰本应用启动的会话。
+///
+/// 必须异步:一次 `wsl.exe` 调用约 0.7s(V17),同步等待会卡住 Stop 按钮与
+/// 退出流程。调用方(中断 = 用户显式停止,退出 = 窗口已销毁)都不再依赖
+/// 这次回收的结果;失败只记日志并提示 `ExitUnproven`,不静默。
+fn reclaim_wsl_session(distro: &str, run_id: &str) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // 退出流程可能已在运行时之外(同步 Drop):开一个临时运行时做完。
+        // 超时由回收脚本自身保证(wsl_transport::run_script_output_with_args)。
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(reclaim_wsl_session_async(distro.to_string(), run_id.to_string()));
+        }
+        return;
+    };
+    runtime.spawn(reclaim_wsl_session_async(
+        distro.to_string(),
+        run_id.to_string(),
+    ));
+}
+
+async fn reclaim_wsl_session_async(distro: String, run_id: String) {
+    if let Err(error) = super::wsl_transport::kill_local_run(&distro, &run_id, true).await {
+        let code = if error.starts_with("WSL_EXIT_UNPROVEN") {
+            error
+        } else {
+            format!("WSL_EXIT_UNPROVEN:{error}")
+        };
+        eprintln!(
+            "[wsl] 会话回收未确认(distro={distro}, run={run_id}): {code}; WSL 内进程可能仍在运行"
+        );
+        crate::engine::wsl_notice::record_unproven(&distro, &run_id);
     }
 }
 
@@ -650,6 +705,7 @@ mod registry_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-1".to_string(), entry);
@@ -703,6 +759,7 @@ mod registry_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-preassigned".to_string(), entry.clone());
@@ -763,6 +820,7 @@ mod registry_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-tree".to_string(), entry);
@@ -802,6 +860,7 @@ mod registry_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         }
     }
 

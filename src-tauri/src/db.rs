@@ -840,6 +840,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(engine, session_id)
         );
+        -- 本机 WSL 工作区的会话发现缓存:发行版内扫描一次(UNC 扫描慢两个
+        -- 数量级,实机 V19),按 (发行版, 转录本绝对路径) 记住 size/mtime,
+        -- 只对签名变化的文件再读头部取标题。`owning_cwd` 是转录本自己的
+        -- cwd(codex 等按 cwd 归属工作区),`title` 来自头部解析。
+        CREATE TABLE IF NOT EXISTS wsl_session_cache(
+            distro TEXT NOT NULL,
+            remote_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            session_id TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            owning_cwd TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(distro, remote_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wsl_session_cache_distro
+            ON wsl_session_cache(distro);
         -- Reasoning effort the session last ran, same shape and same reason as
         -- the model row above: the transcript is not a reliable carrier, and a
         -- session reopened here must keep running the level it used.

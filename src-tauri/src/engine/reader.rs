@@ -9,6 +9,7 @@ use super::grok;
 use super::job;
 use super::plan_review;
 use super::registry::{kill_process_group, FollowupPrefs, ProcessRegistry};
+use super::wsl_transport::WslLaunchFailure;
 use super::Engine;
 use crate::event_sink;
 use serde_json::Value;
@@ -839,6 +840,10 @@ pub(crate) struct RunContext {
     /// without this ring a failed run with empty stderr surfaces as a bare
     /// "exited with status" banner.
     pub(crate) stdout_plain_buf: Arc<Mutex<String>>,
+    /// 本机 WSL 启动器失败时需要的上下文(ssh 后端为 None):退出码只在读取
+    /// 任务结束时才拿到,那时 `WslTransport` 已经不在作用域。它同时也标记
+    /// 「本机后端」,正常结束时据此清理启动器与 pidfile。
+    pub(crate) wsl_launch: Option<WslLaunchFailure>,
     /// Kill-on-close job guard: drops with this context at settle, sweeping
     /// any grandchild the CLI orphaned (Windows pwsh.exe/conhost.exe).
     #[cfg(windows)]
@@ -1255,6 +1260,32 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
                     message.push_str(&format!(": {stdout_tail}"));
                 }
             }
+            // 本机 WSL 启动器的退出码是稳定约定(61 = cwd 不存在,126/127 =
+            // CLI 不可执行/不存在,V14):翻译成与探测同源的错误码,否则用户
+            // 只看到 "claude exited with status 61: "(设计稿 §1.1 第 4 条)。
+            // wsl.exe 自己的失败(发行版没起来等)也在这里换成探针口径。
+            if let Some(launch) = ctx.wsl_launch.as_ref() {
+                let code = status.and_then(|s| s.code());
+                // 启动器约定之外的退出码(含 wsl.exe 的 1 与无退出码),
+                // 一律按 wsl.exe 失败解释,绝不当作 CLI 自己的退出码。
+                let mut mapped = code
+                    .and_then(|c| crate::engine::wsl_transport::launch_failure_code(c, launch));
+                if mapped.is_none() {
+                    let stdout_tail = ctx
+                        .stdout_plain_buf
+                        .lock()
+                        .map(|g| redact_secrets(g.trim()))
+                        .unwrap_or_default();
+                    mapped = crate::engine::wsl_transport::classify_launch_failure(
+                        code,
+                        &stdout_tail,
+                        &stderr_tail,
+                    );
+                }
+                if let Some(code) = mapped {
+                    message = code;
+                }
+            }
             state.push(
                 &ctx.core.sink,
                 &ctx.core.run_id,
@@ -1275,6 +1306,24 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     }
     if status.is_some() {
         state.confirm_exit(&ctx.core);
+    }
+    // §5.7 第 3 条:正常结束只删启动器脚本;pidfile 保留到应用退出/下次
+    // 启动清扫,这样 CLI 用 nohup 拉起的后台进程在关闭 GUI 时仍可回收。
+    // 中断路径由回收脚本删(见 `kill_local_run`)。
+    if let Some(launch) = ctx.wsl_launch.as_ref() {
+        // 启动器路径由 run id 推导(`unix_launcher_path`),不必再单独透传;
+        // 与 `wrap` 用的是同一个 `core.run_id`。
+        let distro = launch.distro.clone();
+        let run_id = ctx.core.run_id.clone();
+        // 不阻塞读取任务的收尾:一次 wsl.exe 约 0.7s(V17),而已发出的终止
+        // 事件不该等它。失败只影响 /tmp 的残留,不影响回合结果。
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::engine::wsl_transport::cleanup_local_launcher(&distro, &run_id).await
+            {
+                eprintln!("[wsl] 启动器清理失败(distro={distro}): {error}");
+            }
+        });
     }
     ctx.core.sink.flush();
 }
@@ -1404,6 +1453,7 @@ mod staging_tests {
                 mcp_restore: None,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+                wsl_launch: None,
                 // Upstream's own constructor omits this Windows-only guard
                 // field (E0063 on Windows); a plain test child owns no job.
                 #[cfg(windows)]
@@ -1449,6 +1499,7 @@ mod staging_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         };
         registry.insert("run-abort".into(), entry.clone());
         registry.insert_alias("session-abort".into(), entry);
@@ -1473,6 +1524,7 @@ mod staging_tests {
             mcp_restore: None,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            wsl_launch: None,
             #[cfg(windows)]
             _tree_guard: None,
         };
@@ -1507,6 +1559,7 @@ mod staging_tests {
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            wsl_local: None,
         };
         registry.insert("run-v".into(), entry.clone());
         registry.insert_alias("session-v".into(), entry);
@@ -1522,6 +1575,7 @@ mod staging_tests {
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
                 plans: Arc::new(Mutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
 
@@ -1750,6 +1804,7 @@ mod terminal_event_tests {
                     stdin: None,
                     questions: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     plans: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                    wsl_local: None,
                 },
             );
             let context = RunContext {
@@ -1773,6 +1828,7 @@ mod terminal_event_tests {
                 mcp_restore: None,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+                wsl_launch: None,
             };
             let reader = tokio::spawn(run_reader(stdout, context));
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -1869,6 +1925,7 @@ mod plan_dispatch_tests {
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
                 plans: Arc::new(Mutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
         (core, collector, db)

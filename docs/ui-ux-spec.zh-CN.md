@@ -145,8 +145,9 @@
 
 - **内网访问自启、访问 IP 切换与端口/Token配置**：设置「远程访问 / 内网访问」（`WebAccessSection.tsx`）提供「随应用自动开启」滑动开关（`Switch`），开启时客户端启动即自动运行内网 Web 服务（后端持久化于 `AppSettings.web_access_auto_start`，前端启动时带兜底探测与自启保障）。运行态下提供「访问 IP / 网卡」下拉框（`Select`），通过平台原生接口（Windows `GetAdaptersAddresses` / Unix `getifaddrs`）动态枚举本机网络接口 IPv4 列表，优先置顶 Tailscale 虚拟网卡与 CGNAT IP（100.64.0.0/10），并列出物理网卡及 Localhost 回环地址；切换 IP 联动实时更新访问地址、复制内容与二维码，并在本地持久化所选偏好（`WEB_ACCESS_SELECTED_IP_KEY`）。支持自定义监听端口（`web_access_port`，留空为自动分配随机端口）与持久化鉴权 Token（`web_access_token`，支持一键「重新生成」）；服务运行中修改配置在卡片内展示重启提示与快捷「立即重启服务」动作，绑定失败时在界面显式展示端口冲突原因。回归：`WebAccessSection.test.tsx`、`web::tests::*`。
 
-### 3.1 自动压缩：阈值控件与幕布行
+- **本机 WSL 工作区是宿主能力，不是插件**：工作区就是系统选择器给出的 `\\wsl.localhost\<发行版>\…`（`\\wsl$\…` 等价），登记时统一成这一拼写（`add_workspace_inner` 调 `wsl_path::normalize_wsl_unc`：`\\wsl$` 别名、主机名大小写、分隔符与尾斜杠都归一，发行版名按 `wsl -l -q` 的拼写——路径确实是 WSL UNC 时才取一次列表，读不到时保留输入拼写）：同一目录的别名或大小写不同拼写不会在侧栏留下两行工作区；「添加工作区」后接着开出的待发会话同样用**登记行交回的路径**（`store.addWorkspace` 返回后端归一后的 `path`），不是选择器给的原始拼写——否则页签绑在一个没有工作区行的目录上，会话存下来后侧栏列不出来。侧栏在 `labelSuffix` 那一格显示发行版名徽标（`use-chat-sidebar.ts` 的 `wslBadgeFor`）：宿主与插件钩子共用这一个槽位，**本机 UNC 工作区用宿主徽标、其余工作区用插件后缀**（`window.__ccguiWorkspaceUI` 只有一个槽位，宿主判断不注册进去，装了「WSL 管理器」插件也不会被覆盖），两套徽标不叠加。会话来源是宿主内建的 `wsl_list_sessions`，返回的行与插件会话源同形（`remote` + `remotePath`），因此侧栏列表、打开回放、删除都沿用同一套行语义——不为本机 WSL 另造一套会话模型，也不要求用户启用某个插件。composer 的引擎菜单在 WSL 工作区改用发行版内探测结果（`useWslEngineAvailability`）：Windows 侧没装 CLI **不得**隐藏发行版里装着的引擎；探测完成前先沿用本机探针（不闪空白），失败同样不隐藏（宁可多列一个不可用的，也不把能用的藏起来）；与插件 `allowedEngines` 同源同槽位，**本机 UNC 工作区用宿主探测结果、其余工作区用插件允许表**（`ChatConversation.tsx` 的 `allowedEngines`）。设置 → WSL 按发行版列出已安装 CLI 与**版本**（探测时在发行版内取 `--version`，只显示版本号；取不到就只显示 CLI 名，不显示空占位），并提供「重新检测」（§7 登记）；每个发行版按引擎各一行「`<CLI>` 路径覆盖」输入框（阶段 1 的 Claude / Codex 即使探测不到也给出输入框，另加该发行版探测到的引擎）：填发行版内的绝对路径即优先于探测结果，留空退回自动探测，**失焦且值有变化才写盘**（未改动不写，避免无谓地广播 `settings://changed`），写入成功后重跑一次探测让上面的 CLI 列表立刻反映新路径，路径不合法（非绝对路径 / `/mnt/…`）时在该页以 `role="alert"` 报出原因、不动输入框内容。它是一次设置写入而非重新读取，因此**不进转圈→对号那套反馈**，§7 亦不登记。运行期状态不静默：回收未确认（发行版内进程可能仍在运行）与发行版内缺 ripgrep（@ 列表已退回 UNC 遍历）各给一条可关闭提示条（`ChatPage.tsx` 顶部、`components/WslNotices.tsx`），`role="status"`，文案带发行版名与下一步；同类提示按「kind + 发行版」合并、关闭只移除那一条，后端队列取走即清，不重复刷。它与 `actionError` 的错误横幅是两种语义：那是某次操作失败（`role="alert"`），这里只是后台事实，不占用错误色。**本机 WSL 的探测/回收/错误文案全部走 `wsl.*` i18n**，稳定错误码（`WSL_NOT_INSTALLED`、`WSL_CLI_NOT_FOUND:` 等）由 `src/lib/errors.ts` 的 `errorText()` 统一翻译，界面上不出现裸 exit code。
 
+### 3.1 自动压缩：阈值控件与幕布行
 - **压缩过程在时间线上只有一条灰线（幕布行），不是气泡**：宿主发出的 `/compact` 用户行（手动按钮或跨过阈值的自动压缩，`ConversationFooter.tsx` 的 `compactSession`）原位渲染为一行右对齐的灰色「‹ 正在压缩上下文 ›」（`MessageTimeline.tsx` 的 `CompactionCurtain`；`internal-rows.ts` 的 `isCompactCommandRow` 把该用户行转成 `curtain` 行）。它属于那条消息，压缩结束后继续留在历史里——用户要能回看「这里压缩过」；原先是用户气泡，已按同一提交移除。阈值触发压缩完成后 footer 自动补发的续接提示（`chat.autoCompactResume`）两语都按 `isResumeNudgeRow` 过滤，从不渲染，模型的回复才是可见部分。
 - **响应校验解析请求别名**：Claude 的请求选择器（如 `opus`）保持原样交给 CLI；校验使用该次启动 CLI 注册表及渠道映射解析出的具体模型，卡片请求模型展示「选择器 → 具体模型」。供应商专属别名按对应注册表映射解析；远端运行不套用本机注册表。无法解析时展示「无法确认」并使用中性色问号，不作为不一致或通过；响应未上报仍显示「未上报」，无响应证据时隐藏徽标。实际具体模型或已上报档位不同仍使用黄色叹号。其他引擎及旧事件沿用原比较方式。
 - **宿主压缩原位常驻，引擎回合中压缩挂尾部**：宿主自己发的压缩（`session.compaction.automatic === false`）已经有原位幕布行，时间线尾部不再重复画；引擎回合中自己触发的压缩（`automatic === true`，只有 `compaction` flag、没有消息行）把幕布行挂在时间线尾部（`MessageTimeline.tsx` 的 tail 槽位），flag 被引擎事件清除即卸载。
@@ -274,6 +275,7 @@ const feedback = useRunningFeedback(store.loading);
 | MCP 刷新 | `src/features/mcp/McpSection.tsx` | `useActionFeedback({ spin: true })` | 重读配置清单与运行时分区；写入成功后也会自动重读 |
 | `/mcp` 面板刷新 | `src/features/mcp/McpCommandPanel.tsx` | `useActionFeedback({ spin: true })` | 与设置页同一份 `mcp_inventory` 数据；写入成功后自动重读 |
 | MCP 连接检测 | `src/features/mcp/McpSection.tsx`、`McpCommandPanel.tsx` | 行内状态徽标（`probe-ui.tsx`，检测中转圈） | 打开页面自动跑（复用 3 分钟内的结果），「检测全部」强制重跑；最多 4 个并行 |
+| WSL 重新检测 | `src/features/settings/WslSection.tsx` | `useActionFeedback({ spin: true })` | 一次动作丢弃全部发行版的探测缓存（发行版列表本就每次都实时读取，刚装好的发行版不必重启应用即可出现）并重跑；`isFailure` 读本次 `probeAll()` 的返回值（列表读不到 / 全部发行版探测失败）。单个发行版起不来只在控制台留原因、该行按「未探测到 CLI」显示，不让整页报错。挂载时同样跑一次，但不带转圈→对号（没有点击可反馈） |
 | 报错态「刷新」 | `src/features/files/FileTreeBody.tsx`、`src/features/files/EditorPane.tsx` | **不加反馈** | 纯文本恢复入口，见 §8 |
 | Worktree 状态采集 | `src/components/application/ai-chat/repo-tree.tsx`（`WorktreeGroup`） | **不加反馈** | 展开「WORKTREES」分组时后台刷一次 git status（复用 git store 30s TTL）与 `git_worktree_list`（locked/prunable），没有用户发起的「刷新」按钮；徽标随状态自然更新 |
 | 更换密钥 | `src/features/settings/WebAuthCard.tsx` | **不加反馈** | 语义是"轮换"不是"刷新" |
@@ -295,8 +297,13 @@ const feedback = useRunningFeedback(store.loading);
 
 ## 变更记录
 
+按版本号降序排列；「时间」是变更发生日期，与版本号不保证单调（长期分支合并后会给旧改动分配更高版本号）。
+
 | 版本 | 时间 | 内容 |
 |---|---|---|
+| v0.89 | 2026-10-20 | 设置 → WSL 的 CLI 徽标补上发行版内版本号（`wsl_reprobe` 随探测结果返回 `versions`，探测脚本对引擎 CLI 取 `--version` 首行并只保留版本号，`timeout 3` 兜底；取不到只显示名字）；§3 补规则 |
+| v0.88 | 2026-10-20 | 设置 → WSL 新增每个发行版**按引擎分开**的「CLI 路径覆盖」输入框（§5.9）：填发行版内绝对路径即优先于探测结果，留空退回自动探测，失焦且值有变化才写盘，写成功重跑一次探测、路径不合法在该页 `role="alert"` 报错。它是一次设置写入而非重新读取，不进转圈→对号那套反馈（§7 不登记）；§3 补规则 |
+| v0.87 | 2026-10-19 | 本机 WSL 工作区（`\\wsl.localhost\…`）接入：侧栏发行版徽标、宿主内建会话源、composer 引擎可用性改用发行版内探测、设置新增「WSL」页（发行版列表 + 各发行版内 CLI + 「重新检测」，§7 登记）、回收未确认 / 缺 ripgrep 的运行期提示条；§3 补规则 |
 | v0.86 | 2026-10-21 | Claude 后台任务（`run_in_background`）不再丢失完成后的续答：第一轮结算后输入框即恢复，CLI 自启的第二轮经 `turn_resumed` 重新打开该 run 并接在后面显示；等待期间发新消息，若模型 / effort / 权限模式未变，会直接写进仍存活的旧进程（后台任务不被停止），设置已变更或旧进程不可写时回退 `--resume` 新进程，其「停止旧后台任务」产生的空结果不再被当成本轮结束；驻留登记只对聊天事件汇生效，插件与任务工作台轮次维持原行为；§3 新增对应规则 |
 | v0.85 | 2026-10-21 | 状态栏分支列表新增搜索过滤（复用 `git.searchBranches` 占位与 `git.noMatchingBranches` 空态，打开即聚焦、关闭清空过滤条件）与整行原生 `title` 全名提示；搜索框是弹层第一个元素、与滚动列表平级；焦点随打开进入弹层，Esc 从此可关闭该弹层；另修原生 `title` 气泡被 react-aria 弹层（默认 z-index 100000）盖住的问题——气泡与弹层重叠时提示完全不可见；§2.3、§3 更新 |
 | v0.84 | 2026-10-16 | 字体设置新增独立「自定义字体族」分类（仅占位示例），保留上传分类；统一聊天代码、编辑器、差异视图和终端的代码字体/字号，补齐字体加载后量度与 PTY 尺寸同步；§2、§3 更新 |

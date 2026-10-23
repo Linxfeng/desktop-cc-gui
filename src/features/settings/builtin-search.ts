@@ -335,6 +335,14 @@ export const builtinSearchEntries: SettingsSearchEntry[] = [
   // 桌面宠物（其他）
   ...petEntries,
 
+  // 本机 WSL（工作区）:发行版列表 + 各发行版内 CLI + 「重新检测」。页面在
+  // 读不到发行版列表时只剩动作入口,所以第一行索引「重新检测」这个控件。
+  // 页面只在桌面 Windows 注册(§10 P1-2),搜索索引必须同步隐藏,否则
+  // Web/其它平台会搜到一个不存在的页面。
+  ...(!isWeb && IS_WINDOWS
+    ? [{ page: "wsl", anchor: "wslRescan", labelKey: "wsl.rescan" }]
+    : []),
+
   // 网络代理
   {
     page: "proxy",

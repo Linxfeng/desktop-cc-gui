@@ -654,8 +654,219 @@ fn is_plausible_remote_session_path(engine: &str, path: &str) -> bool {
     markers.iter().any(|m| path.contains(m))
 }
 
+/// 本机 WSL 会话允许的目录(发行版内 Claude / Codex 的转录本根)。
+/// 形状白名单只能挡住「随便一个 .jsonl」,挡不住「该发行版里任意用户的
+/// 会话」;回放/删除前必须落在这些根下(§10 P1-4)。
+async fn local_session_roots(
+    transport: &crate::engine::wsl_transport::WslTransport,
+) -> Result<Vec<String>, String> {
+    let probe = crate::engine::wsl_probe::ensure(&transport.distro)
+        .await
+        .map_err(|e| e.code())?;
+    let claude_home = if probe.claude_home.trim().is_empty() {
+        format!("{}/.claude", probe.home)
+    } else {
+        probe.claude_home.clone()
+    };
+    let codex_home = if probe.codex_home.trim().is_empty() {
+        format!("{}/.codex", probe.home)
+    } else {
+        probe.codex_home.clone()
+    };
+    let pi_agent = if probe.pi_agent_dir.trim().is_empty() {
+        format!("{}/.pi/agent", probe.home)
+    } else {
+        probe.pi_agent_dir.clone()
+    };
+    Ok(vec![
+        format!("{claude_home}/projects"),
+        format!("{codex_home}/sessions"),
+        format!("{pi_agent}/sessions"),
+    ])
+}
+
+fn linux_path_under(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
 /// 远程转录本拉取上限(base64 前)。
 const MAX_REMOTE_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 本机 WSL 转录本的拉取上限。本机最大会话实测 93 MB(实机 V22);64 MiB
+/// 的旧上限会把它拒之门外,而管道直传 93 MB 约 4.7s、之后只拉增量。
+const MAX_LOCAL_SESSION_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 增量判定用的尾部窗口大小:缓存末尾 4 KB 与远端同区间一致 → 视为追加。
+const LOCAL_TAIL_PROBE_BYTES: u64 = 4096;
+
+/// 本机转录本同步的串行锁。同一会话被两个入口同时打开(侧栏点击 + 恢复
+/// 会话)时,两次「追加写」若交错会把同一段字节写两遍,本机缓存就此损坏;
+/// 全量分支的读-写窗口也需要互斥才能保证解析读到完整文件。
+static LOCAL_TRANSCRIPT_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// 远程转录本的本机缓存文件(两种后端共用同一命名,换后端不丢缓存)。
+fn remote_cache_path(
+    workspace_path: &str,
+    engine: &str,
+    session_id: &str,
+    remote_path: &str,
+) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let dir = crate::paths::app_home().join("remote-sessions");
+    let digest = sha2::Sha256::digest(format!(
+        "{workspace_path}|{engine}|{session_id}|{remote_path}"
+    ));
+    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{name}.jsonl"))
+}
+
+/// 本机 WSL 转录本同步:先探测远端 `(size, mtime)`(一次短调用);与缓存
+/// 记录一致就整段跳过,远端只是变长且末段仍对齐就只追加 `tail -c`,否则
+/// 全量重取。返回缓存路径。
+///
+/// 为什么不是 UNC 直读:实测 93 MB 经 UNC 读取 3–4s 且没有增量语义;发行版内
+/// `tail` 只传新增字节(V22)。管道直传原始字节不做 base64(V10),因此缓存
+/// 文件里就是逐字节的转录本原文。
+pub(crate) async fn sync_local_transcript(
+    transport: &crate::engine::wsl_transport::WslTransport,
+    remote_path: &str,
+    cache_path: &std::path::Path,
+) -> Result<(), String> {
+    let _guard = LOCAL_TRANSCRIPT_LOCK.lock().await;
+    let quoted = crate::engine::wsl_transport::sh_quote(remote_path);
+    let cached_len = std::fs::metadata(cache_path)
+        .map(|m| m.len())
+        .ok()
+        .filter(|len| *len > 0);
+    let cached_sig = std::fs::read_to_string(cache_sig_path(cache_path)).ok();
+
+    // 一次调用同时拿签名与「缓存末尾窗口」指纹:签名一致直接命中;变长时
+    // 窗口再用来判断是不是纯追加,避免多一次往返(V17)。
+    let probe_script = match cached_len {
+        Some(old_len) if cached_sig.is_some() => format!(
+            "st=$(stat -c '%s|%y' -- {quoted} 2>/dev/null) || {{ echo 'WSL_SESSION_UNREADABLE' >&2; exit 3; }}; \
+             printf '%s\\n' \"$st\"; \
+             tail -c +{start} -- {quoted} 2>/dev/null | head -c {window} | base64 -w0",
+            start = old_len.saturating_sub(LOCAL_TAIL_PROBE_BYTES) + 1,
+            window = LOCAL_TAIL_PROBE_BYTES.min(old_len),
+        ),
+        _ => format!(
+            "stat -c '%s|%y' -- {quoted} 2>/dev/null || {{ echo 'WSL_SESSION_UNREADABLE' >&2; exit 3; }}"
+        ),
+    };
+    let probe =
+        crate::engine::wsl_transport::run_script_output(transport, &probe_script).await?;
+    let (sig_line, window_b64) = probe.split_once('\n').unwrap_or((probe.as_str(), ""));
+    let sig = sig_line.trim();
+    let size: u64 = sig
+        .split('|')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(|| format!("WSL_TRANSCRIPT_UNREADABLE:会话状态无法解析 {sig}"))?;
+    if size > MAX_LOCAL_SESSION_BYTES {
+        return Err(format!(
+            "WSL_SESSION_TOO_LARGE:{size}:{MAX_LOCAL_SESSION_BYTES}"
+        ));
+    }
+    if cached_sig.as_deref() == Some(sig) && cached_len == Some(size) {
+        return Ok(());
+    }
+
+    // 增量:只变长,且缓存末尾窗口与远端同区间逐字节一致(窗口比对能识别
+    // 截断/原地重写,单纯比头部做不到)。
+    if let (Some(old_len), Some(_)) = (cached_len, cached_sig.as_deref()) {
+        if size > old_len && window_matches(cache_path, old_len, window_b64) {
+            let tail_script = format!(
+                "tail -c +{} -- {quoted} 2>/dev/null || exit 5",
+                old_len + 1
+            );
+            match crate::engine::wsl_transport::run_script_to_file_local(
+                transport,
+                &tail_script,
+                cache_path,
+                true,
+            )
+            .await
+            {
+                Ok(copied) => {
+                    // §7.2 第 9 步按这行判断"只增量拉取":未变化的会话不会
+                    // 产生本次传输,因此这里没有日志即代表命中缓存。
+                    eprintln!(
+                        "[history] wsl transcript incremental fetch: +{copied} bytes ({} -> {size})",
+                        old_len
+                    );
+                    let _ = std::fs::write(cache_sig_path(cache_path), sig);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // 追加失败:把缓存截回追加前长度,下一次仍是干净的全量。
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(cache_path)
+                        .and_then(|f| f.set_len(old_len));
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    let full_script = format!("cat -- {quoted} 2>/dev/null || exit 5");
+    let copied = match crate::engine::wsl_transport::run_script_to_file_local(
+        transport,
+        &full_script,
+        cache_path,
+        false,
+    )
+    .await
+    {
+        Ok(copied) => copied,
+        Err(error) => {
+            // 全量分支已经 truncate 过:失败会留下半份转录本,下一次解析
+            // 会看到残缺内容。删掉它,下次重新全量拉取(§10 P1-19)。
+            let _ = std::fs::remove_file(cache_path);
+            let _ = std::fs::remove_file(cache_sig_path(cache_path));
+            return Err(error);
+        }
+    };
+    eprintln!("[history] wsl transcript full fetch: {copied} bytes");
+    std::fs::write(cache_sig_path(cache_path), sig)
+        .map_err(|e| format!("写缓存签名失败: {e}"))
+}
+
+/// 缓存签名(远端 `size|mtime`)的旁路文件。与转录本同目录,删缓存时一并清。
+fn cache_sig_path(cache_path: &std::path::Path) -> std::path::PathBuf {
+    cache_path.with_extension("jsonl.sig")
+}
+
+/// 增量前的定点校验:探测阶段取回的远端窗口(缓存末尾 4 KB 对应区间)是否
+/// 与本地缓存同区间一致。
+fn window_matches(cache_path: &std::path::Path, old_len: u64, window_b64: &str) -> bool {
+    use base64::Engine as _;
+    use std::io::{Read, Seek, SeekFrom};
+    // 只读尾部窗口:93 MB 会话整文件读入内存会把「流式、不整块进内存」
+    // 的承诺作废(§10 P1-19)。
+    let Ok(mut file) = std::fs::File::open(cache_path) else {
+        return false;
+    };
+    if file.metadata().map(|m| m.len()).ok() != Some(old_len) {
+        return false;
+    }
+    let window = LOCAL_TAIL_PROBE_BYTES.min(old_len);
+    let start = old_len - window;
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut local = vec![0u8; window as usize];
+    if file.read_exact(&mut local).is_err() {
+        return false;
+    }
+    let Ok(remote) = base64::engine::general_purpose::STANDARD.decode(window_b64.trim()) else {
+        return false;
+    };
+    remote.len() == local.len() && local == remote
+}
 
 /// 远程工作区会话的历史回放:插件会话源把远端 jsonl 绝对路径随 `remotePath`
 /// 上报;这里经引擎 spawn 同一套远程通道 `base64` 拉回转录本,落到本机缓存
@@ -671,41 +882,47 @@ pub async fn load_remote_session_page(
     limit: Option<usize>,
     before_seq: Option<i64>,
 ) -> Result<SessionPage, String> {
-    use sha2::Digest as _;
     if !is_plausible_remote_session_path(&engine, &remote_path) {
         return Err(format!("远程会话路径不合法: {remote_path}"));
     }
     let transport =
-        crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)
+        crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)?
             .ok_or_else(|| format!("工作区 {workspace_path} 未登记远程传输"))?;
-    // 先远端 stat 卡住字节上限再 base64,超限/不可读直接非零退出,
-    // 避免超大转录本经 1.33× 膨胀后全量进内存。
-    let quoted = crate::engine::wsl_transport::sh_quote(&remote_path);
-    let script = format!(
-        "sz=$(stat -c %s -- {quoted} 2>/dev/null) || {{ echo '远程会话文件不可读' >&2; exit 3; }}; \
-         [ \"$sz\" -le {MAX_REMOTE_SESSION_BYTES} ] || {{ echo \"远程会话文件过大(${{sz}}B,上限 {MAX_REMOTE_SESSION_BYTES}B)\" >&2; exit 4; }}; \
-         base64 -w0 -- {quoted}"
-    );
-    // run_script_output 已剥传输层噪声;载荷是单行 base64。
-    let raw = crate::engine::wsl_transport::run_script_output(&transport, &script).await?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw.trim())
-        .map_err(|e| format!("远程转录本解码失败: {e}"))?;
-
+    if transport.is_local() {
+        let roots = local_session_roots(&transport).await?;
+        if !roots.iter().any(|root| linux_path_under(&remote_path, root)) {
+            return Err(format!("远程会话路径不属于该发行版: {remote_path}"));
+        }
+    }
     let dir = crate::paths::app_home().join("remote-sessions");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
-    let digest = sha2::Sha256::digest(format!(
-        "{workspace_path}|{engine}|{session_id}|{remote_path}"
-    ));
-    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    let cache_path = dir.join(format!("{name}.jsonl"));
-    let stale = std::fs::read(&cache_path)
-        .map(|old| old != bytes)
-        .unwrap_or(true);
-    if stale {
-        let tmp = dir.join(format!("{name}.jsonl.tmp"));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("写缓存失败: {e}"))?;
-        std::fs::rename(&tmp, &cache_path).map_err(|e| format!("缓存落位失败: {e}"))?;
+    let cache_path = remote_cache_path(&workspace_path, &engine, &session_id, &remote_path);
+
+    if transport.is_local() {
+        // 本机 WSL:管道直传原始字节 + 增量追加,不进内存(V10/V22)。
+        sync_local_transcript(&transport, &remote_path, &cache_path).await?;
+    } else {
+        // 先远端 stat 卡住字节上限再 base64,超限/不可读直接非零退出,
+        // 避免超大转录本经 1.33× 膨胀后全量进内存。
+        let quoted = crate::engine::wsl_transport::sh_quote(&remote_path);
+        let script = format!(
+            "sz=$(stat -c %s -- {quoted} 2>/dev/null) || {{ echo '远程会话文件不可读' >&2; exit 3; }}; \
+             [ \"$sz\" -le {MAX_REMOTE_SESSION_BYTES} ] || {{ echo \"远程会话文件过大(${{sz}}B,上限 {MAX_REMOTE_SESSION_BYTES}B)\" >&2; exit 4; }}; \
+             base64 -w0 -- {quoted}"
+        );
+        // run_script_output 已剥传输层噪声;载荷是单行 base64。
+        let raw = crate::engine::wsl_transport::run_script_output(&transport, &script).await?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .map_err(|e| format!("远程转录本解码失败: {e}"))?;
+        let stale = std::fs::read(&cache_path)
+            .map(|old| old != bytes)
+            .unwrap_or(true);
+        if stale {
+            let tmp = dir.join(format!("{}.tmp", cache_path.file_name().unwrap_or_default().to_string_lossy()));
+            std::fs::write(&tmp, &bytes).map_err(|e| format!("写缓存失败: {e}"))?;
+            std::fs::rename(&tmp, &cache_path).map_err(|e| format!("缓存落位失败: {e}"))?;
+        }
     }
 
     let engine_for_parse = engine.clone();
@@ -1036,15 +1253,40 @@ pub async fn delete_remote_session(
     remote_path: String,
 ) -> Result<(), String> {
     let script = remote_session_delete_script(&engine, &remote_path)?;
-    let transport = crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)
+    let transport = crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)?
         .ok_or_else(|| format!("工作区 {workspace_path} 未登记远程传输"))?;
+    if transport.is_local() {
+        let roots = local_session_roots(&transport).await?;
+        if !roots.iter().any(|root| linux_path_under(&remote_path, root)) {
+            return Err(format!("远程会话路径不属于该发行版: {remote_path}"));
+        }
+    }
+    let cache_path = remote_cache_path(&workspace_path, &engine, &session_id, &remote_path);
     delete_remote_session_and_frames(
         Arc::clone(&state.db),
         engine,
         session_id,
         crate::engine::wsl_transport::run_script_output(&transport, &script),
     )
-    .await
+    .await?;
+    // 远端转录本已删,本机回放缓存(含签名旁路文件)与扫描缓存随之失效。
+    if transport.is_local() {
+        if let Some(unc) = crate::engine::wsl_path::parse_wsl_unc(&workspace_path) {
+            crate::history::wsl_sessions::forget_cached_session(
+                &state.db,
+                &unc.distro,
+                &remote_path,
+            );
+        }
+    }
+    for path in [&cache_path, &cache_sig_path(&cache_path)] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[wsl] 回放缓存删除失败({}): {error}", path.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1259,7 +1501,7 @@ pub fn list_workspaces(state: tauri::State<'_, crate::AppState>) -> Result<Vec<W
 }
 
 #[tauri::command]
-pub fn add_workspace(
+pub async fn add_workspace(
     state: tauri::State<'_, crate::AppState>,
     path: String,
     meta: Option<serde_json::Value>,
@@ -1307,12 +1549,43 @@ pub fn add_workspace(
         }
         Some(other) => return Err(format!("unknown workspace kind: {other}")),
     }
-    add_workspace_inner(&state, &path, meta, kind, parent_id)
+    add_workspace_inner(&state, &path, meta, kind, parent_id).await
+}
+
+/// 入库前的工作区路径归一化:本机 WSL UNC 统一成
+/// `\\wsl.localhost\<规范发行版名>\…`(发行版名按 `wsl -l -q` 的大小写),
+/// 其余路径逐字不变。
+///
+/// 发行版名为什么要按实机拼写归一:会话行以工作区路径为键(`wsl_sessions`
+/// 的 `windows_workspace`),拼写不同的两行在侧栏是两个工作区,彼此的会话
+/// 也认不出来。
+///
+/// 列表读不到时(`wsl.exe` 缺失、WSL 未安装)`known` 为空,退回形状归一:
+/// 仍然把 `\\wsl$` 收成 `\\wsl.localhost`,只是发行版名保留用户输入的大小
+/// 写。宁可留一个可能重复的行,也不拒绝登记用户刚选中的目录。
+pub(crate) fn normalize_workspace_path_known(path: &str, known: &[String]) -> String {
+    crate::engine::wsl_path::normalize_wsl_unc(path, known)
+        .or_else(|| crate::engine::wsl_path::normalize_wsl_unc(path, &[]))
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 同上,但发行版列表现取(`wsl.exe -l -q`)。**仅当路径确实是 WSL UNC**
+/// 才发生这次调用:普通目录、插件登记的远程 Linux 路径(`~/proj`)都不触发,
+/// 所以装了 WSL 的用户登记本地目录不会多等一次 `wsl.exe`。
+pub(crate) async fn normalize_workspace_path(path: &str) -> String {
+    if crate::engine::wsl_path::parse_wsl_unc(path).is_none() {
+        return path.to_string();
+    }
+    let known = crate::engine::wsl_probe::list_distros().await;
+    normalize_workspace_path_known(path, &known)
 }
 
 /// Shared body of `add_workspace` / `plugin_caps::plugin_add_workspace`:
 /// shape checks + upsert. Grant checks live in the callers.
-pub(crate) fn add_workspace_inner(
+///
+/// async 只为拿一次发行版列表(见 [`normalize_workspace_path`]):探测在拿
+/// db 锁之前完成,锁内没有 await。
+pub(crate) async fn add_workspace_inner(
     state: &crate::AppState,
     path: &str,
     meta: Option<serde_json::Value>,
@@ -1323,6 +1596,10 @@ pub(crate) fn add_workspace_inner(
     if trimmed.is_empty() {
         return Err("empty path".to_string());
     }
+    // path 有唯一约束,但只在拼写逐字相同时才拦得住重复行:`\\wsl$` 与
+    // `\\wsl.localhost` 是同一个目录,却会各占一行工作区。
+    let trimmed = normalize_workspace_path(trimmed).await;
+    let trimmed = trimmed.as_str();
     // Host-capability callers (plugin workspaces.add) may register paths that
     // do not exist on this machine (remote host / WSL distro) — meta presence
     // is the opt-in that skips the local is_dir check.
@@ -1471,6 +1748,58 @@ pub fn remove_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同一目录的别名拼写必须落成同一行工作区;非 WSL 路径逐字不变
+    /// (普通 SMB / 本地路径不该被这条规则碰到)。
+    #[test]
+    fn workspace_paths_normalize_wsl_spellings_only() {
+        // 纯函数形态:规则本身可断言,不依赖 `wsl.exe` 是否存在。
+        let norm = |p: &str| normalize_workspace_path_known(p, &[]);
+        assert_eq!(
+            norm(r"\\wsl$\Ubuntu-24.04\home\me\repo"),
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        );
+        assert_eq!(
+            norm(r"\\WSL.LOCALHOST\Ubuntu-24.04\home\me\repo"),
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        );
+        assert_eq!(
+            norm(r"\\wsl.localhost\Ubuntu-24.04\home\me\repo\"),
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        );
+        // 已经规范过的拼写是幂等的:重复登记同一条不会再造一行。
+        let normalized = norm(r"\\wsl$\Ubuntu-24.04\home\me\repo");
+        assert_eq!(norm(&normalized), normalized);
+        // 中文/空格目录原样保留(V7)。
+        assert_eq!(
+            norm(r"\\wsl$\Ubuntu-24.04\home\me\项目 目录"),
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\项目 目录"
+        );
+        for path in [r"C:\Users\me\repo", r"\\server\share\repo", "/home/me/repo"] {
+            assert_eq!(norm(path), path);
+        }
+    }
+
+    /// 发行版名按 `wsl -l -q` 的拼写归一(设计稿 §5.1):否则
+    /// `\\wsl$\ubuntu-24.04\…` 与规范拼写各占一行工作区,两边的会话互相
+    /// 认不出来。列表里没有该发行版时保留输入拼写 —— 不拒绝登记。
+    #[test]
+    fn workspace_paths_take_distro_spelling_from_the_list() {
+        let known = vec!["Ubuntu-24.04".to_string(), "Debian".to_string()];
+        assert_eq!(
+            normalize_workspace_path_known(r"\\wsl$\ubuntu-24.04\home\me\repo", &known),
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        );
+        assert_eq!(
+            normalize_workspace_path_known(r"\\wsl.localhost\DEBIAN\home\me\repo", &known),
+            r"\\wsl.localhost\Debian\home\me\repo"
+        );
+        // 不认识的发行版:不凭空造规范名,保留用户输入。
+        assert_eq!(
+            normalize_workspace_path_known(r"\\wsl$\Ghost\home", &known),
+            r"\\wsl.localhost\Ghost\home"
+        );
+    }
 
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2433,5 +2762,45 @@ mod tests {
             parsed_footprint(&full) > parsed_footprint(&bare) + 39_000,
             "the payloads, not the row, drive the footprint",
         );
+    }
+
+    /// 增量判定的核心纯函数:窗口一致才算纯追加,截断/原地改写的窗口必须
+    /// 判红,否则下一次追加会把新旧两版内容拼在一起。
+    #[test]
+    fn tail_window_guards_append_only_growth() {
+        use base64::Engine as _;
+        let dir = scratch_dir("tail-window");
+        let cache = dir.join("s.jsonl");
+        let body = b"line-1\nline-2\nline-3\n";
+        std::fs::write(&cache, body).unwrap();
+        let window = LOCAL_TAIL_PROBE_BYTES.min(body.len() as u64);
+        let start = body.len() - window as usize;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        assert!(window_matches(
+            &cache,
+            body.len() as u64,
+            &b64(&body[start..])
+        ));
+        // 同一窗口但来自另一版文件(原地重写):必须拒绝。
+        assert!(!window_matches(&cache, body.len() as u64, &b64(b"XXXX\nline-3\n")));
+        // 长度对不上(缓存被截断):必须拒绝。
+        assert!(!window_matches(
+            &cache,
+            body.len() as u64 + 10,
+            &b64(&body[start..])
+        ));
+        // 空窗口(远端比缓存短、没有可比区间)也不能当成追加。
+        assert!(!window_matches(&cache, body.len() as u64, ""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 缓存签名与转录本同目录、不同后缀,删缓存时一并清,不会互相覆盖。
+    #[test]
+    fn cache_sig_path_sits_beside_the_transcript() {
+        let cache = PathBuf::from("/tmp/abc.jsonl");
+        let sig = cache_sig_path(&cache);
+        assert_eq!(sig, PathBuf::from("/tmp/abc.jsonl.sig"));
+        assert_ne!(sig, cache);
     }
 }

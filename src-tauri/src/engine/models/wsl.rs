@@ -13,14 +13,24 @@ pub(super) async fn pi_family_catalog_remote(
     let (Some(bin), Some(cwd)) = (bin_for(transport, engine), remote_cwd(transport)) else {
         return EngineCatalog::authoritative_remote(Vec::new());
     };
-    let script = format!("cd {cwd} 2>/dev/null; {bin} models --json");
-    match crate::engine::wsl_transport::run_script_output(transport, &script).await {
-        Ok(stdout) => match pi::parse_models_json(&stdout) {
-            Ok(models) if !models.is_empty() => EngineCatalog::authoritative_remote(models),
-            _ => EngineCatalog::authoritative_remote(Vec::new()),
-        },
-        Err(_) => EngineCatalog::authoritative_remote(Vec::new()),
+    let script = format!("cd {} 2>/dev/null; {} models --json", cwd, bin);
+    let discovered = match crate::engine::wsl_transport::run_script_output(transport, &script).await
+    {
+        Ok(stdout) => pi::parse_models_json(&stdout).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if !discovered.is_empty() {
+        return EngineCatalog::authoritative_remote(discovered);
     }
+    // pi 1.4 的 `models` 子命令还不支持 `--json`(输出是表格)。回退到读
+    // 发行版内的 `models.json`,与本机 `configured_models` 同一套解析,
+    // 否则 WSL 里的 pi 模型菜单会永远为空。
+    let config_script =
+        r#"cat "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/models.json" 2>/dev/null"#.to_string();
+    let config = crate::engine::wsl_transport::run_script_output(transport, &config_script)
+        .await
+        .unwrap_or_default();
+    EngineCatalog::authoritative_remote(pi::models_from_config_text(engine, &config))
 }
 
 /// Codex 远程目录:`<bin> debug models`(与本机 codex_catalog 同一命令),
@@ -103,11 +113,18 @@ pub(super) async fn claude_catalog_remote(transport: &WslTransport) -> EngineCat
     EngineCatalog::authoritative_remote(super::claude::claude_models_remote(user, local))
 }
 fn bin_for(transport: &WslTransport, engine: &str) -> Option<String> {
-    transport
-        .engine_paths
-        .get(engine)
-        .map(|b| shell_safe_bin(b))
-        .filter(|b| !b.is_empty())
+    let bin = transport.engine_paths.get(engine)?;
+    if transport.is_local() {
+        // 本机后端的覆盖路径允许空格/中文(与设置页校验一致,§10 D9):
+        // 按 shell 引号包裹而不是拒绝,否则模型菜单会静默为空。
+        if bin.is_empty() || bin.chars().any(char::is_control) {
+            return None;
+        }
+        return Some(crate::engine::wsl_transport::sh_quote(bin));
+    }
+    // SSH 后端沿用历史白名单:插件登记的远端路径不做引号处理。
+    let safe = shell_safe_bin(bin);
+    (!safe.is_empty()).then_some(safe)
 }
 
 /// 发行版内 `$CODEX_HOME/config.toml`(默认 ~/.codex)的顶层 model=。
@@ -126,11 +143,14 @@ async fn codex_config_model_remote(transport: &WslTransport) -> Option<EngineMod
     })
 }
 
-/// 发行版内 `cd` 目标;workspace 字符白名单与 send 路径 build_script 同一
-/// 规则(is_safe_workspace),违例返回 None —— 调用方给空 catalog,绝不
-/// 拿违例路径发脚本(此前 catalog 路径绕过白名单直排,是注入面)。
+/// 发行版内 `cd` 目标(已按 shell 规则引号包裹,可直接拼进脚本)。
+///
+/// `Local` 后端的 workspace 来自 UNC 解析,允许空格/中文/引号(实机 V1),
+/// 所以一律 `sh_quote`;`Ssh` 后端沿用既有字符白名单 —— 插件登记的远端路径
+/// 不做引号处理是历史形态,改它会改变既有可用行为。
 fn remote_cwd(transport: &WslTransport) -> Option<String> {
     match &transport.workspace {
+        Some(ws) if transport.is_local() => Some(crate::engine::wsl_transport::sh_quote(ws)),
         Some(ws) => crate::engine::wsl_transport::is_safe_workspace(ws).then(|| ws.clone()),
         None => Some("~".to_string()),
     }
@@ -166,14 +186,34 @@ mod tests {
 
     fn tp(workspace: Option<&str>) -> WslTransport {
         WslTransport {
-            host: "10.0.0.2".into(),
-            port: 22,
-            user: "dev".into(),
+            backend: crate::engine::wsl_transport::WslBackend::Ssh {
+                host: "10.0.0.2".into(),
+                port: 22,
+                user: "dev".into(),
+                control_path: None,
+            },
             distro: "Ubuntu".into(),
-            control_path: None,
             engine_paths: Default::default(),
             workspace: workspace.map(str::to_string),
+            shell_path: None,
+            codex_home: None,
+            claude_home: None,
+            pi_agent_dir: None,
         }
+    }
+
+    /// 本机后端的覆盖路径允许空格/中文,消费侧必须用同一套规则:
+    /// 引号包裹而不是静默丢弃(§10 D9)。
+    #[test]
+    fn local_bin_quotes_paths_the_settings_page_accepts() {
+        let mut t = tp(None);
+        t.backend = crate::engine::wsl_transport::WslBackend::Local;
+        t.engine_paths
+            .insert("omp".into(), "/home/u/my bin/omp".into());
+        assert_eq!(bin_for(&t, "omp").as_deref(), Some("'/home/u/my bin/omp'"));
+        t.engine_paths
+            .insert("omp".into(), "/home/u/我的/bin/omp".into());
+        assert_eq!(bin_for(&t, "omp").as_deref(), Some("'/home/u/我的/bin/omp'"));
     }
 
     #[test]
@@ -189,5 +229,18 @@ mod tests {
         assert!(remote_cwd(&tp(Some("/home/dev/my proj"))).is_none());
         assert!(remote_cwd(&tp(Some("/x;id"))).is_none());
         assert!(remote_cwd(&tp(Some("/x$(id)"))).is_none());
+    }
+
+    /// 本机后端的 workspace 来自 UNC(空格、中文都合法,V1):按 shell 引号
+    /// 包裹而不是拒绝,否则这类工作区的模型菜单永远是空的。
+    #[test]
+    fn local_cwd_quotes_whatever_unc_allows() {
+        let mut t = tp(Some("/home/dev/我的 项目"));
+        t.backend = crate::engine::wsl_transport::WslBackend::Local;
+        assert_eq!(remote_cwd(&t).as_deref(), Some("'/home/dev/我的 项目'"));
+        // 单引号本身也被转义,不会闭合引号。
+        let mut quoted = tp(Some("/home/dev/it's"));
+        quoted.backend = crate::engine::wsl_transport::WslBackend::Local;
+        assert_eq!(remote_cwd(&quoted).as_deref(), Some(r"'/home/dev/it'\''s'"));
     }
 }

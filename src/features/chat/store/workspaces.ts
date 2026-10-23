@@ -5,6 +5,7 @@ import { pruneMentionIndex } from "@/components/application/ai-chat/mention-file
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
 import { persistTabs, sessionKey, type ActiveSession } from "./persistence";
 import { persistSettings } from "./settings-persist";
+import { forgetWslWorkspace } from "../wsl-sessions";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 
@@ -46,16 +47,20 @@ export function createWorkspaceActions(
 
     addWorkspace: async (path, meta) => {
       try {
-        await ipc.addWorkspace(path, meta);
+        const workspace = await ipc.addWorkspace(path, meta);
         await get().refreshWorkspaces();
         set({ actionError: null });
         // 登记失败只 set actionError 会让调用方以为成功：「新建会话」据此接着
         // 开出的待发会话会指向一个并未登记的目录，恰好复现输入框不可用的形态。
-        // 返回成功与否，让调用方决定要不要往下走（错误条仍由这里负责）。
-        return true;
+        // 所以返回登记后的路径让调用方往下走（错误条仍由这里负责）。
+        //
+        // 返回后端的 path 而不是入参：`\\wsl$` 与 `\\wsl.localhost` 是同一个
+        // 目录却不同字符串，后端会归一化后入库；拿原始路径去开会话会绑到一个
+        // 没有工作区行的目录，会话存下来后也进不了侧栏。
+        return workspace.path;
       } catch (error) {
         set({ actionError: errorText(error) });
-        return false;
+        return null;
       }
     },
 
@@ -87,6 +92,8 @@ export function createWorkspaceActions(
         // The composer's per-root picker caches die with the workspace.
         pruneMentionIndex(removedPath);
         pruneSlashCommands(removedPath);
+        // 本机 WSL 会话扫描缓存同样失效,重新登记时重新扫描(§10 P1-10)。
+        forgetWslWorkspace(removedPath);
         // Evict cached session state belonging to the removed workspace:
         // real session keys come from the list cache, pending-chat keys
         // carry the path in the key itself.

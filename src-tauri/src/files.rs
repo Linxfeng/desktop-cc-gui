@@ -8,7 +8,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 /// @-mention file index: bounds the walk on monster trees (the gitignore
 /// filter drops build output, the cap is the last line of defense).
-const MAX_INDEX_ENTRIES: usize = 20_000;
+pub(crate) const MAX_INDEX_ENTRIES: usize = 20_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,12 +108,31 @@ pub(crate) fn ensure_allowed(path: &str, db: &crate::db::Db) -> Result<PathBuf, 
 /// Windows `canonicalize` returns verbatim paths (`\\?\C:\...`); strip the
 /// prefix so granted roots are stored and displayed in normal form.
 /// Comparisons re-canonicalize both sides, so stripping is lossless here.
+///
+/// The `\\?\UNC\` form needs its own branch: `canonicalize` turns a UNC path
+/// (`\\wsl.localhost\Ubuntu\home`, an SMB share) into `\\?\UNC\wsl.localhost\…`,
+/// and deleting only `\\?\` there leaves the relative-looking `UNC\wsl…` —
+/// every granted-root comparison against the UNC workspace then fails (V18).
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
+    if let Some(rest) = strip_verbatim_unc(&s) {
+        // Re-add the leading `\\` that the UNC form encodes in its prefix.
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
     match s.strip_prefix(r"\\?\") {
         Some(rest) => PathBuf::from(rest),
         None => path,
     }
+}
+
+/// Case-insensitive `\\?\UNC\` strip (Windows spells the prefix either way);
+/// shared with the history scanner so both sides compare the same spelling.
+pub(crate) fn strip_verbatim_unc(path: &str) -> Option<&str> {
+    const PREFIX: &str = r"\\?\UNC\";
+    let head = path.get(..PREFIX.len())?;
+    head.eq_ignore_ascii_case(PREFIX)
+        .then(|| path.get(PREFIX.len()..))
+        .flatten()
 }
 
 /// The directory a grant for `path` would cover: the path itself when it is
@@ -605,9 +624,38 @@ pub async fn list_file_index(
     path: String,
     include_ignored: Option<bool>,
 ) -> Result<Vec<FileIndexEntry>, String> {
-    let db = Arc::clone(db.inner());
+    let include_ignored = include_ignored.unwrap_or(false);
+    let db_inner = Arc::clone(db.inner());
+    // 授权边界先于任何遍历:本机 WSL 不出站,但读到的仍是用户文件系统,
+    // 换后端不该绕过 granted-roots(已登记工作区 / 已授权目录),否则任何
+    // UNC 路径(包括别人 home 下的目录)都能被列出来。canonicalize 顺带把
+    // `\\?\UNC\` 收成 `\\wsl.localhost\…`(V18),后面的解析即以此为准。
+    let path_for_check = path.clone();
+    let db_for_check = Arc::clone(&db_inner);
+    let resolved = tauri::async_runtime::spawn_blocking(move || {
+        ensure_allowed(&path_for_check, &db_for_check)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    // 本机 WSL 工作区在发行版内跑 `rg --files`(实机 V23:75ms vs UNC 1.4s)。
+    // `rg` 缺失时回落到 UNC 遍历并登记一条提示,而不是让 `@` 列表空掉。
+    // 带 `meta.wsl` 的远程工作区即使路径形似 UNC 也不归本机(§10 P1-3):
+    // 它的文件列表由插件提供,这里不能悄悄换成宿主发行版。
+    let resolved_text = resolved.to_string_lossy().to_string();
+    if crate::engine::wsl_transport::path_in_meta_wsl_workspace(&db_inner, &resolved_text) {
+        return Err("该路径属于远程 WSL 工作区,文件列表由插件提供".to_string());
+    }
+    if let Some(unc) = crate::engine::wsl_path::parse_wsl_unc(&resolved_text) {
+        match crate::engine::wsl_index::list_files(&unc, include_ignored).await {
+            Ok(entries) => return Ok(entries),
+            Err(error) if error == crate::engine::wsl_index::RG_MISSING => {
+                crate::engine::wsl_notice::record_rg_missing(&unc.distro);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        list_file_index_blocking(&db, &path, include_ignored.unwrap_or(false))
+        list_file_index_blocking(&db_inner, &path, include_ignored)
     })
     .await
     .map_err(|e| e.to_string())?

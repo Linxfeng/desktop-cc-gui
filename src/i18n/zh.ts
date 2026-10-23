@@ -2306,6 +2306,53 @@ export const zh = {
       checkedAt: "检测于 {{time}} · 耗时 {{ms}} ms",
     },
   },
+  wsl: {
+    settings: "WSL",
+    settingsDesc:
+      "本机 WSL 工作区直接以 \\\\wsl.localhost\\<发行版>\\… 登记，命令在发行版内执行，不需要额外插件或出网。",
+    distros: "已安装发行版",
+    distrosEmpty: "未检测到 WSL 发行版",
+    distrosLoading: "正在读取发行版列表…",
+    distrosUnavailable: "无法读取发行版列表，请确认已安装 WSL",
+    engines: "发行版内可用的 CLI",
+    enginesEmpty: "该发行版内没有探测到可用的 CLI",
+    cliPathFor: "{{cli}} 路径覆盖",
+    cliPathDesc:
+      "探测不到时手工指定（例如装在非标准目录）:填发行版内的绝对路径，留空则退回自动探测。",
+    cliPathInvalid: "路径无效：{{message}}",
+    cliPathReason: {
+      notAbsolute: "必须是发行版内的绝对路径（以 / 开头）",
+      mntPath: "不能指向 /mnt/ 下的 Windows 程序",
+      controlChars: "包含控制字符",
+      badKey: "内部错误：覆盖项的键格式不正确",
+      badDistro: "发行版名不受支持",
+      badEngine: "引擎 id 不受支持",
+    },
+    rescan: "重新检测",
+    noticeExitUnproven:
+      "{{distro}} 内的会话进程可能仍在运行（回收未确认）。如占用资源，请在 WSL 终端里用 ps 检查。",
+    noticeRgMissing:
+      "{{distro}} 内没有 ripgrep：@ 文件列表已退回按 UNC 遍历，速度明显变慢。在发行版内安装 rg（如 sudo apt install ripgrep）后点「重新检测」。",
+    dismiss: "知道了",
+    dismissNamed: "关闭 {{name}} 的提示",
+    error: {
+      notInstalled: "本机没有检测到 WSL，请先在 Windows 中安装并启用 WSL。",
+      distroNotFound: "找不到该 WSL 发行版，它可能已被重命名或卸载。",
+      startTimeout: "WSL 发行版启动超时，请重试；首次启动可能需要更久。",
+      probeFailed: "WSL 发行版探测失败：{{message}}",
+      cliNotFound: "发行版内找不到该 CLI：{{name}}。请确认它已安装，或在设置 → WSL 里重新检测。",
+      cliNotExecutable: "发行版内的该 CLI 不可执行：{{name}}。请检查文件权限（chmod +x），或在设置 → WSL 里重新检测。",
+      cwdNotFound: "发行版内找不到该工作区目录：{{path}}。它可能已被删除或移动，CLI 没有在根目录下启动。",
+      sessionUnreadable: "发行版内的会话文件不可读，可能已被删除或没有读取权限。",
+      sessionTooLarge: "会话文件过大（{{size}}，上限 {{limit}}）。",
+      transcriptTimeout: "读取发行版内会话超时，请重试；首次读取大文件可能需要更久。",
+      transcriptDecode: "会话内容读取失败：{{message}}",
+      shortCallTimeout: "发行版内命令执行超时，请重试。",
+      shortCallFailed: "发行版内命令执行失败：{{message}}",
+      exitUnproven: "WSL 内会话回收未确认：{{message}}",
+      generic: "WSL 操作失败：{{message}}",
+    },
+  },
 
 };
 

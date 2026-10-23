@@ -4,6 +4,7 @@ import {
   type EngineInfo,
   type SessionMeta,
   type Workspace,
+  type WslNotice,
 } from "@/lib/ipc";
 import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
 import { listenEngineEvents, listenSessionsChanged, listenComputerUseEscape } from "@/lib/events";
@@ -31,6 +32,8 @@ import {
   listExternalSessionMetas,
   setSessionSourcesChangedCallback,
 } from "@/features/plugins/runtime/session-source";
+import { listWslSessionMetas, forgetWslWorkspace, takeWslNotices } from "../wsl-sessions";
+import { isWslUncWorkspace } from "@/lib/wsl-path";
 import { emitSessionActivated } from "@/features/plugins/runtime/events";
 import {
   dispatchSessionClosed,
@@ -70,6 +73,27 @@ function withoutArchived(
   );
 }
 
+/** 同一 (kind, 发行版) 只留一条:后端已按 run 合并过「回收未确认」,但两次
+ *  刷新之间仍可能排进多条;展示层再按可见身份去重,避免刷屏。 */
+function wslNoticeKey(notice: WslNotice): string {
+  return notice.kind === "rgMissing"
+    ? `${notice.kind}/${notice.distro}`
+    : `${notice.kind}/${notice.distro}/${notice.runId}`;
+}
+
+/** 把本轮取到的提示并进展示副本:新提示在前,已展示过的同一身份不重复。 */
+function mergeWslNotices(current: WslNotice[], incoming: WslNotice[]): WslNotice[] {
+  if (incoming.length === 0) return current;
+  const seen = new Set(current.map(wslNoticeKey));
+  const fresh = incoming.filter((notice) => {
+    const key = wslNoticeKey(notice);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return fresh.length === 0 ? current : [...fresh, ...current];
+}
+
 /**
  * Session lifecycle: init/refresh of the session/engine catalogs, history
  * paging, and sidebar session ops (archive/delete/pin/rename).
@@ -107,6 +131,8 @@ export function createSessionActions(
   | "deleteSession"
   | "pinSession"
   | "renameSession"
+  | "drainWslNotices"
+  | "dismissWslNotice"
 > {
   const {
     set,
@@ -176,10 +202,34 @@ export function createSessionActions(
       // scan so WSL 等远端会话进侧栏,且重启时已开标签不至于因“会话表无
       // 此会话”被清掉。
       setSessionSourcesChangedCallback(() => void get().refreshSessions());
+      const workspacePaths = workspaces.map((w) => w.path);
       const external = await listExternalSessionMetas();
       const archivedSessionKeys = archivedKeyMap(archivedSessions);
+      // 本机 WSL 工作区是宿主能力,不走插件源;行形态一致,合并到同一目录。
+      // 发行版冷启动/卡死时探测可拖到 30s,不能让它阻塞首屏:最多等 2s,
+      // 迟到的结果再异步并进 store(§10 P1-12)。
+      const wslPromise = listWslSessionMetas(workspacePaths);
+      const wslMetas = await Promise.race([
+        wslPromise,
+        new Promise<SessionMeta[]>((resolve) =>
+          setTimeout(() => resolve([]), 2000),
+        ),
+      ]);
+      void wslPromise
+        .then((late) => {
+          if (late.length === 0) return;
+          const merged = withoutArchived(
+            mergeExternalSessions(get().sessions, late, workspacePaths),
+            archivedSessionKeys,
+          );
+          set({ sessions: visibleSessions(merged, engines) });
+        })
+        .catch((error) => console.error("[wsl] late session merge failed", error));
+      // 上一进程生命周期里记下的运行期提示(回收未确认 / 缺 rg)在这里取走,
+      // 队列一取即空,不会每轮刷新重复弹。
+      void get().drainWslNotices();
       const allSessions = withoutArchived(
-        mergeExternalSessions(sessions, external, workspaces.map((w) => w.path)),
+        mergeExternalSessions(sessions, [...external, ...wslMetas], workspacePaths),
         archivedSessionKeys,
       );
       set({
@@ -196,7 +246,9 @@ export function createSessionActions(
           (t.sessionId === null ||
             allSessions.some(
               (s) => s.engine === t.engine && s.sessionId === t.sessionId,
-            )),
+            ) ||
+            // 本机 WSL 的行可能还在 2s 竞速之外到达:不能因此丢掉已开标签。
+            isWslUncWorkspace(t.workspacePath)),
       );
       set({ openTabs: restoredTabs });
       const persistedActive = readPersistedActive();
@@ -245,15 +297,24 @@ export function createSessionActions(
     },
 
     refreshSessions: async () => {
-      const [sessions, external, archivedSessions] = await Promise.all([
+      const workspacePaths = get().workspaces.map((w) => w.path);
+      const [sessions, external, wslMetas, archivedSessions] = await Promise.all([
         ipc.listSessions().catch(() => null),
         listExternalSessionMetas(),
+        listWslSessionMetas(workspacePaths),
         ipc.listArchivedSessions().catch(() => null),
       ]);
+      // 后台回收失败只写进后端队列(sessions://changed 之后才会走到这里),
+      // 顺手取走;不 await,侧栏刷新不等它。
+      void get().drainWslNotices();
       if (!sessions || !archivedSessions) return;
       const archivedSessionKeys = archivedKeyMap(archivedSessions);
       const merged = withoutArchived(
-        mergeExternalSessions(sessions, external, get().workspaces.map((w) => w.path)),
+        mergeExternalSessions(
+          sessions,
+          [...external, ...wslMetas],
+          workspacePaths,
+        ),
         archivedSessionKeys,
       );
       for (const session of archivedSessions) {
@@ -325,13 +386,17 @@ export function createSessionActions(
     },
 
     refreshEngines: async () => {
-      const [engines, sessions, external, archivedSessions, config] = await Promise.all([
-        ipc.listEngines().catch(() => null),
-        ipc.listSessions().catch(() => null),
-        listExternalSessionMetas(),
-        ipc.listArchivedSessions().catch(() => null),
-        ipc.getCliConfig?.().catch(() => null) ?? Promise.resolve(null),
-      ]);
+      const workspacePaths = get().workspaces.map((w) => w.path);
+      const [engines, sessions, external, wslMetas, archivedSessions, config] =
+        await Promise.all([
+          ipc.listEngines().catch(() => null),
+          ipc.listSessions().catch(() => null),
+          listExternalSessionMetas(),
+          listWslSessionMetas(workspacePaths),
+          ipc.listArchivedSessions().catch(() => null),
+          ipc.getCliConfig?.().catch(() => null) ?? Promise.resolve(null),
+        ]);
+      void get().drainWslNotices();
       if (!engines) return;
       set((s) => {
         const keys = archivedSessions
@@ -347,8 +412,8 @@ export function createSessionActions(
                     preserveUnscannedSessions(
                       mergeExternalSessions(
                         sessions,
-                        external,
-                        s.workspaces.map((w) => w.path),
+                        [...external, ...wslMetas],
+                        workspacePaths,
                       ),
                       s.sessions,
                       s.bySession,
@@ -547,6 +612,8 @@ export function createSessionActions(
         set({ actionError: errorText(error) });
         return;
       }
+      // 本机 WSL 的扫描缓存还握着这行:不失效的话下一次刷新会把它加回来。
+      if (meta?.workspacePath) forgetWslWorkspace(meta.workspacePath);
       set({ actionError: null });
       const key = sessionKey(engine, sessionId, "");
       const tab = get().openTabs.find(
@@ -611,6 +678,23 @@ export function createSessionActions(
       } catch (error) {
         set({ actionError: errorText(error) });
       }
+    },
+
+    drainWslNotices: async () => {
+      // Web 访问端/测试环境没有这个命令:takeWslNotices 已按空表处理。
+      const incoming = await takeWslNotices();
+      if (incoming.length === 0) return;
+      const current = get().wslNotices;
+      const merged = mergeWslNotices(current, incoming);
+      // 没有新增就不写入,避免每轮刷新都触发一次无关的 store 通知。
+      if (merged !== current) set({ wslNotices: merged });
+    },
+
+    dismissWslNotice: (notice) => {
+      const key = wslNoticeKey(notice);
+      set((s) => ({
+        wslNotices: s.wslNotices.filter((n) => wslNoticeKey(n) !== key),
+      }));
     },
   };
 }

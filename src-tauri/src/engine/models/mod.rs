@@ -165,9 +165,13 @@ pub async fn list_engine_models(
     crate::config::ensure_engine_enabled(&engine)?;
     // WSL 工作区:模型目录必须来自发行版内的 CLI(探针 bin),不是本机。
     if let Some(ws) = workspace.as_deref() {
-        if let Some(transport) =
-            crate::engine::wsl_transport::transport_for_workspace(&state.db, ws)
+        if let Some(mut transport) =
+            crate::engine::wsl_transport::transport_for_workspace(&state.db, ws)?
         {
+            // 冷缓存时先补齐探测:否则 bin 表为空,模型菜单静默为空(§10 P1-16)。
+            if transport.is_local() {
+                crate::engine::wsl_transport::ensure_local_probe(&mut transport).await?;
+            }
             match engine.as_str() {
                 "pi" | "omp" => {
                     return Ok(wsl::pi_family_catalog_remote(engine.as_str(), &transport).await);

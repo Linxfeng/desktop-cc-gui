@@ -100,10 +100,16 @@ pub(super) fn discover_claude(workspace: &Path) -> Vec<SessionFile> {
     out
 }
 
-/// Strip the `\\?\` verbatim prefix Windows `canonicalize` adds — the CLI
-/// encodes the plain path, so the prefix would break the match.
-fn strip_verbatim_prefix(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+/// Strip the verbatim prefix Windows `canonicalize` adds — the CLI encodes
+/// the plain path, so the prefix would break the match. UNC paths come back
+/// as `\\?\UNC\server\share\…` and must regain their leading `\\`, or the
+/// stripped spelling becomes the relative-looking `UNC\server\…` and no
+/// project dir ever matches (V18).
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = crate::files::strip_verbatim_unc(path) {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
 /// Candidate `<projects>/<encoded>` dirs for one workspace. Windows terminals
@@ -129,7 +135,7 @@ fn claude_project_dirs(base: &Path, workspace: &Path) -> Vec<PathBuf> {
     push(&mut out, &mut seen, base, &trimmed);
     for spelling in [&raw, &trimmed] {
         if let Ok(canonical) = std::fs::canonicalize(spelling) {
-            let canonical = strip_verbatim_prefix(&canonical.to_string_lossy()).to_string();
+            let canonical = strip_verbatim_prefix(&canonical.to_string_lossy());
             push(&mut out, &mut seen, base, &canonical);
         }
     }
@@ -257,7 +263,7 @@ fn qoder_project_dirs(base: &Path, workspace: &Path) -> Vec<PathBuf> {
     push(&mut out, &mut seen, base, &trimmed);
     for spelling in [&raw, &trimmed] {
         if let Ok(canonical) = std::fs::canonicalize(spelling) {
-            let canonical = strip_verbatim_prefix(&canonical.to_string_lossy()).to_string();
+            let canonical = strip_verbatim_prefix(&canonical.to_string_lossy());
             push(&mut out, &mut seen, base, &canonical);
         }
     }
@@ -1180,6 +1186,26 @@ mod tests {
         assert_eq!(
             strip_verbatim_prefix("/Users/demo/proj"),
             "/Users/demo/proj"
+        );
+    }
+
+    /// V18: `canonicalize` spells a UNC workspace as `\\?\UNC\…`; keeping
+    /// only the tail would leave `UNC\wsl.localhost\…`, which no CLI-encoded
+    /// project path can ever equal.
+    #[test]
+    fn strip_verbatim_prefix_keeps_unc_double_backslash() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\wsl.localhost\Ubuntu\home\me\repo"),
+            r"\\wsl.localhost\Ubuntu\home\me\repo"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\unc\wsl$\Ubuntu\home"),
+            r"\\wsl$\Ubuntu\home"
+        );
+        // 已在普通 UNC 形态:原样返回
+        assert_eq!(
+            strip_verbatim_prefix(r"\\wsl.localhost\Ubuntu\home"),
+            r"\\wsl.localhost\Ubuntu\home"
         );
     }
 

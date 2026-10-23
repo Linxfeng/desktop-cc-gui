@@ -12,6 +12,7 @@ import FlaskConical from "lucide-react/dist/esm/icons/flask-conical";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import Bot from "lucide-react/dist/esm/icons/bot";
 import FileText from "lucide-react/dist/esm/icons/file-text";
+import Terminal from "lucide-react/dist/esm/icons/terminal";
 import Smartphone from "lucide-react/dist/esm/icons/smartphone";
 import ChartColumn from "lucide-react/dist/esm/icons/chart-column";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles";
@@ -35,6 +36,8 @@ import { CliConfigSection } from "./CliConfigSection";
 import { AboutSection } from "./AboutSection";
 import { PerformanceDiagnosticsSection } from "./PerformanceDiagnostics";
 import { BetaFeaturesSection } from "./BetaFeaturesSection";
+import { WslSection } from "./WslSection";
+import { IS_WINDOWS, isWeb } from "@/lib/platform";
 import { UpdateSection } from "./UpdateSection";
 import { WebAccessSection } from "./WebAccessSection";
 import { UsageSection } from "./UsageSection";
@@ -266,6 +269,21 @@ settingsRegistry.register({
   order: 0,
   component: BetaFeaturesSection,
 });
+// 本机 WSL:发行版列表 + 各发行版内探到的 CLI + 「重新检测」(设计稿 §5.9)。
+// 放在 workspace 组:设置对象是"工作区从哪来、里面能跑什么"。
+// 桌面 Windows 专属能力:Web 访问端与非 Windows 平台没有 `wsl_*` IPC,
+// 注册进去只会在挂载时报 unknown command(§10 P1-2)。
+if (!isWeb && IS_WINDOWS) {
+  settingsRegistry.register({
+    id: "wsl",
+    key: "wsl",
+    label: () => i18n.t("wsl.settings"),
+    icon: Terminal,
+    group: "workspace",
+    order: 3,
+    component: WslSection,
+  });
+}
 ENGINE_IDS.forEach((engine, index) => {
   settingsRegistry.register({
     id: `cli:${engine}`,

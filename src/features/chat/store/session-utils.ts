@@ -45,14 +45,20 @@ export function mergeExternalSessions(
 ): SessionMeta[] {
   if (external.length === 0) return local;
   const known = new Set(workspacePaths);
-  const seen = new Set(
-    local.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath)),
-  );
-  const extra = external.filter(
-    (e) =>
-      known.has(e.workspacePath) &&
-      !seen.has(sessionKey(e.engine, e.sessionId, e.workspacePath)),
-  );
+  // 外部源之间也要去重(插件会话源与宿主 WSL 源可能上报同一会话)。
+  // 键必须带 workspacePath:同一 engine/sessionId 在父/子工作区是两行,
+  // 而 sessionKey 会忽略路径(§10 P1-11)。
+  const dedupeKey = (s: SessionMeta) =>
+    `${s.engine}/${s.sessionId}/${s.workspacePath}`;
+  const seen = new Set(local.map(dedupeKey));
+  const extra: SessionMeta[] = [];
+  for (const e of external) {
+    if (!known.has(e.workspacePath)) continue;
+    const key = dedupeKey(e);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    extra.push(e);
+  }
   return extra.length === 0 ? local : [...local, ...extra];
 }
 

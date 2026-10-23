@@ -6,14 +6,26 @@ import type { AppSettings } from "@/lib/ipc";
 
 // Pages read their settings (and the pet page its package list) on mount; the
 // proxy keeps every other method inert for the module tree they pull in.
-const { getAppSettings, listPets, webDevices, dshHostStatus, listGrantedRoots } =
-  vi.hoisted(() => ({
+const {
+  getAppSettings,
+  listPets,
+  webDevices,
+  dshHostStatus,
+  listGrantedRoots,
+  wslDistros,
+  wslProbeSnapshot,
+  wslReprobe,
+} = vi.hoisted(() => ({
     getAppSettings: vi.fn(),
     listPets: vi.fn(async () => []),
     // Web 访问 lists devices on mount; the page indexes its row above them.
     webDevices: vi.fn(async () => []),
     // 工作区 keeps a section (已授权目录) that only renders with data.
     listGrantedRoots: vi.fn(async () => ["/tmp/granted-root"]),
+    // WSL 页挂载只读快照;显式返回空表,让测试走「无发行版」而不是异常分支。
+    wslDistros: vi.fn(async () => [] as string[]),
+    wslProbeSnapshot: vi.fn(async () => []),
+    wslReprobe: vi.fn(async () => []),
     // 本地主机 probes the host on mount (dsh page only).
     dshHostStatus: vi.fn(async () => ({
       installed: false,
@@ -29,7 +41,16 @@ const { getAppSettings, listPets, webDevices, dshHostStatus, listGrantedRoots } 
   }));
 vi.mock("@/lib/ipc", () => ({
   ipc: new Proxy(
-    { getAppSettings, listPets, webDevices, listGrantedRoots, dshHostStatus },
+    {
+      getAppSettings,
+      listPets,
+      webDevices,
+      listGrantedRoots,
+      dshHostStatus,
+      wslDistros,
+      wslProbeSnapshot,
+      wslReprobe,
+    },
     {
       get: (target, prop) =>
         prop in target ? Reflect.get(target, prop) : async () => null,
@@ -43,6 +64,13 @@ vi.mock("@/lib/ipc", () => ({
 vi.mock("@/lib/transport", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/transport")>()),
   isWeb: false,
+}));
+
+// 本机 WSL 页面只在桌面 Windows 注册(§10 P1-2);jsdom 的 userAgent 不是
+// Windows,这里显式模拟,否则「WSL 页已渲染」与「搜索项已声明」会对不上。
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/platform")>()),
+  IS_WINDOWS: true,
 }));
 
 import i18n from "@/lib/i18n";
@@ -60,6 +88,7 @@ import type { CliConfigState } from "./useCliConfig";
 import { UpdateSection } from "./UpdateSection";
 import { WebAccessSection } from "./WebAccessSection";
 import { WorkspacesSection } from "./WorkspacesSection";
+import { WslSection } from "./WslSection";
 import { useChatStore } from "@/features/chat/store";
 import { ShortcutsSection } from "@/features/shortcuts/ShortcutsSection";
 import { SkillsSection } from "@/features/skills/SkillsSection";
@@ -146,6 +175,8 @@ const PAGES: PageSpec[] = [
   { page: "prompts", render: () => <PromptsPane /> },
   { page: "skills", render: () => <SkillsSection /> },
   { page: "workspaces", render: () => <WorkspacesSection /> },
+  // 本机 WSL:发行版列表读不到时只有「重新检测」这一行可索引。
+  { page: "wsl", render: () => <WslSection /> },
   {
     page: "webAccess",
     render: () => <WebAccessSection />,

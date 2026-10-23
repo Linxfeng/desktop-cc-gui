@@ -655,6 +655,7 @@ async fn run_create(
             Some("worktree".to_string()),
             Some(args.parent_workspace_id.clone()),
         )
+        .await
         // The worktree exists on disk now; only the sidebar row is missing.
         // A retry hits the resume path above and lands here again.
         .map_err(|e| fail("register_failed", e))?;

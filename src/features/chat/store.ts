@@ -199,6 +199,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     drafts: {},
     pendingMention: null,
     actionError: null,
+    wslNotices: [],
     initialized: false,
     restoredSessionKeys: {},
     createdSessionKeys: {},

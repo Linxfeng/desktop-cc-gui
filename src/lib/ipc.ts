@@ -36,7 +36,30 @@ export interface SessionMeta {
 }
 
 export type TodoStatus = "pending" | "active" | "complete" | "blocked" | "dropped";
-
+/** One history row found inside a WSL distro (`wsl_list_sessions`). Same shape
+ *  as a plugin session-source row, so both merge through one path. */
+export interface WslSessionRow {
+  engine: string;
+  sessionId: string;
+  /** Registered workspace path (the `\\wsl.localhost\…` UNC root). */
+  workspacePath: string;
+  title: string;
+  updatedAt: number | null;
+  /** Absolute transcript path inside the distro. */
+  remotePath: string;
+}
+/** Runtime notice drained from the native queue (`wsl_take_unproven_notices`). */
+export type WslNotice =
+  | { kind: "exitUnproven"; distro: string; runId: string; atMs: number }
+  | { kind: "rgMissing"; distro: string; atMs: number };
+/** One distro's probe result in Settings → WSL (`wsl_reprobe`). */
+export interface WslDistroEngines {
+  distro: string;
+  /** Engine ids whose CLI was found inside this distro (or overridden). */
+  engines: string[];
+  /** Engine id → CLI version inside the distro (`--version`); missing = unknown. */
+  versions: Record<string, string>;
+}
 export interface TodoItem {
   id?: string | null;
   content: string;
@@ -1557,6 +1580,32 @@ export const ipc = {
     remotePath: string,
   ) =>
     invoke<void>("delete_remote_session", { workspacePath, engine, sessionId, remotePath }),
+  // ---- 本机 WSL(工作区就是 \\wsl.localhost\<发行版>\… 的 UNC 路径) ----
+  /** 发行版内可用的引擎 id(按 registry 顺序)。判定依据是发行版内
+   *  `bash -ic` 探到的 CLI,不是 Windows 侧本机探测 —— 本机没装不影响。 */
+  wslEngineAvailability: (workspacePath: string) =>
+    invoke<string[]>("wsl_engine_availability", { workspacePath }),
+  /** 已安装发行版(`wsl.exe -l -q`);读不到时为空表。 */
+  wslDistros: () => invoke<string[]>("wsl_distros"),
+  /** 丢弃探测缓存并重新检测一次(设置页「重新检测」)。不传发行版 = 全部重新
+   *  检测,返回每个发行版的可用引擎;传发行版 = 只检测它。 */
+  wslReprobe: (distro?: string) =>
+    invoke<WslDistroEngines[]>("wsl_reprobe", { distro: distro ?? null }),
+  /** 读取当前探测结果(不失效缓存);设置页挂载时用。 */
+  wslProbeSnapshot: () =>
+    invoke<WslDistroEngines[]>("wsl_probe_snapshot"),
+  /** 发行版内工作区的历史会话(与插件会话源同形,`remotePath` 用于回放/删除)。 */
+  wslListSessions: (workspacePath: string) =>
+    invoke<WslSessionRow[]>("wsl_list_sessions", { workspacePath }),
+  /** 取走运行期提示(未确认的进程回收、缺失的 rg);取走即清空。 */
+  wslTakeNotices: () => invoke<WslNotice[]>("wsl_take_unproven_notices"),
+  /** 手工指定某个发行版内 CLI 的绝对路径(优先于探测结果)。传空串 = 删除
+   *  该覆盖,退回探测。路径必须是发行版内的绝对路径,不能是 `/mnt/…`。 */
+  setWslEnginePath: (distro: string, engine: string, path: string) =>
+    invoke<void>("set_wsl_engine_path", { distro, engine, path }),
+  /** 某发行版已登记的 CLI 覆盖(引擎 id → 绝对路径)。 */
+  getWslEnginePaths: (distro: string) =>
+    invoke<[string, string][]>("get_wsl_engine_paths", { distro }),
   pinSession: (engine: string, sessionId: string, pinned: boolean) =>
     invoke<void>("pin_session", { engine, sessionId, pinned }),
   renameSession: (engine: string, sessionId: string, title: string) =>

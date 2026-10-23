@@ -197,6 +197,8 @@ pub fn run() {
             // Clone what the initial scan needs before state moves into manage.
             let scan_db = Arc::clone(&state.db);
             let scan_sink = Arc::clone(&state.sink);
+            // 同上:启动兜底回收只用只读一次工作区表,不共享上面的 Arc。
+            let wsl_db = Arc::clone(&state.db);
             app.manage(state);
             // Provider commands inject State<'_, ConfigStore> directly (not
             // via AppState), so the store must be managed as its own type —
@@ -225,6 +227,15 @@ pub fn run() {
             }
             // Initial history scan, non-blocking.
             history::scanner::spawn_scan(scan_db, scan_sink);
+            // 本机 WSL:上次运行被强杀/崩溃带走时,发行版 /tmp 里可能还留着
+            // 启动器与 pidfile,对应的 Linux 会话可能仍活着(§5.7 第 4 条)。
+            // 后台一次短调用按会话回收,只碰本应用写的 pidfile。
+            // 只有登记过本机 WSL 工作区才有必要:没用过就不去惊动发行版。
+            if db_has_wsl_workspace(&wsl_db) {
+                tauri::async_runtime::spawn(async move {
+                    engine::wsl_availability::reclaim_startup_sessions().await;
+                });
+            }
             // 内置「插件开发」skill：同步进已存在引擎的 skills 根（幂等，失败
             // 只记日志）——skill 只有落在 CLI 自己的根里才会被引擎加载，
             // 见 creator_skill.rs 模块注释。
@@ -350,6 +361,10 @@ pub fn run() {
                 }
                 if let Some(state) = window.try_state::<AppState>() {
                     state.processes.kill_all();
+                    // 退出时等一次 Linux 会话清扫:turn 结束时 pidfile 被保留,
+                    // 就是为了覆盖 CLI 用 nohup 拉起的后台进程(§5.7 第 6 条)。
+                    // 总预算 5s;自建 runtime 的细节见函数注释。
+                    engine::wsl_availability::reclaim_all_on_exit_blocking();
                     state.dsh_host.kill_spawned();
                     state.opencode_server.kill_spawned();
                     plugin_caps::kill_all_tracked_children();
@@ -450,6 +465,13 @@ pub fn run() {
             engine::list_plan_reviews,
             engine::list_engines,
             engine::models::list_engine_models,
+            engine::wsl_availability::wsl_engine_availability,
+            engine::wsl_availability::wsl_distros,
+            engine::wsl_availability::wsl_reprobe,
+            engine::wsl_availability::wsl_probe_snapshot,
+            engine::wsl_notice::wsl_take_unproven_notices,
+            settings::set_wsl_engine_path,
+            settings::get_wsl_engine_paths,
             engine::pi_family_auth::pi_family_auth_list,
             engine::pi_family_auth::pi_family_auth_set_api_key,
             engine::pi_family_auth::pi_family_auth_delete_credential,
@@ -484,6 +506,7 @@ pub fn run() {
             history::search::search_messages,
             history::reader::delete_session,
             history::reader::delete_remote_session,
+            history::wsl_sessions::wsl_list_sessions,
             history::reader::pin_session,
             history::reader::rename_session,
             history::reader::remember_session_model,
@@ -691,3 +714,23 @@ fn adopt_login_shell_path() {
 
 #[cfg(not(unix))]
 fn adopt_login_shell_path() {}
+
+/// 有没有登记过本机 WSL 工作区(`\\wsl.localhost\…`)。启动兜底回收只对这类
+/// 工作区有意义:没用过本机 WSL 就不必在启动时去惊动发行版(一次短调用约
+/// 0.7s,实机 V17)。查不到按"没有"处理 —— 启动路径不为它失败。
+fn db_has_wsl_workspace(db: &std::sync::Arc<db::Db>) -> bool {
+    // 一次性收完再判断:rusqlite 的 Statement/Row 都借用 Connection,让
+    // 迭代器越过锁的生命周期会借不过去。工作区数量是十量级,全取无妨。
+    let conn = db.0.lock();
+    let paths: Vec<String> = match conn.prepare("SELECT path FROM workspaces") {
+        Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    drop(conn);
+    paths
+        .iter()
+        .any(|path| engine::wsl_path::parse_wsl_unc(path).is_some())
+}

@@ -38,6 +38,20 @@ describe("filterEngineOptions", () => {
     expect(out[0]?.available).toBe(true);
     expect(out[0]?.disabled).toBe(false);
   });
+
+  it("delegated 但结果未到/失败:不回落到本机探针,不隐藏引擎", () => {
+    // Windows 侧一个都没装,发行版探测还没返回(或失败)→ allowed=null。
+    // 此时必须仍列出全部已启用引擎,否则「Windows 不装 CLI」场景在
+    // 探测的 2.4s 内/失败后菜单为空(§10 P1-1)。
+    const out = filterEngineOptions(
+      [engine("claude", { available: false }), engine("codex", { available: false })],
+      null,
+      t,
+      true,
+    );
+    expect(out.map((o) => o.id)).toEqual(["claude", "codex"]);
+    expect(out.every((o) => o.available)).toBe(true);
+  });
 });
 
 describe("orderEngineOptions", () => {

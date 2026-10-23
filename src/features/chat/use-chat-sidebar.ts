@@ -16,7 +16,14 @@ import { dismissCenterSurfaces } from "./center-surfaces";
 import { focusComposerWhenVisible } from "./focus-composer";
 import { relativeTime } from "./time";
 import { useWorkspaceUIHooks, workspaceLabelSuffix } from "./workspace-ui-bridge";
+import { parseWslUncPath } from "@/lib/wsl-path";
 import type { ChatPageDialog } from "./ChatPageDialogs";
+
+/** 本机 WSL 工作区的侧栏徽标 = 发行版名(`\\wsl.localhost\Ubuntu\…` →
+ *  `Ubuntu`)。非 WSL 路径返回 null。设计稿 §5.9 要求宿主内建,不依赖插件。 */
+export function wslBadgeFor(path: string): string | null {
+  return parseWslUncPath(path)?.distro ?? null;
+}
 
 /** Sidebar data and actions: the workspace/thread repo list plus thread
  * selection, pin/rename/delete dispatch, workspace add/remove/reorder, and
@@ -110,7 +117,12 @@ export function useChatSidebar({
       // Sidebar alias: a user-set name replaces the folder name in the
       // sidebar only; the original stays on the row tooltip.
       const alias = workspaceAliases[w.id]?.trim();
-      const suffix = workspaceLabelSuffix(w.path);
+      // 本机 WSL 工作区由宿主给徽标(发行版名,便于区分多发行版)。
+      // 设计稿 §5.9:`window.__ccguiWorkspaceUI` 只有一个钩子槽位,宿主内建
+      // 判断不能注册进去(否则装了「WSL 管理器」插件就被覆盖),只能在求值处
+      // 先判断是不是本机 UNC —— 是则用宿主结果,否则交给插件钩子。
+      const suffix =
+        wslBadgeFor(w.path) ?? workspaceLabelSuffix(w.path) ?? null;
       const meta = worktreeMetaOf(w);
       const children = childrenByParent.get(w.id);
       return {
@@ -205,17 +217,19 @@ export function useChatSidebar({
     return result;
   }, [workspaces, archivedIds, workspaceAliases]);
 
-  /** 「添加工作区」：选目录并登记。返回选中的路径（取消 / web 模式 / 登记
-   *  失败返回 null），调用方据此接下一步——「新建会话」在没有工作区时要接着
-   *  把会话开出来，否则用户点的是新会话，拿到的只有一次选目录。登记失败时
-   *  store 已经把错误放进错误条，这里只负责不继续往下走。 */
+  /** 「添加工作区」：选目录并登记。返回**登记后的路径**（取消 / web 模式 /
+   *  登记失败返回 null），调用方据此接下一步——「新建会话」在没有工作区时要
+   *  接着把会话开出来，否则用户点的是新会话，拿到的只有一次选目录。用登记后
+   *  的路径而不是选中的原始路径：后端会把 `\\wsl$` 归一成 `\\wsl.localhost`，
+   *  原始路径没有对应的工作区行。登记失败时 store 已经把错误放进错误条，这里
+   *  只负责不继续往下走。 */
   const handleAddWorkspace = useCallback(async (): Promise<string | null> => {
     // 移动端/网页访问模式没有目录选择器，侧栏也不渲染添加入口。
     if (isWeb) return null;
     try {
       const path = await pickDirectory(t("chat.addWorkspace"));
       if (!path) return null;
-      return (await addWorkspace(path)) ? path : null;
+      return await addWorkspace(path);
     } catch {
       return null;
     }

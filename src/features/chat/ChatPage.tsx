@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useChatStore } from "./store";
 import { SessionTabStrip } from "./components/SessionTabStrip";
 import { ErrorBanner } from "./components/ErrorBanner";
+import { WslNotices } from "./components/WslNotices";
 import { AppStatusBar } from "@/components/application/app-status-bar/app-status-bar";
 import { isWeb } from "@/lib/platform";
 import { useTitlebarStyle } from "@/features/settings/titlebar";
@@ -305,6 +306,9 @@ export default function ChatPage() {
             onDismiss={dismissActionError}
           />
         )}
+        {/* 本机 WSL 的后台事实(回收未确认 / 缺 rg):不是某次操作的失败,
+            走 status 提示条而不是错误横幅。 */}
+        <WslNotices className="mx-4 mt-2" />
 
         <div
           id="center-tabpanel"

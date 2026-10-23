@@ -1446,6 +1446,7 @@ mod tests {
                 stdin: None,
                 questions: Arc::new(StdMutex::new(HashMap::new())),
                 plans: Arc::new(StdMutex::new(HashMap::new())),
+                wsl_local: None,
             },
         );
         let core = TurnCore {
