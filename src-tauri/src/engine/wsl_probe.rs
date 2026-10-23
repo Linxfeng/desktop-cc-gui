@@ -37,6 +37,8 @@ pub struct WslProbe {
     /// 发行版内核标识(`/proc/sys/kernel/osrelease`)。用于显式拒绝 WSL1:
     /// WSL1 没有真实 Linux 会话,进程回收与 UNC 语义都不同(§10 D7)。
     pub kernel: String,
+    /// `$KIMI_CODE_HOME`(未设置时为空,脚本侧回退 `$HOME/.kimi-code`)。
+    pub kimi_home: String,
     /// `$PI_CODING_AGENT_DIR`(未设置时为空,脚本侧回退 `$HOME/.pi/agent`)。
     pub pi_agent_dir: String,
     /// 命令名 → 发行版内绝对路径(已过滤 `/mnt/` 下的 Windows 程序)。
@@ -146,7 +148,7 @@ pub fn invalidate(distro: &str) {
 /// `type -ap` 逐个列出候选(含 alias/function 之外的路径),第一个不在
 /// `/mnt/` 下的即可用项胜出;用 `while read` 而不是 `$(…)` 迭代,带空格的
 /// 路径不会被拆开。
-pub const PROBE_SCRIPT: &str = r#"printf '\n__CCGUI__HOME=%s\n__CCGUI__PATH=%s\n__CCGUI__CODEX_HOME=%s\n__CCGUI__CLAUDE_HOME=%s\n__CCGUI__PI_AGENT_DIR=%s\n__CCGUI__KERNEL=%s\n' "$HOME" "$PATH" "${CODEX_HOME:-}" "${CLAUDE_CONFIG_DIR:-}" "${PI_CODING_AGENT_DIR:-}" "$(cat /proc/sys/kernel/osrelease 2>/dev/null)"
+pub const PROBE_SCRIPT: &str = r#"printf '\n__CCGUI__HOME=%s\n__CCGUI__PATH=%s\n__CCGUI__CODEX_HOME=%s\n__CCGUI__CLAUDE_HOME=%s\n__CCGUI__KIMI_HOME=%s\n__CCGUI__PI_AGENT_DIR=%s\n__CCGUI__KERNEL=%s\n' "$HOME" "$PATH" "${CODEX_HOME:-}" "${CLAUDE_CONFIG_DIR:-}" "${KIMI_CODE_HOME:-}" "${PI_CODING_AGENT_DIR:-}" "$(cat /proc/sys/kernel/osrelease 2>/dev/null)"
 for c in claude codex kimi grok mcode pi rg git; do
   type -ap "$c" 2>/dev/null | while IFS= read -r p; do
     case "$p" in /mnt/*) continue ;; esac
@@ -172,6 +174,7 @@ pub fn parse_probe_output(raw: &str) -> Result<WslProbe, String> {
     let mut path = None;
     let mut codex_home = String::new();
     let mut claude_home = String::new();
+    let mut kimi_home = String::new();
     let mut pi_agent_dir = String::new();
     let mut kernel = String::new();
     let mut bins = BTreeMap::new();
@@ -186,6 +189,8 @@ pub fn parse_probe_output(raw: &str) -> Result<WslProbe, String> {
             codex_home = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("__CCGUI__CLAUDE_HOME=") {
             claude_home = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("__CCGUI__KIMI_HOME=") {
+            kimi_home = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("__CCGUI__PI_AGENT_DIR=") {
             pi_agent_dir = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("__CCGUI__KERNEL=") {
@@ -223,6 +228,7 @@ pub fn parse_probe_output(raw: &str) -> Result<WslProbe, String> {
         codex_home,
         claude_home,
         kernel,
+        kimi_home,
         pi_agent_dir,
         bins,
         versions,
@@ -511,6 +517,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(probe.pi_agent_dir, "/data/pi");
+    }
+
+    #[test]
+    fn parses_kimi_home_sentinel() {
+        let probe = parse_probe_output(
+            "__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n__CCGUI__KIMI_HOME=/data/kimi\n",
+        )
+        .unwrap();
+        assert_eq!(probe.kimi_home, "/data/kimi");
     }
 
     #[test]

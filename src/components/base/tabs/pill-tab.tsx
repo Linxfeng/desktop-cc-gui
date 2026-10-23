@@ -16,8 +16,9 @@ const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffec
  *   blue      fully rounded (40px); selected bg uses the semantic blue pill
  *             surface, icon + label color/blue/500 (the AI chat panel switcher)
  *   gray      radius/2lg (10px); selected bg background/tertiary, label
- *             text/primary (quieter — scope/filter rows like the settings
- *             Tools page)
+ *             text/primary (quieter — filter rows like the settings Tools
+ *             page; its dark-theme selected bg is close to the card, so a
+ *             primary mode switch should use blue)
  *   idle      label text/secondary, icon foreground/icon/secondary,
  *             background/primary/hover on hover (both styles)
  *   icon      optional 16px leading glyph

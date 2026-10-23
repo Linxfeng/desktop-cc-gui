@@ -60,6 +60,26 @@ export interface WslDistroEngines {
   /** Engine id → CLI version inside the distro (`--version`); missing = unknown. */
   versions: Record<string, string>;
 }
+/** Where an engine's WSL CLI path came from (`wsl_cli_status`). */
+export type WslCliSource = "probe" | "override" | "missing";
+/** One supported engine's CLI state inside a WSL distro. */
+export interface WslCliStatus {
+  engine: string;
+  distro: string;
+  bin: string | null;
+  version: string | null;
+  source: WslCliSource;
+  /** Absolute path of the CLI's official config file inside the distro;
+   *  display-only (it is not read or written here). */
+  configPath: string | null;
+  /** Age of the probe cache in seconds; null only when it was invalidated
+   *  concurrently between `ensure` and the cache read. */
+  probedAgoSecs: number | null;
+}
+/** Engine ids this backend can run inside WSL, in `config::ENGINES` order. */
+export interface WslCliCapabilities {
+  engines: string[];
+}
 export interface TodoItem {
   id?: string | null;
   content: string;
@@ -1594,6 +1614,11 @@ export const ipc = {
   /** 读取当前探测结果(不失效缓存);设置页挂载时用。 */
   wslProbeSnapshot: () =>
     invoke<WslDistroEngines[]>("wsl_probe_snapshot"),
+  /** 后端当前能在 WSL 中运行的引擎(CLI 管理据此决定是否显示 WSL 作用域)。 */
+  wslCliCapabilities: () => invoke<WslCliCapabilities>("wsl_cli_capabilities"),
+  /** 某发行版内受支持引擎的 CLI 状态(只读;复用探测缓存,不强制重探)。 */
+  wslCliStatus: (distro: string) =>
+    invoke<WslCliStatus[]>("wsl_cli_status", { distro }),
   /** 发行版内工作区的历史会话(与插件会话源同形,`remotePath` 用于回放/删除)。 */
   wslListSessions: (workspacePath: string) =>
     invoke<WslSessionRow[]>("wsl_list_sessions", { workspacePath }),

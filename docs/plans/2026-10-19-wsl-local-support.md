@@ -696,16 +696,16 @@ WSL 侧目前只有「设置 → WSL」里的发行版列表、探测结果/版�
 
 ### 11.2 能力盘点
 
-| 能力 | 现实现（本机） | WSL 可行性 | 建议阶段 |
+| 能力 | 现实现（本机） | WSL 可行性 | 归属 |
 | --- | --- | --- | --- |
-| 引擎启停 | 全局 `config.enabled` | 全局即适用（发送前统一门禁） | 1（只读说明，不新增开关） |
-| 版本/路径 | 本机探测 + `AppSettings.<engine>Bin` | 已有 `wsl_engine_paths` + `wsl_probe` 版本 | 1 |
-| 官方配置编辑 | 本地文件编辑器 | 发行版内读/写文本，复用 JSON/TOML 校验 | 1（claude/codex/kimi） |
-| Pi / omp 认证 | 主机 `auth.json` / `models.json` | 发行版内同名文件；API key 可写、OAuth 登录需终端 | 1（API key/models）；OAuth 阶段 2 |
-| 供应商渠道 | 应用级 `config.json` + spawn 时注入 env/argv | 同一套渠道已作用于 WSL 发送（`prepare_launch` 在 `wrap` 之前） | 1（只读说明，避免误导为“每个发行版一套”） |
-| 自定义模型 | `AppSettings.customModels`（全局） | 远程目录已是权威；全局自定义模型是否合并需定 | 2 |
-| 自定义配置目录 | `codexHome`（主机） | 可加每发行版 `CODEX_HOME` 覆盖 | 2 |
-| 检查更新/升级 | 本机二进制/包管理器 | 需在发行版内跑包管理器，风险高 | 2/不支持 |
+| 引擎启停 | 全局 `config.enabled` | 全局即适用（发送前统一门禁） | 本次（只读说明，不新增开关） |
+| 版本/路径 | 本机探测 + `AppSettings.<engine>Bin` | 已有 `wsl_engine_paths` + `wsl_probe` 版本 | 本次（查询、展示与覆盖） |
+| 官方配置编辑 | 本地文件编辑器 | 发行版内读/写文本，复用 JSON/TOML 校验 | 本次（只读展示路径）/ 后续（claude/codex/kimi 编辑） |
+| Pi / omp 认证 | 主机 `auth.json` / `models.json` | 发行版内同名文件；API key 可写、OAuth 登录需终端 | 后续（API key/models）；OAuth 依赖终端 |
+| 供应商渠道 | 应用级 `config.json` + spawn 时注入 env/argv | 同一套渠道已作用于 WSL 发送（`prepare_launch` 在 `wrap` 之前） | 本次（只读说明，避免误导为“每个发行版一套”） |
+| 自定义模型 | `AppSettings.customModels`（全局） | 远程目录已是权威；全局自定义模型是否合并需定 | 后续 |
+| 自定义配置目录 | `codexHome`（主机） | 可加每发行版 `CODEX_HOME` 覆盖 | 后续 |
+| 检查更新/升级 | 本机二进制/包管理器 | 需在发行版内跑包管理器，风险高 | 后续（只给可复制命令，不自动执行） |
 | cc-switch 导入 | 主机配置/文件 | 与发行版配置无关 | 不提供 |
 | DSH 本机主机 | Windows 主机进程 | 与本机 WSL 无关 | 不提供 |
 
@@ -719,15 +719,17 @@ Claude Code
 ```
 
 - 默认「本机 Windows」，保持现有行为完全不变。
-- 选择 WSL 后，整个页签主体替换为 `WslCliPanel`（独立组件，不复用主机 `useCliConfig` 的 state），显示：
-  1. **状态**：发行版、探测到的二进制绝对路径、版本、探测时间；「重新检测」复用 `wsl_reprobe`。
+- 选择 WSL 后，整个页签主体替换为 `WslCliPanel`（独立组件，不复用主机 `useCliConfig` 的 state），最终目标显示：
+  1. **状态**：探测到的二进制绝对路径、版本、来源、探测时间；「重新检测」复用 `wsl_reprobe`。
   2. **CLI 路径覆盖**：复用现有 `set_wsl_engine_path` / `get_wsl_engine_paths`。
-  3. **官方配置**：claude/codex/kimi 的远程文件编辑器；codex 的 `auth.json` 作为 secret 文件处理；pi 的官方配置交给下一项。
-  4. **Pi / omp 认证**：API Key 列表（只回传 provider + 掩码状态，绝不回传 key）、新增/删除、`models.json` 编辑器；OAuth 显示「请在 WSL 终端执行 `pi auth login`」，不在阶段 1 代跑。
+  3. **官方配置**：本次只读展示发行版内的官方配置文件路径（可复制）；claude/codex/kimi 的远程文件编辑器与 codex `auth.json` 的 secret 处理留给后续。
+  4. **Pi / omp 认证**：API Key 列表（只回传 provider + 掩码状态，绝不回传 key）、新增/删除、`models.json` 编辑器；本次的 OAuth 只显示「请在 WSL 终端执行 `pi auth login`」，内置终端就绪后由用户在其中完成登录，宿主不代跑 `pi auth`。
   5. **渠道说明**：一行只读提示「应用级渠道对本机与 WSL 同时生效」，避免用户在 WSL 面板里找不到渠道而误以为失效。
-  6. **不支持项**：检查更新、cc-switch 导入、DSH 主机卡片直接隐藏；若用户从搜索进入，显示一行原因。
-- 发行版选择持久化在 localStorage（全局一个，不按引擎分裂）；没有发行版时显示空态并给「去设置 → WSL」入口。
-- 作用域控件只在桌面 Windows 且至少有一个发行版时出现；Web 模式不渲染。
+  6. **不支持项**：检查更新、cc-switch 导入、DSH 主机卡片直接隐藏；不受支持的引擎不显示作用域，页面与本机一致，不提供点了才报错的假入口。
+
+  本次只实现 1–2（只读状态 + 路径覆盖）；3–5 在后续加入，本次不提前渲染空壳。
+- 发行版选择持久化在 localStorage（全局一个，不按引擎分裂）；没有发行版时作用域控件不渲染，页面与本机现状一致（发行版的安装/检测入口仍在「设置 → WSL」）。
+- 作用域控件只在桌面 Windows、至少有一个发行版且该引擎受后端支持时出现；Web 模式不渲染。
 
 **为什么不做成新导航页**：用户已经在对应引擎页里，作用域是页内属性；新页会让“Claude 的 WSL 配置”和“Claude 的本机配置”分居两处，也会让 CLI 管理导航无限膨胀（发行版 × 引擎）。**为什么不把 host state 穿透一个 `scope` 参数**：`useCliConfig`、`CliEngineSettingsCard`、官方编辑器、Pi 认证、版本/更新都各自直连主机数据源，逐个改造会把主机路径、AppSettings、cc-switch 语义带进远程分支，回归面过大；独立面板可以 fail-closed。
 
@@ -741,6 +743,9 @@ pub struct WslCliStatus {
     distro: String,
     bin: Option<String>,        // 探测/覆盖后的发行版内绝对路径
     version: Option<String>,
+    source: WslCliSource,       // probe | override | missing
+    probed_ago_secs: Option<u64>,
+    // 以下字段后续增量加入；本次不实现
     config_files: Vec<WslConfigFileInfo>, // key/path/format/secret/exists
     auth: bool,                 // pi/omp 是否有 auth.json
     capabilities: WslCliCaps,   // official_config / api_key / models / oauth / update
@@ -749,8 +754,11 @@ pub struct WslCliStatus {
 pub struct WslConfigFile { key, path, format, content, exists, secret }
 ```
 
-IPC：
+上面是后续的最终形状；本次只实现前六个字段（`engine`/`distro`/`bin`/`version`/`source`/`probed_ago_secs`），后续字段只做增量，不改已有语义。
 
+IPC（本次只实现前两个只读命令，其余后续增量加入）：
+
+- `wsl_cli_capabilities() -> WslCliCapabilities`（后端声明哪些引擎能在 WSL 中运行）
 - `wsl_cli_status(distro) -> Vec<WslCliStatus>`
 - `wsl_cli_config_read(distro, engine) -> Vec<WslConfigFile>`
 - `wsl_cli_config_write(distro, engine, files: Vec<{key, content, expectedHash?}>) -> ()`
@@ -772,7 +780,7 @@ IPC：
 | kimi | `config` → `${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml` | toml | 否 |
 | pi | `models` → `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/models.json` | json | 否 |
 | pi | `auth` → `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json` | json | 是 |
-| omp | 同 pi，根为 `$OMP_HOME`/`~/.omp/agent`（阶段 2） | json/yml | 是 |
+| omp | 同 pi，根为 `$OMP_HOME`/`~/.omp/agent`（后续） | json/yml | 是 |
 
 **读写机制**
 
@@ -782,7 +790,7 @@ IPC：
 - 锁：按 `(distro, engine, file)` 串行化写入；同一发行版的探测/写配置不并发。
 - 错误码：`WSL_CLI_FILE_TOO_LARGE`、`WSL_CLI_CONFIG_INVALID_JSON/TOML`、`WSL_CLI_CONFIG_READONLY`、`WSL_CLI_CONFIG_CONFLICT`、`WSL_CLI_AUTH_INVALID`，其余复用 `WSL_*` 探测错误；全部走 i18n。
 
-**Pi 认证复用**：把 `pi_family_auth` 的纯解析/校验（`validate_models_config_text`、provider catalog、掩码逻辑）抽成不依赖主机路径的函数；主机实现继续用 `~/.pi`，WSL 实现通过上面的文件 API 读写发行版 `auth.json` / `models.json`。OAuth 状态只读展示；登录按钮阶段 1 显示「在 WSL 终端执行」。
+**Pi 认证复用**：把 `pi_family_auth` 的纯解析/校验（`validate_models_config_text`、provider catalog、掩码逻辑）抽成不依赖主机路径的函数；主机实现继续用 `~/.pi`，WSL 实现通过上面的文件 API 读写发行版 `auth.json` / `models.json`。OAuth 状态只读展示；登录按钮本次显示「在 WSL 终端执行」，内置终端就绪后再接入。
 
 ### 11.5 安全与数据
 
@@ -793,7 +801,7 @@ IPC：
 - 所有远程文件操作只在 `Local` 后端；`meta.wsl` 远程工作区不走本机发行版。
 - Web 模式不注册这些命令，设置页 WSL 作用域不渲染。
 
-### 11.6 分阶段路线图（公开仓库）
+### 11.6 范围与路线图（公开仓库）
 
 **最终目标状态**
 
@@ -804,48 +812,53 @@ IPC：
 - 渠道（供应商）保持**应用级**，本机与 WSL 共用；不按发行版分裂；
 - 所有远程能力按引擎 capability 显示，后续新增引擎不需要改 UI 骨架。
 
-**阶段划分**（每阶段独立可合并、可回滚）
+**本次实现**
 
-| 阶段 | 用户可见结果 | 范围 | 明确不做 | 依赖 | PR 数 / 预估 |
-| --- | --- | --- | --- | --- | --- |
-| **P0 基础设施** | 无（或仅开发开关） | `wsl_cli.rs`：状态、白名单文件读、原子写、大小/权限/冲突、错误码；单元测试 | 任何设置页 UI | WSL 探测/传输已就绪 | 1–2 / 2–3 天 |
-| **P1 只读作用域** | CLI 页出现「本机 / WSL」；WSL 面板显示发行版、bin、版本、探测时间，可改路径、可重新检测 | 作用域控件、发行版选择、状态卡、路径覆盖 | 官方配置/认证写入 | P0（只读命令） | 1 / 1–2 天 |
-| **P2 官方配置** | claude/codex/kimi 的官方配置可在 WSL 面板编辑；非法 JSON/TOML 被拒；外部改动冲突提示 | 远程编辑器、校验、原子写、hash 冲突、secret 文件权限 | Pi 认证/OAuth | P1 | 2 / 2–3 天 |
-| **P3 Pi 认证** | Pi 的 API Key 列表/增删、`models.json` 编辑；聊天模型菜单即时刷新 | 远程 `auth.json` 读写、掩码、provider 校验、模型刷新 | OAuth 登录 | P2（复用文件服务） | 2 / 2–3 天 |
-| **P4 WSL 终端 + OAuth** | Pi/omp OAuth 登录可直接在发行版内完成；OAuth 状态刷新 | WSL 终端（原方案阶段 2）+ `pi auth` 流程 + 状态读取 | 其他引擎的登录流程 | 原方案阶段 2 终端 | 2–3 / 3–5 天 |
-| **P5 高级配置** | 每发行版自定义配置目录/自定义模型；minimax（mcode）状态；更新给出可复制的发行版内命令 | `CODEX_HOME` 等覆盖、custom models、状态卡、手动更新提示 | 自动跑包管理器升级 | P2/P3 | 2–3 / 3–4 天 |
+- 只读状态与页内作用域：CLI 页出现「本机 / WSL 发行版」，WSL 面板显示 bin、版本、来源、上次探测，可改路径、可重新检测；
+- WSL 面板复用本机页的应用级能力：引擎启停、官方配置文件路径（只读 + 复制）、供应商渠道说明与「切回本机管理」；
+- 后端提供 `wsl_cli_status` / `wsl_cli_capabilities`，复用现有探测缓存与路径覆盖；
+- 任何配置/认证写入都不在本次范围。
 
-**已决定：渠道保持应用级，不做 P6（每发行版独立渠道）。** 本机与 WSL 发送共用 `config.json` 的渠道与当前选择；WSL 面板只放一行说明，不提供第二套渠道管理。这样发送路径、迁移与 UI 都不会分裂。
+**后续工作**（按依赖顺序推进，不构成版本承诺）
 
-**当前工作区对应的阶段**：§1–§10 的本机 WSL 基础能力、Pi 支持与一轮缺陷修复已经交织在同一批文件里，作为**第 1 个完整阶段**整体提交；不按文件硬拆（中间态无法编译，也不符合公开仓库每个提交可构建的要求）。§11 的 P0–P5 是后续独立阶段，尚未实现。
+| 工作项 | 用户可见结果 | 范围 | 明确不做 | 依赖 |
+| --- | --- | --- | --- | --- |
+| 官方配置 | claude/codex/kimi 的官方配置可在 WSL 面板编辑；非法 JSON/TOML 被拒；外部改动冲突提示 | 远程编辑器、校验、原子写、hash 冲突、secret 文件权限 | Pi 认证/OAuth | 本次的状态契约 |
+| Pi 认证 | Pi 的 API Key 列表/增删、`models.json` 编辑；聊天模型菜单即时刷新 | 远程 `auth.json` 读写、掩码、provider 校验、模型刷新 | OAuth 登录 | 官方配置的文件服务 |
+| WSL 终端与 OAuth | Pi/omp OAuth 登录可在发行版内完成；OAuth 状态刷新 | WSL 终端 + `pi auth` 流程 + 状态读取 | 其他引擎的登录流程 | 终端能力 |
+| 高级配置 | 每发行版自定义配置目录/自定义模型；更新给出可复制的发行版内命令 | `CODEX_HOME` 等覆盖、custom models、手动更新提示 | 自动跑包管理器升级 | 官方配置与 Pi 认证 |
 
-**为什么这样切**
+**已决定：渠道保持应用级，不做每发行版独立渠道。** 本机与 WSL 发送共用 `config.json` 的渠道与当前选择；WSL 面板只放说明，不提供第二套渠道管理。这样发送路径、迁移与 UI 都不会分裂。
 
-1. **P0 先落安全底座**：白名单、路径解析、原子写、权限、上限、冲突检测都在没有 UI 时评审完；公开仓库可以先合这一层，避免“UI 先上、文件写入后补”的安全债。
-2. **P1 只读**：先验证作用域切换、发行版选择、错误态和 host 页签零回归；不引入写入风险。
-3. **P2 官方配置**：写入面扩大，但只碰非 secret 文件（codex `auth.json` 单独按 secret 处理）；与 P3 的认证写入分开评审。
-4. **P3 Pi 认证**：涉及密钥，独立 PR、独立测试/威胁模型；先 API Key，OAuth 留到终端可用。
-5. **P4 依赖终端**：OAuth 需要发行版内交互式终端；终端未就绪时保持“在 WSL 终端执行”的明确降级，不做假登录按钮。
-6. **P5/P6 是增强**：自定义目录/模型、其他引擎、每发行版渠道，都建立在 P0–P3 的稳定契约上，不阻塞主路径。
+**当前工作区的改动**：§1–§10 的本机 WSL 基础能力、Pi 支持与一轮缺陷修复已经交织在同一批文件里，作为一次完整的改动整体提交；不按文件硬拆（中间态无法编译，也不符合公开仓库每个提交可构建的要求）。§11 描述的只读状态与页内作用域已实现（未提交），实机验收通过。
+
+本次实现的详细设计、IPC 契约、组件拆分和验收见 `docs/plans/2026-10-23-wsl-cli-management.md`；后续工作在该文档 §9 保持概要，实施时再单独细化。
+
+**为什么先做只读**
+
+1. **先固定只读契约**：状态、能力、路径来源与错误码在没有 UI 时评审完；白名单、原子写、权限、上限、冲突检测随第一次真正的文件读写一起评审，避免先落一层没有调用方、也不会被实机验证的写入代码。
+2. **只读作用域先验证交互**：切换、发行版选择、错误态和 host 页签零回归；不引入写入风险。
+3. **官方配置写入面较大**：但只碰非 secret 文件（codex `auth.json` 单独按 secret 处理）；Pi 认证涉及密钥，单独评审、独立测试/威胁模型，先 API Key，OAuth 等终端可用。
+4. **OAuth 依赖终端**：需要发行版内交互式终端；终端未就绪时保持「在 WSL 终端执行」的明确降级，不做假登录按钮。
+5. **增强项不阻塞主路径**：自定义目录/模型、其他引擎都建立在稳定契约上。
 
 **公开仓库的合并规则**
 
-- 每个阶段一个（或两个）自包含 PR：后端 + UI + i18n + 测试 + 设计文档同步；不把未完成面板露给用户。
+- 每次改动自包含：后端 + UI + i18n + 测试 + 设计文档同步；不把未完成面板露给用户。
 - 新 IPC 与新字段只做**增量**；`config.json` / `AppSettings` 不改既有字段语义，旧版本读写不报错。
-- 能力用 `WslCliCaps` 表达：后端说支持什么，前端才渲染什么；新引擎接入不改 UI 骨架。
+- 能力用 `WslCliCapabilities` 表达：后端说支持什么，前端才渲染什么；新引擎接入不改 UI 骨架。
 - 主机 CLI 管理路径完全不动；WSL 作用域只在桌面 Windows 且检测到发行版时出现，Web 端不注册命令。
-- secret 相关代码单独 PR（P3），合并前必须有：不回传明文 key、不写日志、0600 权限、大小上限、失败不覆盖原文件。
-- 每个阶段结束跑：`cargo test --lib wsl`、相关 vitest、`pnpm build`、`cargo test --test wsl_boundary_guard`；P2/P3 增加实机 WSL 读写用例。
-- 版本记录/`src/version/changelog.ts` 只在真正发版时更新，不随每个阶段改；设计文档随阶段更新 §11 的状态。
+- 涉及密钥的改动，合并前必须有：不回传明文 key、不写日志、0600 权限、大小上限、失败不覆盖原文件。
+- 涉及文件读写的改动增加实机 WSL 读写用例；只涉及只读状态的改动至少跑 `cargo test --lib wsl`、相关 vitest、`pnpm build`、`cargo test --test wsl_boundary_guard`。
+- 版本记录/`src/version/changelog.ts` 只在真正发版时更新，不随每次改动修改；设计文档随改动更新 §11 的状态。
 
-**阶段验收门槛（摘要）**
+**验收门槛（摘要）**
 
-- P0：白名单外路径不可读写；非法 JSON/TOML 不落盘；secret 文件 0600；超限/只读/冲突有稳定错误码。
-- P1：host 页签无回归；WSL 面板空态/发行版关停/无 CLI 均有明确文案；Web 不出现作用域。
-- P2：编辑保存后发行版内文件立即变化；外部同时修改返回冲突而非覆盖；原文件在失败时保持不变。
-- P3：API Key 只在写入命令中出现一次；列表只返回掩码；保存 `models.json` 后模型菜单刷新。
-- P4：OAuth 在发行版内完成并能刷新状态；终端不可用时 UI 明确降级。
-- P5：每发行版自定义目录/模型只影响该发行版；更新只给命令，不自动执行。
+- 只读状态与页内作用域：契约稳定；受支持引擎顺序固定；非法发行版在探测前被拒绝；不新增 `wsl.exe` 调用；host 页签无回归；空态/发行版关停/无 CLI 都有明确文案；Web 与非 Windows 不出现作用域；`wsl_boundary_guard` 全绿。
+- 官方配置：白名单外路径不可读写；非法 JSON/TOML 不落盘；secret 文件 0600；超限/只读/冲突有稳定错误码；编辑保存后发行版内文件立即变化；外部同时修改返回冲突而非覆盖；原文件在失败时保持不变。
+- Pi 认证：API Key 只在写入命令中出现一次；列表只返回掩码；保存 `models.json` 后模型菜单刷新。
+- WSL 终端与 OAuth：OAuth 在发行版内完成并能刷新状态；终端不可用时 UI 明确降级。
+- 高级配置：每发行版自定义目录/模型只影响该发行版；更新只给命令，不自动执行。
 
 ### 11.7 验收清单
 
@@ -860,8 +873,15 @@ IPC：
 
 ### 11.8 待决问题
 
-1. **渠道作用域**：保持应用级（本方案）还是允许每发行版一套？后者要改 `config.json` 结构、发送时的 env 注入与 UI，收益低，建议不做。
-2. **secret 文件是否允许在 webview 中查看**：主机官方编辑器已经这么做；若要求更严，可把 `auth.json` 改成“只写不读”（阶段 1 可先对 codex auth 做只写）。
-3. **作用域选择持久化粒度**：全局一个发行版（推荐）还是每个引擎独立记住。
-4. **Pi OAuth 登录**：接受“在 WSL 终端执行”作为阶段 1 的明确降级，还是必须内置终端（依赖阶段 2 WSL 终端）。
-5. **minimax/grok/omp**：先只覆盖 claude/codex/kimi/pi，还是所有已探测引擎都给一个只读状态卡。
+已决定：
+
+1. **渠道作用域**：保持应用级，不做每发行版一套；本次只放说明。
+2. **作用域选择持久化粒度**：全局一个发行版，不按引擎分裂。
+3. **minimax/grok/omp**：本次覆盖 `claude/codex/kimi/pi/minimax`；grok/omp 等发送门禁支持 WSL 后再加入，不在本次显示不可用的作用域。
+4. **本次是否包含文件读写**：不包含；白名单、原子写、权限、上限、冲突检测随第一次真正写文件时评审。
+
+仍待确认：
+
+1. **secret 文件是否允许在 webview 中查看**：主机官方编辑器已经这么做；若要求更严，可把 `auth.json` 改成“只写不读”（官方配置写入落地时可先对 codex auth 做只写）。
+2. **Pi OAuth 登录**：接受“在 WSL 终端执行”作为明确降级，还是必须内置终端（依赖后续的 WSL 终端）。
+3. **`WslCliStatus.configFiles` 是否需要 `exists`/`mtime`**：需要时再做一次短调用，本次不加。

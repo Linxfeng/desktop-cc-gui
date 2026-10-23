@@ -43,6 +43,7 @@ mod reader;
 mod registry;
 pub mod resolve;
 pub mod wsl_availability;
+pub mod wsl_cli;
 pub mod wsl_index;
 pub mod wsl_notice;
 pub mod wsl_path;

@@ -46,20 +46,13 @@ fn available_engines(distro: &str, probe: &wsl_probe::WslProbe) -> Vec<String> {
             .unwrap_or_default();
     crate::config::ENGINES
         .iter()
-        .filter(|id| local_supported_engine(id))
+        .filter(|id| super::wsl_cli::supported_engine(id))
         .filter(|id| {
             // 探测表按**命令名**建键(minimax 的 CLI 叫 mcode),不是引擎 id。
             probe.bin(crate::engine::cli_binary_name(id)).is_some() || overridden.contains(**id)
         })
         .map(|id| id.to_string())
         .collect()
-}
-
-/// 阶段 1 真正能在本机 WSL 里跑的引擎:Child 传输、无 Windows staging 文件。
-/// 菜单不能只按「探测到了二进制」放行 —— grok/omp 在发行版里可能装着,但
-/// 发送时会被 Own/staging 门禁拒绝,提前隐藏比让用户点了才报错好。
-fn local_supported_engine(id: &str) -> bool {
-    matches!(id, "claude" | "codex" | "kimi" | "minimax" | "pi")
 }
 
 /// 已安装发行版(`wsl.exe -l -q`)。`WSL_UTF8=1` 之外的旧版输出按 UTF-16LE
@@ -226,12 +219,12 @@ mod tests {
 
     #[test]
     fn menu_hides_engines_this_backend_cannot_run() {
-        // pi 是 Child 传输,阶段 1 支持;grok/omp 即使装着也会在发送时被
+        // pi 是 Child 传输,当前支持;grok/omp 即使装着也会在发送时被
         // Own/staging 门禁拒绝,菜单不应先列出来。
-        assert!(local_supported_engine("pi"));
-        assert!(local_supported_engine("claude"));
-        assert!(!local_supported_engine("grok"));
-        assert!(!local_supported_engine("omp"));
+        assert!(super::super::wsl_cli::supported_engine("pi"));
+        assert!(super::super::wsl_cli::supported_engine("claude"));
+        assert!(!super::super::wsl_cli::supported_engine("grok"));
+        assert!(!super::super::wsl_cli::supported_engine("omp"));
     }
 
     #[test]
@@ -247,7 +240,7 @@ mod tests {
     }
 
     /// MiniMax 的 CLI 叫 `mcode`:探测表按命令名建键,引擎 id 与它不同。
-    /// 按 id 查表会让发行版里装着的 mcode 在菜单里永远不出现(§5.6 阶段 1
+    /// 按 id 查表会让发行版里装着的 mcode 在菜单里永远不出现(§5.6
     /// 明确支持 MiniMax 的 Child 路径)。
     #[test]
     fn engine_ids_are_mapped_to_their_cli_binary_names() {

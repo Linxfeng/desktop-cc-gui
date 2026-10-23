@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import { Button } from "@/components/base/buttons/button";
 import { ActionFeedbackIcon, useActionFeedback } from "@/components/base/action-feedback";
-import { Input } from "@/components/base/input/input";
 import {
   SettingsCard,
   SettingsRow,
@@ -13,6 +12,8 @@ import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands"
 import { errorText } from "@/lib/errors";
 import { ipc } from "@/lib/ipc";
 import { invalidateWslEngineAvailability } from "@/features/chat/components/use-wsl-engine-availability";
+import { invalidateWslCliMeta } from "./use-cli-scope";
+import { WslEnginePathRow } from "./WslEnginePathRow";
 
 /**
  * 设置 → WSL(设计稿 §5.9)。
@@ -60,7 +61,11 @@ export function WslSection() {
     setVersionsByDistro(
       Object.fromEntries(probed.map((row) => [row.distro, row.versions])),
     );
-    if (force) invalidateWslEngineAvailability();
+    if (force) {
+      invalidateWslEngineAvailability();
+      // 发行版可能刚装上/卸载：让 CLI 页的作用域立刻看到新列表。
+      invalidateWslCliMeta();
+    }
     // 列表读取失败(未安装 / 超时 / 命令失败)与「装好了但没有发行版」
     // 是两种事实:前者显示后端错误,后者显示空态(§10 P2-6)。
     if (!listedResult.ok) {
@@ -199,10 +204,11 @@ export function WslSection() {
                 </div>
               </SettingsRow>
               {overrideEngines.map((engine) => (
-                <OverrideRow
+                <WslEnginePathRow
                   key={engine}
                   distro={distro}
                   engine={engine}
+                  anchor={`wslCliPath:${distro}:${engine}`}
                   onSaved={(savedDistro) =>
                     void rescanDistro(savedDistro).catch((e: unknown) =>
                       setError(errorText(e)),
@@ -220,84 +226,7 @@ export function WslSection() {
 }
 
 /**
- * 阶段 1 在 WSL 工作区里支持的引擎(设计稿 §1.2)。它们即使没被探测到也要
+ * 在 WSL 工作区里常驻给出覆盖位的引擎(设计稿 §1.2)。它们即使没被探测到也要
  * 有覆盖位:用户点进这一页多半就是因为某个 CLI 没被自动找到。
  */
 const WSL_OVERRIDE_ENGINES = ["claude", "codex", "pi"] as const;
-
-/** 单个发行版里某个引擎的 CLI 路径覆盖(§5.9)。
- *
- *  独立组件而不是写在 `.map()` 里:它有自己的草稿状态与保存动作,做成
- *  hook 会被条件调用 —— 发行版列表是动态的,行数每次刷新都可能变。
- */
-function OverrideRow({
-  distro,
-  engine,
-  onSaved,
-  onError,
-}: {
-  distro: string;
-  engine: string;
-  onSaved: (distro: string) => void;
-  onError: (message: string) => void;
-}) {
-  const { t } = useTranslation();
-  const [draft, setDraft] = useState("");
-  const saved = useRef<string | null>(null);
-
-  // 挂载时读回该引擎已登记的覆盖:页面刷新不该把用户填过的路径显示成空。
-  useEffect(() => {
-    let cancelled = false;
-    void ipc
-      .getWslEnginePaths(distro)
-      .then((rows) => {
-        if (cancelled) return;
-        const value = rows.find(([id]) => id === engine)?.[1] ?? "";
-        saved.current = value;
-        setDraft(value);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [distro, engine]);
-
-  const save = useCallback(() => {
-    const value = draft.trim();
-    // 未改动就不写盘:设置写入会广播 settings://changed。
-    if (value === (saved.current ?? "")) return;
-    // 键是 `<distro>:<engine>` 一条一个引擎:写错引擎会把别的 CLI 盖掉,
-    // 所以这里用行自己绑定的 engine,不再去猜「首个引擎」。
-    // 空串 = 删除该引擎的覆盖,退回自动探测。
-    void ipc
-      .setWslEnginePath(distro, engine, value)
-      .then(() => {
-        saved.current = value;
-        onError("");
-        onSaved(distro);
-      })
-      .catch((err: unknown) => onError(errorText(err)));
-  }, [draft, distro, engine, onError, onSaved]);
-
-  const label = t("wsl.cliPathFor", {
-    cli: CLI_DISPLAY_NAMES[engine] ?? engine,
-  });
-
-  return (
-    <SettingsRow
-      anchor={`wslCliPath:${distro}:${engine}`}
-      label={label}
-      description={t("wsl.cliPathDesc")}
-    >
-      <div className="w-[260px] shrink-0">
-        <Input
-          size="small"
-          aria-label={label}
-          value={draft}
-          onChange={setDraft}
-          onBlur={save}
-        />
-      </div>
-    </SettingsRow>
-  );
-}

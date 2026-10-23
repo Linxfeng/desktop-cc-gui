@@ -11,22 +11,50 @@ import { openExternal } from "@/lib/platform";
 import { cx } from "@/utils/cx";
 import { ENGINE_DOCS_URLS, type EngineId } from "./providers";
 import { CliUpdateDialog } from "./CliUpdateDialog";
+import { useCliScope } from "./use-cli-scope";
 import { useCliUpdateFlow } from "./useCliUpdateFlow";
 import { useCliVersionStatus } from "./useCliVersionStatus";
 
 /**
- * CLI 管理 page-header cluster: icon-only docs and refresh buttons flanking
- * a single segmented pill — the left segment carries the version status
- * (checking / not installed / local version + ✓ or ↑), the right segment is
- * the install/update CTA naming the target version. One piece of information
- * (current → target) reads as one control, and every element shares the
- * small-button 32px height.
+ * CLI 管理 page-header cluster.
  *
+ * Host scope: icon-only docs and refresh buttons flanking a single segmented
+ * pill — the left segment carries the version status (checking / not installed
+ * / local version + ✓ or ↑), the right segment is the install/update CTA
+ * naming the target version. One piece of information (current → target)
+ * reads as one control, and every element shares the small-button 32px height.
  * Version data comes from the shared session store (useCliVersionStatus) —
  * probes run on mount and the refresh button only, so opening settings never
  * blocks on `npm view`.
+ *
+ * WSL scope (or while the scope is still being resolved): only the docs entry
+ * — version/update probes target the Windows binary and would mislead here.
  */
 export function CliHeaderActions({ engine }: { engine: EngineId }) {
+  const scope = useCliScope(engine);
+  // pending: 上次选 WSL、元数据还没回来，先别让本机版本号闪出来。
+  if (scope.pending || scope.active === "wsl") {
+    return <CliDocsButton engine={engine} />;
+  }
+  return <HostCliHeaderActions engine={engine} />;
+}
+
+/** WSL 作用域（或作用域未判定）只保留通用文档入口：版本/更新只针对本机二进制。 */
+function CliDocsButton({ engine }: { engine: EngineId }) {
+  const { t } = useTranslation();
+  return (
+    <Button
+      iconOnly
+      size="small"
+      variant="ghost"
+      leadingIcon={BookOpen}
+      aria-label={t("settings.cliDocs")}
+      onClick={() => openExternal(ENGINE_DOCS_URLS[engine])}
+    />
+  );
+}
+
+function HostCliHeaderActions({ engine }: { engine: EngineId }) {
   const { t } = useTranslation();
   const { status, loading, error, updating, refresh } = useCliVersionStatus(engine);
   const updateFlow = useCliUpdateFlow(engine);
@@ -36,14 +64,7 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 
   return (
     <div className="flex min-w-0 shrink-0 items-center gap-2" title={error ?? undefined}>
-      <Button
-        iconOnly
-        size="small"
-        variant="ghost"
-        leadingIcon={BookOpen}
-        aria-label={t("settings.cliDocs")}
-        onClick={() => openExternal(ENGINE_DOCS_URLS[engine])}
-      />
+      <CliDocsButton engine={engine} />
       <Button
         iconOnly
         size="small"

@@ -2377,6 +2377,7 @@ export const en: Messages = {
     cliPathFor: "{{cli}} path override",
     cliPathDesc:
       "Set this by hand when auto-detection misses it (a non-standard install, for example): an absolute path inside the distro. Leave empty to fall back to detection.",
+    cliPathPlaceholder: "e.g. /home/me/.local/bin/…",
     cliPathInvalid: "Invalid path: {{message}}",
     cliPathReason: {
       notAbsolute: "must be an absolute path inside the distro (starting with /)",
@@ -2387,6 +2388,33 @@ export const en: Messages = {
       badEngine: "unsupported engine id",
     },
     rescan: "Detect again",
+    cli: {
+      scope: "Scope",
+      scopeHost: "This PC",
+      scopeWsl: "WSL distro",
+      distro: "Distro",
+      status: "CLI status",
+      sourceProbe: "Detected",
+      sourceOverride: "Path override",
+      sourceMissing: "Not found",
+      path: "CLI path",
+      pathMissing: "CLI not found in this distro",
+      probed: "Last probe",
+      probedUnknown: "Unknown",
+      statusFailed: "Could not read CLI status: {{message}}",
+      statusStale: "Saved, but reading the status failed: {{message}}",
+      loading: "Reading CLI status in this distro…",
+      metaLoading: "Reading WSL information…",
+      emptyTitle: "{{cli}} not found in this distro",
+      emptyDesc: "Set an absolute path above, or install it and rescan.",
+      channelsGlobal:
+        "Provider channels are app-level and shared by host and WSL sends.",
+      manageChannels: "Manage on This PC",
+      officialDesc: "The CLI's own config file inside the distro; edit it there.",
+      copyPath: "Copy path",
+      metaFailed: "Could not read WSL information: {{message}}",
+      retry: "Retry",
+    },
     noticeExitUnproven:
       "Processes from a session in {{distro}} may still be running (teardown unconfirmed). If they hold resources, check with ps in a WSL terminal.",
     noticeRgMissing:
