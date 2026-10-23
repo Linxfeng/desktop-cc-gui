@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   setWslEnginePath: vi.fn(),
   getCliConfig: vi.fn(),
   setEngineEnabled: vi.fn(),
+  wslCliConfigRead: vi.fn(),
+  wslCliConfigWrite: vi.fn(),
 }));
 
 vi.mock("@/lib/ipc", () => ({ ipc: mocks }));
@@ -54,14 +56,19 @@ async function flush() {
   await Promise.resolve();
 }
 
-async function render() {
+async function render(canEditOfficial = true) {
   container = document.createElement("div");
   document.body.appendChild(container);
   const nextRoot = createRoot(container);
   root = nextRoot;
   await act(async () => {
     nextRoot.render(
-      <WslCliPanel engine="claude" distro={DISTRO} onManageHost={() => {}} />,
+      <WslCliPanel
+        engine="claude"
+        distro={DISTRO}
+        canEditOfficial={canEditOfficial}
+        onManageHost={() => {}}
+      />,
     );
     await flush();
   });
@@ -94,6 +101,19 @@ beforeEach(() => {
     claude: { providers: {}, current: null },
   });
   mocks.setEngineEnabled.mockResolvedValue(undefined);
+  mocks.wslCliConfigRead.mockResolvedValue([
+    {
+      key: "settings",
+      path: "/home/me/.claude/settings.json",
+      format: "json",
+      secret: false,
+      exists: true,
+      tooLarge: false,
+      content: "{\n  \"theme\": \"dark\"\n}\n",
+      hash: "abc123",
+    },
+  ]);
+  mocks.wslCliConfigWrite.mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
@@ -207,5 +227,82 @@ describe("WslCliPanel", () => {
     );
     expect(container.textContent).toContain("已保存，但读取状态失败");
     expect(container.textContent).not.toContain("路径无效");
+  });
+
+  it("opens the official-config editor and saves with the read hash", async () => {
+    await render();
+
+    const edit = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("编辑"),
+    );
+    expect(edit).toBeTruthy();
+    await act(async () => {
+      edit!.click();
+      await flush();
+    });
+
+    // ModalShell portals to document.body
+    expect(document.body.textContent).toContain("/home/me/.claude/settings.json");
+    expect(document.body.textContent).toContain('"theme": "dark"');
+
+    const textarea = document.body.querySelector("textarea");
+    expect(textarea).toBeTruthy();
+    const confirm = [...document.body.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("确认"),
+    );
+    expect(confirm).toBeTruthy();
+    await act(async () => {
+      confirm!.click();
+      await flush();
+    });
+
+    expect(mocks.wslCliConfigWrite).toHaveBeenCalledWith(DISTRO, "claude", [
+      {
+        key: "settings",
+        content: "{\n  \"theme\": \"dark\"\n}\n",
+        expectedHash: "abc123",
+      },
+    ]);
+    // 保存成功后关闭弹窗（面板卡上仍有路径,所以用弹窗标题判断）
+    expect(document.body.textContent).not.toContain(
+      "编辑 Claude Code 官方配置（发行版内）",
+    );
+  });
+
+  it("shows a conflict with a re-read action", async () => {
+    mocks.wslCliConfigWrite.mockRejectedValue(
+      new Error("WSL_CLI_CONFIG_CONFLICT:settings"),
+    );
+    await render();
+
+    const edit = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("编辑"),
+    );
+    await act(async () => {
+      edit!.click();
+      await flush();
+    });
+    const confirm = [...document.body.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("确认"),
+    );
+    await act(async () => {
+      confirm!.click();
+      await flush();
+    });
+
+    // errors 被 mock,errorText 返回原始错误串;真机上映射为「已被修改」。
+    expect(document.body.textContent).toContain("WSL_CLI_CONFIG_CONFLICT");
+    const reread = [...document.body.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("重新读取"),
+    );
+    expect(reread).toBeTruthy();
+  });
+
+  it("does not show the edit button when the engine is not editable", async () => {
+    await render(false);
+    const edit = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("编辑"),
+    );
+    expect(edit).toBeUndefined();
   });
 });

@@ -31,6 +31,7 @@ export function CliConfigSection({ engine }: { engine: EngineId }) {
         <WslCliPanel
           engine={engine}
           distro={scope.distro}
+          canEditOfficial={scope.editableEngines.includes(engine)}
           onManageHost={() => scope.setScope("host")}
         />
       ) : (

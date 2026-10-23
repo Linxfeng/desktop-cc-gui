@@ -22,17 +22,18 @@
 **前端（本次实现，只读）**
 
 - CLI 页顶部出现「本机 Windows / WSL 发行版」作用域，发行版可切换并全局记忆；
-- WSL 面板复用本机页的语言：引擎启停（应用级）、官方配置文件路径（只读 + 复制）、CLI 状态与「重新检测」、路径覆盖、供应商渠道说明与「切回本机管理」；
+- WSL 面板复用本机页的语言：引擎启停（应用级）、官方配置（白名单文件读写 + 冲突检测）、CLI 状态与「重新检测」、路径覆盖、供应商渠道说明与「切回本机管理」；
 - 页头在本机作用域保持原样，在 WSL 作用域隐藏本机版本/更新，只保留通用文档入口；
 - 本机页签的内容与既有测试不变（`useCliConfig` 原样搬进 `HostCliConfig`）；只有桌面且检测到发行版时，内容上方多一张作用域卡，其余环境 DOM 与现在一致。
 
 **本次明确不做**
 
-- 不读写发行版内的官方配置、`auth.json`、`models.json`（只读展示配置路径）；
+- 不编辑 Pi 的 `models.json` / `auth.json`（认证与模型留给下一步）；
 - 不做 API Key、OAuth、CLI 更新、cc-switch 导入、DSH 主机；
 - 不新增每发行版渠道，不新增「WSL CLI 管理」导航页；
 - 不改 `config.json` / `AppSettings` 的既有字段语义；
-- 不把 `wsl_cli_*` 加入 `web/dispatch.rs`。
+- 不把 `wsl_cli_*` 加入 `web/dispatch.rs`；
+- 白名单之外的发行版内文件不可读写。
 
 ---
 
@@ -189,7 +190,7 @@ WSL 侧目前只有「设置 → WSL」的探测结果、版本和 CLI 路径覆
 WSL 面板把**应用级**能力按本机页的语言直接给出，而不是只放一句说明：
 
 - **引擎启停**：复用 `CliEngineCard`，开关写的就是 `config.enabled`；WSL 发送受同一个开关门禁（`config::ensure_engine_enabled`），不存在「本机停用、WSL 仍可发」的第二套开关。
-- **官方配置**：只读展示发行版内的官方配置文件路径（`WslCliStatus.configPath`）+ 复制路径；编辑发行版内文件仍留给后续的远程文件服务，不在这里放假编辑器。
+- **官方配置**：白名单文件可读写（claude `settings.json`、codex `config.toml` + `auth.json`、kimi `config.toml`）：读带 sha256，写前校验 JSON/TOML、`expectedHash` 冲突检测、`umask 077` 临时文件 + `mv` 原子替换，secret 文件 `chmod 600`；卡片显示路径 + 复制 + 编辑入口。
 - **供应商渠道**：卡片说明「应用级，本机与 WSL 发送共用同一套渠道」，并提供「切回本机管理」按钮（切回本机作用域后即可看到完整的渠道卡）。不在 WSL 作用域内复制一套渠道 UI。
 
 ---
@@ -264,6 +265,7 @@ pub(crate) fn supported_engines() -> Vec<String> {
 pub fn wsl_cli_capabilities() -> WslCliCapabilities {
     WslCliCapabilities {
         engines: supported_engines(),
+        editable_engines: editable_engines(), // claude / codex / kimi
     }
 }
 
@@ -279,6 +281,12 @@ pub async fn wsl_cli_status(distro: String) -> Result<Vec<WslCliStatus>, String>
     let probed_ago_secs = wsl_probe::probe_age(&distro).map(|age| age.as_secs());
     Ok(statuses(&distro, &probe, &overrides, probed_ago_secs))
 }
+```
+
+另外两条只读/写命令（白名单文件服务，细节见 §4.6 与 §4.8）：
+
+- `wsl_cli_config_read(distro, engine) -> Vec<WslCliConfigFile>`（`key/path/format/secret/exists/tooLarge/content/hash`）；
+- `wsl_cli_config_write(distro, engine, files)`：`{ key, content, expectedHash }` 先全量校验、再原子写；冲突返回 `WSL_CLI_CONFIG_CONFLICT:<key>` 不写任何文件。
 
 fn overrides_or_empty(
     settings: Result<crate::settings::AppSettings, String>,
@@ -446,7 +454,7 @@ fn statuses(
 | 探测失败的 10 秒负缓存期内重试 | 仍返回上一次错误 | 面板的「重新检测」走 `wsl_reprobe`（先 `invalidate`），而不是裸重试 |
 | 设置文件损坏 | 不失败；无覆盖继续返回探测状态 | 控制台留原因，不阻塞页面 |
 
-本次不新增错误码。后续的文件读写再增加 `WSL_CLI_FILE_*` / `WSL_CLI_CONFIG_*`，并单独评审。
+配置读写新增错误码（全部走 `errorText` 本地化）：`WSL_CLI_FILE_TOO_LARGE:<key>`、`WSL_CLI_CONFIG_INVALID_JSON:<key>: <detail>`、`WSL_CLI_CONFIG_INVALID_TOML:<key>: <detail>`、`WSL_CLI_CONFIG_CONFLICT:<key>`、`WSL_CLI_CONFIG_WRITE_FAILED:<key>`、`WSL_CLI_CONFIG_READ_FAILED:<key>`、`WSL_CLI_CONFIG_UNSUPPORTED:<engine>`。脚本永远 `exit 0`：结果走 stdout 哨兵，非零退出会被传输层统一成 `WSL_SHORT_CALL_FAILED` 而丢掉冲突信息。
 
 ### 4.7 缓存与并发
 
@@ -458,19 +466,24 @@ fn statuses(
 
 ### 4.8 契约演进
 
-后续只做增量字段，不改变现有字段语义：
+后续只做增量字段/命令，不改变现有字段语义。本次已落地：
+
+- `WslCliCapabilities.editableEngines`（`Vec<String>`）：声明哪些引擎的官方配置可编辑（claude/codex/kimi）；
+- `wsl_cli_config_read(distro, engine)` → `Vec<WslCliConfigFile>`（`key/path/format/secret/exists/tooLarge/content/hash`）；
+- `wsl_cli_config_write(distro, engine, files)`：`key/content/expectedHash`，全量校验后才写，冲突按文件拒绝。
+
+仍留给后续的增量：
 
 ```rust
 // 后续增量（本次不实现）
 pub struct WslCliStatus {
     // ... 现有字段不变
-    pub config_files: Vec<WslConfigFileInfo>, // key/path/format/secret/exists
-    pub auth: bool,
-    pub capabilities: WslCliCaps,             // official_config / api_key / models / oauth / update
+    pub auth: bool,                 // pi/omp 是否有 auth.json
+    pub capabilities: WslCliCaps,   // api_key / models / oauth / update
 }
 ```
 
-`WslCliCapabilities` 也可以从「只有 engines」扩展为每引擎能力表；本次前端只读 `engines`，新增字段不破坏旧客户端。
+`WslCliStatus` 不内嵌 `configFiles`：打开编辑器才读文件（`wsl_cli_config_read`），状态查询不付发行版内文件读取的代价。
 
 ---
 
@@ -603,7 +616,9 @@ export function useWslCliStatus(distro: string | null): {
 
 - 面板结构与本机页对齐：引擎启停卡 → 官方配置卡（只读路径 + 复制）→ CLI 状态卡（含路径覆盖）→ 供应商渠道卡（说明 + 切回本机管理）；
 - 引擎启停复用 `CliEngineCard`，状态来自聊天 store 的 `engines[].enabled`，写 `set_engine_enabled` 后 `notifyCliConfigChanged()`；失败在卡片下方行内 `role="alert"`；
-- 官方配置卡只在 `configPath` 存在时渲染；路径等宽截断 + `title`，复制走 `useCopied`（Copy → Check），不提供编辑器；
+- 官方配置卡只在 `configPath` 存在时渲染；路径等宽截断 + `title`，复制走 `useCopied`（Copy → Check）；
+- `editableEngines` 含当前引擎时给「编辑」按钮，打开 `WslOfficialEditDialog`（打开时 `wsl_cli_config_read`，保存前 JSON 校验 + `expectedHash` 冲突检测，冲突提示「重新读取」而非覆盖；secret 文件标记密钥、写入 0600）；
+- 编辑弹窗：`ModalShell` + 每个白名单文件一个 `TextArea` 页签；超限文件只提示不加载内容；缺失的 JSON 文件预填 `{}`；
 - 渠道卡只说明应用级并提供「切回本机管理」（`onManageHost` → `scope.setScope("host")`）；不在 WSL 作用域复制渠道 UI，避免两套开关；
 - 从 `statuses` 里按 `engine` 取当前行；若能力表说支持但状态行缺失（前后端漂移），按 `missing` 显示并在控制台留一行警告，不静默空白；
 - 已安装/覆盖：
@@ -714,6 +729,15 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 | `wsl.cli.copyPath` | 复制路径 | Copy path |
 | `wsl.cli.metaFailed` | 无法读取 WSL 信息：{{message}} | Could not read WSL information: {{message}} |
 | `wsl.cli.retry` | 重试 | Retry |
+| `wsl.cli.editTitle` | 编辑 {{name}} 官方配置（发行版内） | Edit {{name}} official config (in the distro) |
+| `wsl.cli.secretBadge` | 密钥 | secret |
+| `wsl.cli.fileMissing` | 文件不存在，保存时创建 | The file does not exist; saving will create it. |
+| `wsl.cli.fileTooLarge` | 配置文件过大（{{name}}），上限 256 KiB；请在发行版内编辑。 | The config file is too large ({{name}}); the limit is 256 KiB. Edit it inside the distro. |
+| `wsl.cli.configConflict` | 发行版内的 {{name}} 已被修改；请重新读取后再保存。 | {{name}} was modified inside the distro. Read it again before saving. |
+| `wsl.cli.configInvalid` | 配置内容校验失败：{{message}} | Invalid config content: {{message}} |
+| `wsl.cli.configWriteFailed` | 写入发行版内配置失败：{{message}} | Could not write the config inside the distro: {{message}} |
+| `wsl.cli.configReadFailed` | 读取发行版内配置失败：{{message}} | Could not read the config inside the distro: {{message}} |
+| `wsl.cli.reRead` | 重新读取 | Read again |
 
 复用现有键：`wsl.rescan`、`wsl.cliPathFor`、`wsl.cliPathDesc`、`wsl.cliPathPlaceholder`（新增）、`wsl.cliPathInvalid`、`wsl.cliPathReason.*`、`settings.cliOfficial`、`settings.cliChannels`、`wsl.error.*`，以及 `relativeTime` 已经在用的 `time.now` / `time.minutes` / `time.hours` / `time.days`。
 
@@ -757,6 +781,14 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 - `settings_error_yields_no_overrides`：`overrides_or_empty(Err(..), distro)` 返回空覆盖且不 panic，再用 `statuses` 喂空覆盖验证仍按探测结果出行；
 - `config_paths_default_to_home_dirs` / `config_paths_follow_distro_env`：官方配置路径按 `$HOME` 与发行版内 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `KIMI_CODE_HOME` / `PI_CODING_AGENT_DIR` 计算，minimax 为 `None`；
 - `capabilities_match_supported_engines`。
+
+官方配置读写（同模块）：
+
+- `config_targets_follow_whitelist_and_env`：claude/codex/kimi 的白名单路径随发行版内 `*_HOME` 环境变量走，codex `auth` 标记 secret，pi/minimax 无目标；
+- `validate_rejects_malformed_content`：JSON 必须是对象、TOML 必须可解析，非法内容不落盘；
+- `parse_config_read_roundtrip` / `parse_config_read_marks_too_large` / `parse_config_read_rejects_incomplete_output`：存在/缺失/超限/输出不完整的哨兵解析；
+- `write_script_checks_conflicts_before_writing`：冲突检查在写入之前，脚本永远 `exit 0`；
+- `parse_config_write_reports_conflict_first`：冲突/写入失败/写入计数三类输出。
 
 `cargo test --test wsl_boundary_guard`：
 
@@ -808,7 +840,8 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 - 渠道卡说明应用级并提供「切回本机管理」；
 - 「重新检测」调用 `wslReprobe(distro)` 并重读状态；探测成功但状态读取失败时显示错误、不显示对号；
 - 路径覆盖保存失败显示行内本地化错误；
-- **保存成功但 `reload()` 失败**：页面级显示 `wsl.cli.statusStale`（不是行内「路径无效」），设置不回滚。
+- **保存成功但 `reload()` 失败**：页面级显示 `wsl.cli.statusStale`（不是行内「路径无效」），设置不回滚；
+- 官方配置编辑：打开弹窗读白名单文件、保存带 `expectedHash` 调用 `wslCliConfigWrite`、冲突显示「重新读取」入口、`editableEngines` 之外的引擎不出现编辑按钮。
 
 **`CliHeaderActions.wsl.test.tsx`（新增）**
 
@@ -918,12 +951,11 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 
 | 工作项 | 内容 | 关键依赖 | 契约增量 |
 | --- | --- | --- | --- |
-| 官方配置读写 | 远程官方配置读写（claude/codex/kimi）：白名单、JSON/TOML 校验、原子写、0600、hash 冲突 | 本次已展示 `configPath`；新增 `wsl_cli_config_*` | `WslCliStatus.configFiles`、`capabilities.officialConfig` |
-| Pi 认证 | Pi API Key / `models.json` 编辑：掩码、只写 key、模型菜单刷新 | 上面的文件服务；secret 单独评审 | `auth`、`capabilities.apiKey/models` |
+| Pi 认证 | Pi API Key / `models.json` 编辑：掩码、只写 key、模型菜单刷新 | 本次的文件服务；secret 单独评审 | `auth`、`capabilities.apiKey/models` |
 | WSL 终端与 OAuth | WSL 终端 + Pi/omp OAuth 登录 | 原方案的终端能力 | `capabilities.oauth` |
 | 高级配置 | 每发行版自定义配置目录/模型、手动更新提示（minimax 状态已在本次实现） | 文件服务与 Pi 认证 | 每发行版设置键、`capabilities.update` |
 
-渠道保持全局，不做每发行版渠道。后续的文件读写必须复用本次的 `WslCliStatus` 契约与 `WslEnginePathRow`，不另造一套发行版选择器。
+渠道保持全局，不做每发行版渠道。后续的文件读写复用本次的 `wsl_cli_config_*` 与 `WslEnginePathRow`，不另造一套发行版选择器。
 
 ---
 
@@ -940,11 +972,13 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 7. **`probedAgoSecs` 是否可空**：保留 `Option`（并发 `invalidate` 兜底），前端按「未知」显示；`ensure` 成功后正常总有值。
 8. **测试如何模拟桌面**：mock `@/lib/platform` / `@/lib/transport`，不改 UA；store 用 `vi.resetModules()` 隔离。
 9. **WSL 设置页与 CLI 面板的覆盖行差异**：保留（见 §5.6），本次不统一 `WSL_OVERRIDE_ENGINES`。
-10. **WSL 面板补齐到什么程度**：引擎启停直接复用应用级开关；官方配置只读展示路径 + 复制，编辑仍留给后续远程文件服务；渠道不复制第二套 UI，只给「切回本机管理」。
-11. **官方配置路径的来源**：优先发行版内环境变量（`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `KIMI_CODE_HOME` / `PI_CODING_AGENT_DIR`），否则 `$HOME` 下的默认目录；只展示，不证明文件存在。
+10. **WSL 面板补齐到什么程度**：引擎启停直接复用应用级开关；官方配置白名单可读写（打开编辑器才读文件）；渠道不复制第二套 UI，只给「切回本机管理」。
+11. **官方配置路径的来源**：优先发行版内环境变量（`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `KIMI_CODE_HOME` / `PI_CODING_AGENT_DIR`），否则 `$HOME` 下的默认目录。
+12. **codex `auth.json` 是否可读**：与主机官方编辑器同级，允许读，标记密钥，写入 0600；内容不进日志/argv（base64 走 stdin 脚本）。
+13. **`configFiles` 是否进 `WslCliStatus`**：不进；状态查询不付文件读取代价，打开编辑器时 `wsl_cli_config_read` 才读（带 `exists` 与 sha256，不带 mtime）。
+14. **冲突处理**：`expectedHash` 不一致时整次写入放弃，提示「重新读取」，不覆盖、不写部分文件。
 
 仍待产品/实现确认：
 
 1. WSL 面板是否需要在状态卡里显示发行版名（作用域选择器已经显示，可能重复）；实现时按视觉评审决定。
-2. 后续的 `WslCliStatus.configFiles` 是否需要 `exists`/`mtime`；需要时再做一次短调用，本次不加。
-3. 内置终端就绪后的 OAuth 登录是否复用宿主终端，还是只给「在 WSL 终端执行」的复制命令；依赖终端能力。
+2. 内置终端就绪后的 OAuth 登录是否复用宿主终端，还是只给「在 WSL 终端执行」的复制命令；依赖终端能力。

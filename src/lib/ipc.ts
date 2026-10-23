@@ -79,6 +79,26 @@ export interface WslCliStatus {
 /** Engine ids this backend can run inside WSL, in `config::ENGINES` order. */
 export interface WslCliCapabilities {
   engines: string[];
+  /** Engines whose official config files can be edited inside the distro. */
+  editableEngines: string[];
+}
+/** One editable official-config file inside a WSL distro. */
+export interface WslCliConfigFile {
+  key: string;
+  path: string;
+  format: string;
+  secret: boolean;
+  exists: boolean;
+  /** Over the size cap: no content is shipped to the webview. */
+  tooLarge: boolean;
+  content: string;
+  hash: string | null;
+}
+/** Write-back draft; `expectedHash` is the sha256 read earlier. */
+export interface WslCliConfigDraft {
+  key: string;
+  content: string;
+  expectedHash?: string | null;
 }
 export interface TodoItem {
   id?: string | null;
@@ -1619,6 +1639,12 @@ export const ipc = {
   /** 某发行版内受支持引擎的 CLI 状态(只读;复用探测缓存,不强制重探)。 */
   wslCliStatus: (distro: string) =>
     invoke<WslCliStatus[]>("wsl_cli_status", { distro }),
+  /** 读取发行版内某引擎的官方配置文件(白名单,base64 在发行版内完成)。 */
+  wslCliConfigRead: (distro: string, engine: string) =>
+    invoke<WslCliConfigFile[]>("wsl_cli_config_read", { distro, engine }),
+  /** 写回官方配置文件;非法 JSON/TOML 不落盘,hash 冲突返回冲突而不覆盖。 */
+  wslCliConfigWrite: (distro: string, engine: string, files: WslCliConfigDraft[]) =>
+    invoke<void>("wsl_cli_config_write", { distro, engine, files }),
   /** 发行版内工作区的历史会话(与插件会话源同形,`remotePath` 用于回放/删除)。 */
   wslListSessions: (workspacePath: string) =>
     invoke<WslSessionRow[]>("wsl_list_sessions", { workspacePath }),

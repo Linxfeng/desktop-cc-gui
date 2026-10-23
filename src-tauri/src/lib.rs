@@ -471,6 +471,8 @@ pub fn run() {
             engine::wsl_availability::wsl_probe_snapshot,
             engine::wsl_cli::wsl_cli_capabilities,
             engine::wsl_cli::wsl_cli_status,
+            engine::wsl_cli::wsl_cli_config_read,
+            engine::wsl_cli::wsl_cli_config_write,
             engine::wsl_notice::wsl_take_unproven_notices,
             settings::set_wsl_engine_path,
             settings::get_wsl_engine_paths,

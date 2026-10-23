@@ -5,7 +5,7 @@
 //! 正缓存/失败负缓存/single-flight 都在那里），也不读写发行版内文件。后续的
 //! 白名单文件服务会在这里增量扩展，而不是另起一套探测。
 
-use crate::engine::{cli_binary_name, wsl_path, wsl_probe};
+use crate::engine::{cli_binary_name, wsl_path, wsl_probe, wsl_transport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +37,8 @@ pub struct WslCliStatus {
 pub struct WslCliCapabilities {
     /// 当前后端能在 WSL 中运行的引擎 id，按 `config::ENGINES` 顺序。
     pub engines: Vec<String>,
+    /// 发行版内官方配置可编辑的引擎（有白名单文件：claude/codex/kimi）。
+    pub editable_engines: Vec<String>,
 }
 
 /// 本次真正能在本机 WSL 里跑的引擎：Child 传输、无 Windows staging 文件。
@@ -58,7 +60,13 @@ pub(crate) fn supported_engines() -> Vec<String> {
 pub fn wsl_cli_capabilities() -> WslCliCapabilities {
     WslCliCapabilities {
         engines: supported_engines(),
+        editable_engines: editable_engines(),
     }
+}
+
+/// 发行版内官方配置可编辑的引擎。与 [`config_targets`] 的白名单一致。
+pub(crate) fn editable_engines() -> Vec<String> {
+    vec!["claude".into(), "codex".into(), "kimi".into()]
 }
 
 /// 某个发行版内受支持引擎的 CLI 状态。
@@ -174,6 +182,402 @@ fn official_config_path(engine: &str, probe: &wsl_probe::WslProbe) -> Option<Str
         _ => return None,
     };
     Some(format!("{dir}/{file}"))
+}
+
+// ── 官方配置读写（白名单文件） ─────────────────────────────
+//
+// 只碰白名单内的固定文件；前端永远不能传任意路径。内容经 base64 随脚本走
+// stdin，不进 argv、不进日志；secret 文件写入 0600。写入前先在后端校验
+// JSON/TOML，再按 `expectedHash` 做冲突检测，失败保留原文件。
+
+/// 单个配置文件的大小上限；超过则拒绝读入 webview。
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+
+struct ConfigTarget {
+    key: &'static str,
+    dir: String,
+    file: &'static str,
+    format: &'static str,
+    secret: bool,
+}
+
+impl ConfigTarget {
+    fn path(&self) -> String {
+        format!("{}/{}", self.dir.trim_end_matches('/'), self.file)
+    }
+}
+
+fn config_targets(engine: &str, probe: &wsl_probe::WslProbe) -> Vec<ConfigTarget> {
+    let dir = |configured: &str, fallback: &str| {
+        let raw = if configured.trim().is_empty() {
+            format!("{}/{}", probe.home.trim_end_matches('/'), fallback)
+        } else {
+            configured.trim().to_string()
+        };
+        raw.trim_end_matches('/').to_string()
+    };
+    match engine {
+        "claude" => vec![ConfigTarget {
+            key: "settings",
+            dir: dir(&probe.claude_home, ".claude"),
+            file: "settings.json",
+            format: "json",
+            secret: false,
+        }],
+        "codex" => vec![
+            ConfigTarget {
+                key: "config",
+                dir: dir(&probe.codex_home, ".codex"),
+                file: "config.toml",
+                format: "toml",
+                secret: false,
+            },
+            ConfigTarget {
+                key: "auth",
+                dir: dir(&probe.codex_home, ".codex"),
+                file: "auth.json",
+                format: "json",
+                secret: true,
+            },
+        ],
+        "kimi" => vec![ConfigTarget {
+            key: "config",
+            dir: dir(&probe.kimi_home, ".kimi-code"),
+            file: "config.toml",
+            format: "toml",
+            secret: false,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// 编辑器的一个文件页签。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WslCliConfigFile {
+    pub key: String,
+    pub path: String,
+    pub format: String,
+    pub secret: bool,
+    pub exists: bool,
+    /// 超过 [`MAX_CONFIG_BYTES`] 时不带内容，编辑器只展示提示。
+    pub too_large: bool,
+    pub content: String,
+    /// 读时的 sha256（十六进制），写回时用于冲突检测；不存在/过大为 None。
+    pub hash: Option<String>,
+}
+
+/// 写回的草稿。`key` 命中白名单才允许写；`expectedHash` 与读时的 sha256
+/// 不一致时按冲突拒绝，不覆盖发行版里刚改的内容。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WslCliConfigDraft {
+    pub key: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+}
+
+fn local_transport(distro: &str) -> wsl_transport::WslTransport {
+    wsl_transport::WslTransport {
+        backend: wsl_transport::WslBackend::Local,
+        distro: distro.to_string(),
+        engine_paths: std::collections::HashMap::new(),
+        workspace: None,
+        shell_path: None,
+        codex_home: None,
+        claude_home: None,
+        pi_agent_dir: None,
+    }
+}
+
+/// 读取发行版内某引擎的白名单配置文件。
+#[tauri::command]
+pub async fn wsl_cli_config_read(
+    distro: String,
+    engine: String,
+) -> Result<Vec<WslCliConfigFile>, String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = config_targets(&engine, &probe);
+    if targets.is_empty() {
+        return Err(format!("WSL_CLI_CONFIG_UNSUPPORTED:{engine}"));
+    }
+    let transport = local_transport(&distro);
+    let raw =
+        wsl_transport::run_script_output(&transport, &config_read_script(&targets)).await?;
+    parse_config_read(&raw, &targets)
+}
+
+/// 写回发行版内某引擎的白名单配置文件。
+#[tauri::command]
+pub async fn wsl_cli_config_write(
+    distro: String,
+    engine: String,
+    files: Vec<WslCliConfigDraft>,
+) -> Result<(), String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = config_targets(&engine, &probe);
+    if targets.is_empty() {
+        return Err(format!("WSL_CLI_CONFIG_UNSUPPORTED:{engine}"));
+    }
+    // 先全部校验,再写:任一文件非法/超限都不落盘。
+    let mut resolved = Vec::with_capacity(files.len());
+    for draft in &files {
+        let target = targets
+            .iter()
+            .find(|t| t.key == draft.key)
+            .ok_or_else(|| format!("WSL_CLI_CONFIG_UNSUPPORTED:{engine}:{}", draft.key))?;
+        validate_config_content(target.format, &draft.key, &draft.content)?;
+        if draft.content.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(format!("WSL_CLI_FILE_TOO_LARGE:{}", draft.key));
+        }
+        resolved.push(target);
+    }
+    if resolved.is_empty() {
+        return Ok(());
+    }
+    let transport = local_transport(&distro);
+    let raw =
+        wsl_transport::run_script_output(&transport, &config_write_script(&resolved, &files))
+            .await?;
+    parse_config_write(&raw, resolved.len())
+}
+
+/// JSON 必须是对象;TOML 必须能解析。错误码是稳定前缀,前端按前缀本地化。
+fn validate_config_content(format: &str, key: &str, content: &str) -> Result<(), String> {
+    match format {
+        "toml" => {
+            content
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| format!("WSL_CLI_CONFIG_INVALID_TOML:{key}: {e}"))?;
+        }
+        _ => {
+            let value: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| format!("WSL_CLI_CONFIG_INVALID_JSON:{key}: {e}"))?;
+            if !value.is_object() {
+                return Err(format!("WSL_CLI_CONFIG_INVALID_JSON:{key}: 必须是 JSON 对象"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 读取脚本:每个白名单文件一个 BEGIN/END 块;不存在 → MISSING;超限 →
+/// TOO_LARGE(不再读内容,避免把大文件灌进 IPC)。
+fn config_read_script(targets: &[ConfigTarget]) -> String {
+    let mut script = format!(
+        "set -u\n\
+cfg_read() {{\n\
+  local key=\"$1\" path=\"$2\"\n\
+  printf '__CCGUI__CFG_BEGIN %s\\n' \"$key\"\n\
+  if [ -f \"$path\" ]; then\n\
+    printf '__CCGUI__CFG_EXISTS\\n'\n\
+    if [ \"$(wc -c < \"$path\")\" -gt {max} ]; then\n\
+      printf '__CCGUI__CFG_TOO_LARGE\\n'\n\
+    else\n\
+      sha256sum \"$path\" | awk '{{printf \"__CCGUI__CFG_HASH %s\\n\", $1}}'\n\
+      base64 -w0 \"$path\"\n\
+      printf '\\n'\n\
+    fi\n\
+  else\n\
+    printf '__CCGUI__CFG_MISSING\\n'\n\
+  fi\n\
+  printf '__CCGUI__CFG_END\\n'\n\
+}}\n",
+        max = MAX_CONFIG_BYTES,
+    );
+    for target in targets {
+        script.push_str(&format!(
+            "cfg_read {} {}\n",
+            wsl_transport::sh_quote(target.key),
+            wsl_transport::sh_quote(&target.path()),
+        ));
+    }
+    script.push_str("exit 0\n");
+    script
+}
+
+/// 写入脚本:先全量冲突检查,再逐个原子写。脚本永远 `exit 0`,结果走 stdout
+/// 哨兵 —— 非零退出会被传输层统一成 `WSL_SHORT_CALL_FAILED`,丢冲突信息。
+fn config_write_script(targets: &[&ConfigTarget], drafts: &[WslCliConfigDraft]) -> String {
+    let mut script = String::from(
+        "set -u\n\
+umask 077\n\
+conflict=0\n\
+cfg_check() {\n\
+  local key=\"$1\" path=\"$2\" expected=\"$3\"\n\
+  if [ -n \"$expected\" ]; then\n\
+    if [ ! -f \"$path\" ]; then\n\
+      printf '__CCGUI__CFG_CONFLICT %s\\n' \"$key\"\n\
+      conflict=1\n\
+      return\n\
+    fi\n\
+    local current\n\
+    current=$(sha256sum \"$path\" | awk '{print $1}')\n\
+    if [ \"$current\" != \"$expected\" ]; then\n\
+      printf '__CCGUI__CFG_CONFLICT %s\\n' \"$key\"\n\
+      conflict=1\n\
+    fi\n\
+  fi\n\
+}\n",
+    );
+    for draft in drafts {
+        let target = targets
+            .iter()
+            .find(|t| t.key == draft.key)
+            .expect("validated before script");
+        script.push_str(&format!(
+            "cfg_check {} {} {}\n",
+            wsl_transport::sh_quote(target.key),
+            wsl_transport::sh_quote(&target.path()),
+            wsl_transport::sh_quote(draft.expected_hash.as_deref().unwrap_or("")),
+        ));
+    }
+    script.push_str("if [ \"$conflict\" -eq 0 ]; then\n");
+    script.push_str(
+        "cfg_write() {\n\
+  local key=\"$1\" path=\"$2\" secret=\"$3\" b64=\"$4\"\n\
+  local dir\n\
+  dir=$(dirname \"$path\")\n\
+  mkdir -p -m 700 \"$dir\" 2>/dev/null || true\n\
+  # 非 secret 沿用原文件权限,缺失/secret 一律 600;mv 保留临时文件的权限位。\n\
+  local mode\n\
+  if [ \"$secret\" = \"1\" ]; then\n\
+    mode=600\n\
+  elif [ -f \"$path\" ]; then\n\
+    mode=$(stat -c '%a' \"$path\" 2>/dev/null)\n\
+    mode=${mode:-600}\n\
+  else\n\
+    mode=600\n\
+  fi\n\
+  local tmp=\"$path.ccgui-tmp-$$\"\n\
+  if ! printf '%s' \"$b64\" | base64 -d > \"$tmp\" 2>/dev/null; then\n\
+    rm -f \"$tmp\"\n\
+    printf '__CCGUI__CFG_WRITE_FAIL %s\\n' \"$key\"\n\
+    return\n\
+  fi\n\
+  chmod \"$mode\" \"$tmp\" 2>/dev/null\n\
+  if mv -f \"$tmp\" \"$path\" 2>/dev/null; then\n\
+    printf '__CCGUI__CFG_WRITTEN %s\\n' \"$key\"\n\
+  else\n\
+    rm -f \"$tmp\"\n\
+    printf '__CCGUI__CFG_WRITE_FAIL %s\\n' \"$key\"\n\
+  fi\n\
+}\n",
+    );
+    for draft in drafts {
+        let target = targets
+            .iter()
+            .find(|t| t.key == draft.key)
+            .expect("validated before script");
+        // base64 只含字母数字 + / + =,不含引号/空白,可以裸写在脚本里。
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            draft.content.as_bytes(),
+        );
+        script.push_str(&format!(
+            "cfg_write {} {} {} {}\n",
+            wsl_transport::sh_quote(target.key),
+            wsl_transport::sh_quote(&target.path()),
+            if target.secret { "1" } else { "0" },
+            b64,
+        ));
+    }
+    script.push_str("fi\nexit 0\n");
+    script
+}
+
+fn parse_config_read(
+    raw: &str,
+    targets: &[ConfigTarget],
+) -> Result<Vec<WslCliConfigFile>, String> {
+    use base64::Engine as _;
+    let mut out = Vec::with_capacity(targets.len());
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
+        let Some(key) = line.trim().strip_prefix("__CCGUI__CFG_BEGIN ") else {
+            continue;
+        };
+        let key = key.trim();
+        let target = targets
+            .iter()
+            .find(|t| t.key == key)
+            .ok_or_else(|| format!("WSL_CLI_CONFIG_READ_FAILED:unknown key {key}"))?;
+        let mut exists = false;
+        let mut too_large = false;
+        let mut hash = None;
+        let mut b64 = String::new();
+        for line in lines.by_ref() {
+            let line = line.trim_end();
+            if line == "__CCGUI__CFG_END" {
+                break;
+            } else if line == "__CCGUI__CFG_EXISTS" {
+                exists = true;
+            } else if line == "__CCGUI__CFG_MISSING" {
+                exists = false;
+            } else if line == "__CCGUI__CFG_TOO_LARGE" {
+                too_large = true;
+            } else if let Some(value) = line.strip_prefix("__CCGUI__CFG_HASH ") {
+                hash = Some(value.trim().to_string());
+            } else if !line.is_empty() {
+                b64.push_str(line);
+            }
+        }
+        let content = if exists && !too_large {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| format!("WSL_CLI_CONFIG_READ_FAILED:{key}: {e}"))?;
+            String::from_utf8(bytes)
+                .map_err(|_| format!("WSL_CLI_CONFIG_READ_FAILED:{key}: 不是 UTF-8 文本"))?
+        } else {
+            String::new()
+        };
+        out.push(WslCliConfigFile {
+            key: key.to_string(),
+            path: target.path(),
+            format: target.format.to_string(),
+            secret: target.secret,
+            exists,
+            too_large,
+            content,
+            hash,
+        });
+    }
+    // 每个目标都要有 BEGIN/END,否则按读取失败处理(不静默丢文件页签)。
+    if out.len() != targets.len() {
+        return Err("WSL_CLI_CONFIG_READ_FAILED:输出不完整".to_string());
+    }
+    Ok(out)
+}
+
+fn parse_config_write(raw: &str, expected_writes: usize) -> Result<(), String> {
+    let mut conflicts = Vec::new();
+    let mut failures = Vec::new();
+    let mut written = 0usize;
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(key) = line.strip_prefix("__CCGUI__CFG_CONFLICT ") {
+            conflicts.push(key.trim().to_string());
+        } else if let Some(key) = line.strip_prefix("__CCGUI__CFG_WRITE_FAIL ") {
+            failures.push(key.trim().to_string());
+        } else if line.starts_with("__CCGUI__CFG_WRITTEN ") {
+            written += 1;
+        }
+    }
+    if let Some(key) = conflicts.first() {
+        return Err(format!("WSL_CLI_CONFIG_CONFLICT:{key}"));
+    }
+    if let Some(key) = failures.first() {
+        return Err(format!("WSL_CLI_CONFIG_WRITE_FAILED:{key}"));
+    }
+    if written != expected_writes {
+        return Err(format!(
+            "WSL_CLI_CONFIG_WRITE_FAILED:expected {expected_writes}, wrote {written}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,9 +744,147 @@ mod tests {
 
     #[test]
     fn capabilities_match_supported_engines() {
-        assert_eq!(
-            wsl_cli_capabilities().engines,
-            vec!["claude", "kimi", "codex", "pi", "minimax"]
+        let caps = wsl_cli_capabilities();
+        assert_eq!(caps.engines, vec!["claude", "kimi", "codex", "pi", "minimax"]);
+        assert_eq!(caps.editable_engines, vec!["claude", "codex", "kimi"]);
+    }
+
+    // ── 官方配置读写 ───────────────────────────────────────────
+
+    fn probe_with_dirs(raw: &str) -> wsl_probe::WslProbe {
+        wsl_probe::parse_probe_output(raw).expect("probe parses")
+    }
+
+    #[test]
+    fn config_targets_follow_whitelist_and_env() {
+        let probe = probe_with_dirs(
+            "__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n\
+             __CCGUI__CLAUDE_HOME=/data/claude\n\
+             __CCGUI__CODEX_HOME=/data/codex\n",
         );
+        let claude = config_targets("claude", &probe);
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].path(), "/data/claude/settings.json");
+
+        let codex = config_targets("codex", &probe);
+        assert_eq!(codex.len(), 2);
+        assert_eq!(codex[1].key, "auth");
+        assert!(codex[1].secret);
+        assert_eq!(codex[1].path(), "/data/codex/auth.json");
+
+        let kimi = config_targets("kimi", &probe);
+        assert_eq!(kimi.len(), 1);
+        assert_eq!(kimi[0].path(), "/home/me/.kimi-code/config.toml");
+
+        assert!(config_targets("pi", &probe).is_empty());
+        assert!(config_targets("minimax", &probe).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_content() {
+        assert!(validate_config_content("json", "settings", "{}").is_ok());
+        assert!(validate_config_content("json", "settings", "{\"a\":1}").is_ok());
+        assert!(validate_config_content("json", "settings", "not json").is_err());
+        assert!(validate_config_content("json", "settings", "[1,2]").is_err());
+        assert!(validate_config_content("toml", "config", "a = 1").is_ok());
+        assert!(validate_config_content("toml", "config", "a = = 1").is_err());
+    }
+
+    /// 读脚本的哨兵 → 结构体:存在 / 缺失 / 超限都要正确落到字段上。
+    #[test]
+    fn parse_config_read_roundtrip() {
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        let targets = config_targets("codex", &probe);
+        let raw = concat!(
+            "noise before\n",
+            "__CCGUI__CFG_BEGIN config\n",
+            "__CCGUI__CFG_EXISTS\n",
+            "__CCGUI__CFG_HASH abc123\n",
+            "YSA9IDE=\n", // "a = 1"
+            "__CCGUI__CFG_END\n",
+            "__CCGUI__CFG_BEGIN auth\n",
+            "__CCGUI__CFG_MISSING\n",
+            "__CCGUI__CFG_END\n",
+        );
+        let files = parse_config_read(raw, &targets).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].exists);
+        assert_eq!(files[0].content, "a = 1");
+        assert_eq!(files[0].hash.as_deref(), Some("abc123"));
+        assert!(!files[0].secret);
+        assert!(!files[1].exists);
+        assert!(files[1].secret);
+        assert_eq!(files[1].content, "");
+    }
+
+    #[test]
+    fn parse_config_read_marks_too_large() {
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        let targets = config_targets("claude", &probe);
+        let raw = concat!(
+            "__CCGUI__CFG_BEGIN settings\n",
+            "__CCGUI__CFG_EXISTS\n",
+            "__CCGUI__CFG_TOO_LARGE\n",
+            "__CCGUI__CFG_END\n",
+        );
+        let files = parse_config_read(raw, &targets).unwrap();
+        assert!(files[0].too_large);
+        assert_eq!(files[0].content, "");
+        assert_eq!(files[0].hash, None);
+    }
+
+    #[test]
+    fn parse_config_read_rejects_incomplete_output() {
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        let targets = config_targets("codex", &probe);
+        let raw = concat!(
+            "__CCGUI__CFG_BEGIN config\n",
+            "__CCGUI__CFG_EXISTS\n",
+            "__CCGUI__CFG_HASH abc\n",
+            "e30K\n",
+            "__CCGUI__CFG_END\n",
+        );
+        assert!(parse_config_read(raw, &targets).is_err());
+    }
+
+    #[test]
+    fn write_script_checks_conflicts_before_writing() {
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        let targets = config_targets("codex", &probe);
+        let refs: Vec<&ConfigTarget> = targets.iter().collect();
+        let drafts = vec![
+            WslCliConfigDraft {
+                key: "config".to_string(),
+                content: "a = 1".to_string(),
+                expected_hash: Some("abc".to_string()),
+            },
+            WslCliConfigDraft {
+                key: "auth".to_string(),
+                content: "{\"k\":\"v\"}".to_string(),
+                expected_hash: None,
+            },
+        ];
+        let script = config_write_script(&refs, &drafts);
+        let check_pos = script.find("cfg_check 'config'").unwrap();
+        let write_pos = script.find("cfg_write 'config'").unwrap();
+        assert!(check_pos < write_pos);
+        // base64 内容在脚本里,secret 标记为 1
+        assert!(script.contains("cfg_write 'auth' '/home/me/.codex/auth.json' 1 eyJrIjoidiJ9"));
+        // 脚本永远 exit 0,冲突/失败走 stdout 哨兵
+        assert!(script.ends_with("exit 0\n"));
+    }
+
+    #[test]
+    fn parse_config_write_reports_conflict_first() {
+        let raw = "__CCGUI__CFG_CONFLICT config\n";
+        assert_eq!(
+            parse_config_write(raw, 1).unwrap_err(),
+            "WSL_CLI_CONFIG_CONFLICT:config"
+        );
+        assert!(parse_config_write("__CCGUI__CFG_WRITE_FAIL auth\n", 1)
+            .unwrap_err()
+            .starts_with("WSL_CLI_CONFIG_WRITE_FAILED:"));
+        assert!(parse_config_write("__CCGUI__CFG_WRITTEN config\n", 1).is_ok());
+        assert!(parse_config_write("", 1).is_err());
     }
 }

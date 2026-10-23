@@ -29,6 +29,8 @@ interface CliScopeSnapshot {
   distros: string[];
   /** 后端声明的 WSL 可运行引擎。 */
   engines: string[];
+  /** 后端声明的「官方配置可编辑」引擎。 */
+  editableEngines: string[];
   /** 是否已完成一次元数据读取（成功或失败）。 */
   ready: boolean;
   metaError: string | null;
@@ -83,6 +85,7 @@ function baseSnapshot(): CliScopeSnapshot {
       distro: readKey(DISTRO_KEY) || null,
       distros: [],
       engines: [],
+      editableEngines: [],
       ready: false,
       metaError: null,
     };
@@ -144,6 +147,7 @@ async function loadMeta(): Promise<void> {
       ...baseSnapshot(),
       distros: [],
       engines: [],
+      editableEngines: [],
       ready: true,
       metaError: errorText(reason),
     });
@@ -161,6 +165,11 @@ async function loadMeta(): Promise<void> {
   // 不能把 null 灌进快照。
   const engines = Array.isArray(rawCaps?.engines)
     ? rawCaps.engines.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  const editableEngines = Array.isArray(rawCaps?.editableEngines)
+    ? rawCaps.editableEngines.filter(
         (value): value is string => typeof value === "string",
       )
     : [];
@@ -183,6 +192,7 @@ async function loadMeta(): Promise<void> {
     ...current,
     distros,
     engines,
+    editableEngines,
     requested,
     distro,
     ready: true,

@@ -23,6 +23,7 @@ import { CliEngineCard } from "./CliEngineCard";
 import { notifyCliConfigChanged, type EngineId } from "./providers";
 import { useWslCliStatus } from "./use-wsl-cli-status";
 import { WslEnginePathRow } from "./WslEnginePathRow";
+import { WslOfficialEditDialog } from "./WslOfficialEditDialog";
 
 /**
  * CLI 页的 WSL 作用域:应用级设置 + 只读状态 + 路径覆盖。
@@ -39,10 +40,13 @@ import { WslEnginePathRow } from "./WslEnginePathRow";
 export function WslCliPanel({
   engine,
   distro,
+  canEditOfficial,
   onManageHost,
 }: {
   engine: EngineId;
   distro: string;
+  /** 后端声明该引擎的发行版内官方配置可编辑。 */
+  canEditOfficial: boolean;
   /** 渠道是应用级的,切回本机作用域管理。 */
   onManageHost: () => void;
 }) {
@@ -51,6 +55,7 @@ export function WslCliPanel({
   const [pathError, setPathError] = useState("");
   const [engineError, setEngineError] = useState("");
   const [engineBusy, setEngineBusy] = useState(false);
+  const [editingOfficial, setEditingOfficial] = useState(false);
   const feedback = useActionFeedback({ spin: true });
 
   const engines = useChatStore((state) => state.engines);
@@ -153,6 +158,15 @@ export function WslCliPanel({
                 {configPath}
               </span>
               <CopyPathButton path={configPath} />
+              {canEditOfficial && (
+                <Button
+                  variant="secondary"
+                  size="small"
+                  onClick={() => setEditingOfficial(true)}
+                >
+                  {t("settings.cliEdit")}
+                </Button>
+              )}
             </div>
           </SettingsRow>
         </SettingsCard>
@@ -251,6 +265,14 @@ export function WslCliPanel({
           </Button>
         </SettingsRow>
       </SettingsCard>
+
+      {editingOfficial && (
+        <WslOfficialEditDialog
+          engine={engine}
+          distro={distro}
+          onClose={() => setEditingOfficial(false)}
+        />
+      )}
     </div>
   );
 }

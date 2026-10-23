@@ -14,21 +14,9 @@ import { TextArea } from "@/components/base/input/textarea";
 import { ModalShell } from "@/components/dialogs";
 import { ipc, type OfficialConfigFile } from "@/lib/ipc";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
+import { jsonErrorOf } from "./official-config-json";
 import type { CliConfigState } from "./useCliConfig";
 import { errorText } from "@/lib/errors";
-
-/** Client-side JSON check so the save button disables before the round-trip;
- *  TOML panes rely on the backend's parse error, shown inline. */
-function jsonErrorOf(format: string, content: string): string | null {
-  if (format !== "json") return null;
-  try {
-    const value: unknown = JSON.parse(content);
-    if (!value || typeof value !== "object" || Array.isArray(value)) return "object";
-    return null;
-  } catch {
-    return "syntax";
-  }
-}
 
 export function CliOfficialEditDialog({ cli }: { cli: CliConfigState }) {
   const { t, engine, officialEditing, setOfficialEditing, saveOfficialConfig, busy } = cli;

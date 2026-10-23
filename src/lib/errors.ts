@@ -22,6 +22,12 @@ const WSL_ERROR_PREFIXES: [prefix: string, key: string][] = [
   ["WSL_SHORT_CALL_TIMEOUT:", "wsl.error.shortCallTimeout"],
   ["WSL_SHORT_CALL_FAILED:", "wsl.error.shortCallFailed"],
   ["WSL_CLI_PATH_INVALID:", "wsl.cliPathInvalid"],
+  ["WSL_CLI_FILE_TOO_LARGE:", "wsl.cli.fileTooLarge"],
+  ["WSL_CLI_CONFIG_CONFLICT:", "wsl.cli.configConflict"],
+  ["WSL_CLI_CONFIG_INVALID_JSON:", "wsl.cli.configInvalid"],
+  ["WSL_CLI_CONFIG_INVALID_TOML:", "wsl.cli.configInvalid"],
+  ["WSL_CLI_CONFIG_WRITE_FAILED:", "wsl.cli.configWriteFailed"],
+  ["WSL_CLI_CONFIG_READ_FAILED:", "wsl.cli.configReadFailed"],
   ["WSL_EXIT_UNPROVEN:", "wsl.error.exitUnproven"],
   ["WSL_RG_MISSING", "wsl.error.generic"],
 ];
@@ -30,6 +36,8 @@ const WSL_ERROR_PREFIXES: [prefix: string, key: string][] = [
 const WSL_NAME_KEYS = new Set([
   "wsl.error.cliNotFound",
   "wsl.error.cliNotExecutable",
+  "wsl.cli.fileTooLarge",
+  "wsl.cli.configConflict",
 ]);
 
 /** 需要保留完整路径的 key(cwd 缺失时用户要靠路径定位目录)。 */

@@ -27,9 +27,9 @@ beforeEach(async () => {
   store = (await import("./use-cli-scope")).cliScopeStore;
 });
 
-function resolved(distros: string[], engines: string[]) {
+function resolved(distros: string[], engines: string[], editableEngines: string[] = ["claude"]) {
   mocks.wslDistros.mockResolvedValue(distros);
-  mocks.wslCliCapabilities.mockResolvedValue({ engines });
+  mocks.wslCliCapabilities.mockResolvedValue({ engines, editableEngines });
 }
 
 describe("cliScopeStore", () => {
@@ -42,6 +42,7 @@ describe("cliScopeStore", () => {
       requested: "host",
       distros: ["Ubuntu-24.04", "Debian"],
       engines: ["claude", "pi"],
+      editableEngines: ["claude"],
     });
 
     store.setScope("wsl");

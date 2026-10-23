@@ -2410,10 +2410,21 @@ export const en: Messages = {
       channelsGlobal:
         "Provider channels are app-level and shared by host and WSL sends.",
       manageChannels: "Manage on This PC",
-      officialDesc: "The CLI's own config file inside the distro; edit it there.",
+      officialDesc: "The CLI's own config file inside the distro",
       copyPath: "Copy path",
       metaFailed: "Could not read WSL information: {{message}}",
       retry: "Retry",
+      editTitle: "Edit {{name}} official config (in the distro)",
+      secretBadge: "secret",
+      fileMissing: "The file does not exist; saving will create it.",
+      fileTooLarge:
+        "The config file is too large ({{name}}); the limit is 256 KiB. Edit it inside the distro.",
+      configConflict:
+        "{{name}} was modified inside the distro. Read it again before saving.",
+      configInvalid: "Invalid config content: {{message}}",
+      configWriteFailed: "Could not write the config inside the distro: {{message}}",
+      configReadFailed: "Could not read the config inside the distro: {{message}}",
+      reRead: "Read again",
     },
     noticeExitUnproven:
       "Processes from a session in {{distro}} may still be running (teardown unconfirmed). If they hold resources, check with ps in a WSL terminal.",
