@@ -2364,6 +2364,8 @@ export const zh = {
       configWriteFailed: "写入发行版内配置失败：{{message}}",
       configReadFailed: "读取发行版内配置失败：{{message}}",
       reRead: "重新读取",
+      piAuthOauthHint:
+        "WSL 作用域暂无内置终端：请在发行版内启动 pi 后执行 {{command}} 完成登录。",
     },
     noticeExitUnproven:
       "{{distro}} 内的会话进程可能仍在运行（回收未确认）。如占用资源，请在 WSL 终端里用 ps 检查。",

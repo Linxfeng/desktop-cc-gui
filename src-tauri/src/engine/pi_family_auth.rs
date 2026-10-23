@@ -329,6 +329,81 @@ fn snapshots_for(get_key: impl Fn(&str) -> Option<String>) -> Vec<AuthProviderSn
         .collect()
 }
 
+// ── shared pure helpers (path-independent) ─────────────────────────────────
+//
+// 抽出来给 WSL 侧复用（engine/wsl_cli.rs 的 wsl_pi_* 命令）：解析、掩码、
+// 合并/删除规则与文件存放位置无关，主机实现与 WSL 实现必须共享同一份，
+// 否则掩码/校验规则会漂移。
+
+/// JSON 对象解析。损坏报 CORRUPTED（fail-closed，永不覆盖）。
+pub(crate) fn parse_auth_store(text: &str, display_path: &str) -> Result<Map<String, Value>, String> {
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        format!(
+            "[PI_FAMILY_AUTH_CORRUPTED] {display_path} is not valid JSON: {error}"
+        )
+    })?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(format!(
+            "[PI_FAMILY_AUTH_CORRUPTED] {display_path} root must be a JSON object"
+        )),
+    }
+}
+
+/// Provider 快照（掩码后）+ oauth provider 列表。掩码在此完成：
+/// 快照之后原始 key 不再出现在任何 IPC 载荷里。
+pub(crate) fn auth_snapshots(
+    map: &Map<String, Value>,
+) -> (Vec<AuthProviderSnapshot>, Vec<String>) {
+    let oauth_providers = map
+        .iter()
+        .filter(|(_, item)| item.get("type").and_then(Value::as_str) == Some("oauth"))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let providers = snapshots_for(|id| {
+        map.get(id)
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("api_key"))
+            .and_then(|item| item.get("key"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    (providers, oauth_providers)
+}
+
+/// 在已解析的 auth store 上应用「设置/替换 API key」。
+pub(crate) fn apply_set_api_key(
+    map: &mut Map<String, Value>,
+    provider_id: &str,
+    key: &str,
+) -> Result<(), String> {
+    let key = validate_new_key(provider_id, key)?;
+    let mut credential = Map::new();
+    credential.insert("type".to_string(), Value::String("api_key".to_string()));
+    credential.insert("key".to_string(), Value::String(key));
+    map.insert(provider_id.to_string(), Value::Object(credential));
+    Ok(())
+}
+
+/// 在已解析的 auth store 上应用「删除凭据」。返回是否真的删除了条目。
+/// oauth 凭据由 CLI 自管，拒绝。
+pub(crate) fn apply_delete_credential(
+    map: &mut Map<String, Value>,
+    provider_id: &str,
+) -> Result<bool, String> {
+    catalog_entry(provider_id).ok_or_else(|| {
+        format!("[PI_FAMILY_AUTH_UNKNOWN_PROVIDER] unknown provider: {provider_id}")
+    })?;
+    if let Some(entry) = map.get(provider_id) {
+        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        if entry_type == "oauth" {
+            return Err(format!(
+                "[PI_FAMILY_AUTH_OAUTH_MANAGED] {provider_id} is an OAuth credential managed by pi itself; run `pi /logout` in a terminal"
+            ));
+        }
+    }
+    Ok(map.remove(provider_id).is_some())
+}
+
 // ── pi: auth.json ───────────────────────────────────────────────────────────
 
 /// Read auth.json into a JSON object map.
@@ -336,21 +411,7 @@ fn snapshots_for(get_key: impl Fn(&str) -> Option<String>) -> Vec<AuthProviderSn
 /// - Corrupted JSON / non-object root → `Err` (fail-closed; never overwritten).
 fn read_auth_map(path: &std::path::Path) -> Result<Option<Map<String, Value>>, String> {
     match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let value: Value = serde_json::from_str(&content).map_err(|error| {
-                format!(
-                    "[PI_FAMILY_AUTH_CORRUPTED] {} is not valid JSON: {error}",
-                    path.display()
-                )
-            })?;
-            match value {
-                Value::Object(map) => Ok(Some(map)),
-                _ => Err(format!(
-                    "[PI_FAMILY_AUTH_CORRUPTED] {} root must be a JSON object",
-                    path.display()
-                )),
-            }
-        }
+        Ok(content) => parse_auth_store(&content, &path.display().to_string()).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
             "[PI_FAMILY_AUTH_READ] read {}: {error}",
@@ -412,11 +473,7 @@ fn pi_list(agent: &std::path::Path) -> Result<AuthListResult, String> {
     let exists = map.is_some();
     let map = map.unwrap_or_default();
 
-    let oauth_providers = map
-        .iter()
-        .filter(|(_, item)| item.get("type").and_then(Value::as_str) == Some("oauth"))
-        .map(|(id, _)| id.clone())
-        .collect();
+    let (providers, oauth_providers) = auth_snapshots(&map);
 
     Ok(AuthListResult {
         store: AuthStoreInfo {
@@ -424,46 +481,25 @@ fn pi_list(agent: &std::path::Path) -> Result<AuthListResult, String> {
             kind: "authJson".to_string(),
             exists,
         },
-        providers: snapshots_for(|id| {
-            map.get(id)
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("api_key"))
-                .and_then(|item| item.get("key"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }),
+        providers,
         oauth_providers,
     })
 }
 
 fn pi_set_api_key(agent: &std::path::Path, provider_id: &str, key: &str) -> Result<(), String> {
-    let key = validate_new_key(provider_id, key)?;
     let path = agent.join("auth.json");
     let mut map = read_auth_map(&path)?.unwrap_or_default();
-    let mut credential = Map::new();
-    credential.insert("type".to_string(), Value::String("api_key".to_string()));
-    credential.insert("key".to_string(), Value::String(key));
-    map.insert(provider_id.to_string(), Value::Object(credential));
+    apply_set_api_key(&mut map, provider_id, key)?;
     write_auth_map(&path, &map)
 }
 
 fn pi_delete_credential(agent: &std::path::Path, provider_id: &str) -> Result<(), String> {
-    catalog_entry(provider_id).ok_or_else(|| {
-        format!("[PI_FAMILY_AUTH_UNKNOWN_PROVIDER] unknown provider: {provider_id}")
-    })?;
     let path = agent.join("auth.json");
     let mut map = match read_auth_map(&path)? {
         Some(map) => map,
         None => return Ok(()), // nothing to delete
     };
-    if let Some(entry) = map.get(provider_id) {
-        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
-        if entry_type == "oauth" {
-            return Err(format!(
-                "[PI_FAMILY_AUTH_OAUTH_MANAGED] {provider_id} is an OAuth credential managed by pi itself; run `pi /logout` in a terminal"
-            ));
-        }
-    }
-    map.remove(provider_id);
+    apply_delete_credential(&mut map, provider_id)?;
     write_auth_map(&path, &map)
 }
 
@@ -633,7 +669,7 @@ fn omp_delete_credential(agent: &std::path::Path, provider_id: &str) -> Result<(
 // `!command`), so the raw file text IS returned for editing.
 
 /// pi template (JSON with comments); omp gets the YAML equivalent below.
-const MODELS_TEMPLATE_JSON: &str = r#"{
+pub(crate) const MODELS_TEMPLATE_JSON: &str = r#"{
   "providers": {
     "my-relay": {
       "baseUrl": "https://your-relay.com/v1",
@@ -813,7 +849,7 @@ pub(crate) fn validate_models_config_text(engine: &str, text: &str) -> Result<Va
     Ok(value)
 }
 
-fn summarize_providers(value: &Value) -> Vec<CustomProviderSummary> {
+pub(crate) fn summarize_providers(value: &Value) -> Vec<CustomProviderSummary> {
     let mut out = Vec::new();
     let Some(providers) = value.get("providers").and_then(Value::as_object) else {
         return out;

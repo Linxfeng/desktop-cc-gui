@@ -24,6 +24,7 @@ import { notifyCliConfigChanged, type EngineId } from "./providers";
 import { useWslCliStatus } from "./use-wsl-cli-status";
 import { WslEnginePathRow } from "./WslEnginePathRow";
 import { WslOfficialEditDialog } from "./WslOfficialEditDialog";
+import { WslPiAuthSection } from "./WslPiAuthSection";
 
 /**
  * CLI 页的 WSL 作用域:应用级设置 + 只读状态 + 路径覆盖。
@@ -171,6 +172,10 @@ export function WslCliPanel({
           </SettingsRow>
         </SettingsCard>
       )}
+
+      {/* pi 的供应商认证（API Key / 自定义供应商）与主机页同一套交互；
+          发行版内读写经 wsl_pi_* 白名单命令，key 只以掩码跨 IPC。 */}
+      {engine === "pi" && <WslPiAuthSection key={distro} distro={distro} />}
 
       <SettingsCard>
         {loading && !statuses ? (

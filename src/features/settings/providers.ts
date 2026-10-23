@@ -223,11 +223,19 @@ export function providerEntries(
  * Window event fired after any CLI config mutation so the chat tree
  * (ChatConversation's model picker) refetches — it caches getCliConfig on
  * mount and never re-reads otherwise.
+ *
+ * `detail.engine` narrows the re-probe to one engine (pi 认证写入只影响
+ * pi 的模型目录); without it listeners only refresh channel config, keeping
+ * the original behavior.
  */
 export const CLI_CONFIG_CHANGED_EVENT = "ccgui:cli-config-changed";
 
-export function notifyCliConfigChanged() {
-  window.dispatchEvent(new Event(CLI_CONFIG_CHANGED_EVENT));
+export function notifyCliConfigChanged(engine?: EngineId) {
+  window.dispatchEvent(
+    engine
+      ? new CustomEvent(CLI_CONFIG_CHANGED_EVENT, { detail: { engine } })
+      : new Event(CLI_CONFIG_CHANGED_EVENT),
+  );
 }
 
 /** Per-engine default channel (`section.current`). Unset / empty → 官方配置. */

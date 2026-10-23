@@ -823,7 +823,7 @@ IPC（本次只实现前两个只读命令，其余后续增量加入）：
 
 | 工作项 | 用户可见结果 | 范围 | 明确不做 | 依赖 |
 | --- | --- | --- | --- | --- |
-| Pi 认证 | Pi 的 API Key 列表/增删、`models.json` 编辑；聊天模型菜单即时刷新 | 远程 `auth.json` 读写、掩码、provider 校验、模型刷新 | OAuth 登录 | 本次的文件服务 |
+| Pi 认证 | 已实现（`docs/plans/2026-10-23-wsl-pi-auth.md`）：Pi 的 API Key 列表/增删、`models.json` 编辑；聊天模型菜单即时刷新 | 远程 `auth.json` 读写、掩码、provider 校验、模型刷新 | OAuth 登录 | 本次的文件服务 |
 | WSL 终端与 OAuth | Pi/omp OAuth 登录可在发行版内完成；OAuth 状态刷新 | WSL 终端 + `pi auth` 流程 + 状态读取 | 其他引擎的登录流程 | 终端能力 |
 | 高级配置 | 每发行版自定义配置目录/自定义模型；更新给出可复制的发行版内命令 | `CODEX_HOME` 等覆盖、custom models、手动更新提示 | 自动跑包管理器升级 | 本次的文件服务与 Pi 认证 |
 

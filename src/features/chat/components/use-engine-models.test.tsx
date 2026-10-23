@@ -292,6 +292,41 @@ describe("useEngineModels probe dispatch", () => {
       "/ws-b",
     ]);
   });
+
+  it("带引擎的配置变更事件触发该引擎重探,无 detail 的事件不重探", async () => {
+    // pi 认证 / 模型编辑只影响 pi 的目录:事件带 detail.engine 时清掉该引擎
+    // 的目录与探针记录,让探针 effect 重新派发;其它引擎与无 detail 的旧事件
+    // 保持原行为(只重读渠道配置)。
+    let catalog = { models: [{ id: "pi/m1", provider: "pi" }], authoritative: true };
+    vi.mocked(ipc.listEngineModels).mockImplementation(async () => catalog);
+    await show([engineInfo("pi", true), engineInfo("omp", true)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      catalog = { models: [{ id: "pi/m2", provider: "pi" }], authoritative: true };
+      window.dispatchEvent(
+        new CustomEvent("ccgui:cli-config-changed", { detail: { engine: "pi" } }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(3);
+    expect(latest.catalogs.pi?.models[0]?.id).toBe("pi/m2");
+    // omp 的目录没被动过,不重探。
+    expect(vi.mocked(ipc.listEngineModels).mock.calls.map((call) => call[0])).toEqual([
+      "pi",
+      "omp",
+      "pi",
+    ]);
+
+    await act(async () => {
+      catalog = { models: [{ id: "pi/m3", provider: "pi" }], authoritative: true };
+      window.dispatchEvent(new Event("ccgui:cli-config-changed"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe("useEngineModels refresh scope", () => {

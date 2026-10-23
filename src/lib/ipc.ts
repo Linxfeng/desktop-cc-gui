@@ -81,6 +81,9 @@ export interface WslCliCapabilities {
   engines: string[];
   /** Engines whose official config files can be edited inside the distro. */
   editableEngines: string[];
+  /** Engines whose provider auth (API keys / custom providers) can be
+   *  managed inside the distro (pi's auth.json / models.json). */
+  authEngines: string[];
 }
 /** One editable official-config file inside a WSL distro. */
 export interface WslCliConfigFile {
@@ -1221,6 +1224,23 @@ export interface PiFamilyModelsConfigReadResult {
   parseError: string | null;
 }
 
+// ---- pi provider auth inside a WSL distro (wsl_pi_*) ----
+// Same shapes as the host pi-family section: keys are masked backend-side
+// and never round-trip; models.json text is the user's own config text.
+
+/** `wsl_pi_models_read`: text + provider summaries + the read hash for
+ *  conflict detection (the host shape has no hash — host writes don't need it). */
+export interface WslPiModelsRead {
+  path: string;
+  exists: boolean;
+  /** Verbatim JSONC text (comments preserved); null when missing. */
+  text: string | null;
+  template: string;
+  providers: PiFamilyCustomProviderSummary[];
+  parseError: string | null;
+  hash: string | null;
+}
+
 // ==================== Plugins (Phase 1 runtime, plan §4.3) ====================
 
 export interface PluginInfo {
@@ -1413,6 +1433,17 @@ export const ipc = {
     invoke<PiFamilyModelsConfigReadResult>("pi_family_models_config_read", { engine }),
   piFamilyModelsConfigWrite: (engine: string, text: string) =>
     invoke<void>("pi_family_models_config_write", { engine, text }),
+  // pi provider auth inside a WSL distro (desktop-only; not in web dispatch)
+  wslPiAuthList: (distro: string) =>
+    invoke<PiFamilyAuthListResult>("wsl_pi_auth_list", { distro }),
+  wslPiAuthSetKey: (distro: string, providerId: string, key: string) =>
+    invoke<void>("wsl_pi_auth_set_key", { distro, providerId, key }),
+  wslPiAuthDelete: (distro: string, providerId: string) =>
+    invoke<void>("wsl_pi_auth_delete", { distro, providerId }),
+  wslPiModelsRead: (distro: string) =>
+    invoke<WslPiModelsRead>("wsl_pi_models_read", { distro }),
+  wslPiModelsWrite: (distro: string, text: string, expectedHash?: string | null) =>
+    invoke<void>("wsl_pi_models_write", { distro, text, expectedHash: expectedHash ?? null }),
   // cc-switch interop
   checkCcSwitch: () => invoke<CcSwitchStatus>("check_cc_switch"),
   dismissCcSwitch: (hash: string) => invoke<void>("dismiss_cc_switch", { hash }),

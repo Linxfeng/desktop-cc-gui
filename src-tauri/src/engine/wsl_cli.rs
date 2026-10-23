@@ -39,6 +39,8 @@ pub struct WslCliCapabilities {
     pub engines: Vec<String>,
     /// 发行版内官方配置可编辑的引擎（有白名单文件：claude/codex/kimi）。
     pub editable_engines: Vec<String>,
+    /// 发行版内供应商认证可管理的引擎（pi 的 auth/models 白名单）。
+    pub auth_engines: Vec<String>,
 }
 
 /// 本次真正能在本机 WSL 里跑的引擎：Child 传输、无 Windows staging 文件。
@@ -61,12 +63,19 @@ pub fn wsl_cli_capabilities() -> WslCliCapabilities {
     WslCliCapabilities {
         engines: supported_engines(),
         editable_engines: editable_engines(),
+        auth_engines: auth_engines(),
     }
 }
 
 /// 发行版内官方配置可编辑的引擎。与 [`config_targets`] 的白名单一致。
 pub(crate) fn editable_engines() -> Vec<String> {
     vec!["claude".into(), "codex".into(), "kimi".into()]
+}
+
+/// 发行版内供应商认证可管理的引擎。与 [`pi_targets`] 一致；omp 不在 WSL
+/// 可运行引擎里，不出现。
+pub(crate) fn auth_engines() -> Vec<String> {
+    vec!["pi".into()]
 }
 
 /// 某个发行版内受支持引擎的 CLI 状态。
@@ -580,6 +589,251 @@ fn parse_config_write(raw: &str, expected_writes: usize) -> Result<(), String> {
     Ok(())
 }
 
+// ── pi 供应商认证（发行版内 auth.json / models.json） ────────
+//
+// 不走通用 `wsl_cli_config_read/write`：auth.json 的 key 明文不能进
+// webview（列表只回传掩码），所以 pi 有专用命令；掩码/校验/合并逻辑与主机
+// 共用 `pi_family_auth` 的纯函数。auth 的写是「读-改-写」：读时记下
+// sha256，写回带 expectedHash 冲突检测，窗口期发行版侧的修改不会被覆盖。
+
+fn pi_targets(probe: &wsl_probe::WslProbe) -> Vec<ConfigTarget> {
+    let dir = if probe.pi_agent_dir.trim().is_empty() {
+        format!("{}/.pi/agent", probe.home.trim_end_matches('/'))
+    } else {
+        probe.pi_agent_dir.trim().trim_end_matches('/').to_string()
+    };
+    vec![
+        ConfigTarget {
+            key: "auth",
+            dir: dir.clone(),
+            file: "auth.json",
+            format: "json",
+            secret: true,
+        },
+        ConfigTarget {
+            key: "models",
+            dir,
+            file: "models.json",
+            format: "jsonc",
+            secret: false,
+        },
+    ]
+}
+
+fn pi_target<'a>(targets: &'a [ConfigTarget], key: &str) -> Result<&'a ConfigTarget, String> {
+    targets
+        .iter()
+        .find(|t| t.key == key)
+        .ok_or_else(|| "WSL_CLI_CONFIG_READ_FAILED:missing pi target".to_string())
+}
+
+/// 从发行版读一个 pi 文件的原始文本。缺失 → Ok(None)；损坏/超限等沿用
+/// config read 的错误契约。
+async fn read_pi_file(
+    distro: &str,
+    target: &ConfigTarget,
+) -> Result<Option<String>, String> {
+    let transport = local_transport(distro);
+    let targets = std::slice::from_ref(target);
+    let raw = wsl_transport::run_script_output(&transport, &config_read_script(targets)).await?;
+    let files = parse_config_read(&raw, targets)?;
+    let file = &files[0];
+    if !file.exists || file.too_large {
+        if file.too_large {
+            return Err(format!("WSL_CLI_FILE_TOO_LARGE:{}", target.key));
+        }
+        return Ok(None);
+    }
+    Ok(Some(file.content.clone()))
+}
+
+/// 把一段文本原子写回发行版内的 pi 文件。`expected_hash` 做冲突检测。
+async fn write_pi_file(
+    distro: &str,
+    target: &ConfigTarget,
+    content: &str,
+    expected_hash: Option<&str>,
+) -> Result<(), String> {
+    let draft = WslCliConfigDraft {
+        key: target.key.to_string(),
+        content: content.to_string(),
+        expected_hash: expected_hash.map(str::to_string),
+    };
+    let transport = local_transport(distro);
+    let raw = wsl_transport::run_script_output(
+        &transport,
+        &config_write_script(&[target], &[draft]),
+    )
+    .await?;
+    parse_config_write(&raw, 1)
+}
+
+/// 列出发行版内 pi 的 provider 认证状态。key 只以掩码跨 IPC。
+#[tauri::command]
+pub async fn wsl_pi_auth_list(distro: String) -> Result<super::pi_family_auth::AuthListResult, String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = pi_targets(&probe);
+    let target = pi_target(&targets, "auth")?;
+    let path = target.path();
+    let text = read_pi_file(&distro, target).await?;
+    let Some(text) = text else {
+        // 缺失 = 空店：全部 none，与主机 `pi_family_auth_list` 的语义一致。
+        let (providers, oauth_providers) = super::pi_family_auth::auth_snapshots(&Default::default());
+        return Ok(super::pi_family_auth::AuthListResult {
+            store: super::pi_family_auth::AuthStoreInfo {
+                path,
+                kind: "authJson".to_string(),
+                exists: false,
+            },
+            providers,
+            oauth_providers,
+        });
+    };
+    let map = super::pi_family_auth::parse_auth_store(&text, &path)?;
+    let (providers, oauth_providers) = super::pi_family_auth::auth_snapshots(&map);
+    Ok(super::pi_family_auth::AuthListResult {
+        store: super::pi_family_auth::AuthStoreInfo {
+            path,
+            kind: "authJson".to_string(),
+            exists: true,
+        },
+        providers,
+        oauth_providers,
+    })
+}
+
+/// 设置/替换发行版内 pi 的一个 API key。读-改-写，冲突不覆盖。
+#[tauri::command]
+pub async fn wsl_pi_auth_set_key(
+    distro: String,
+    provider_id: String,
+    key: String,
+) -> Result<(), String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = pi_targets(&probe);
+    let target = pi_target(&targets, "auth")?;
+    // key 校验在前（不发起任何 wsl.exe 调用），错误串与主机一致。
+    let mut probe_map: serde_json::Map<String, serde_json::Value> = Default::default();
+    super::pi_family_auth::apply_set_api_key(&mut probe_map, &provider_id, &key)?;
+    let path = target.path();
+    let text = read_pi_file(&distro, target).await?;
+    let hash = match &text {
+        Some(text) => Some(sha256_hex(text.as_bytes())),
+        None => None,
+    };
+    let mut map = match &text {
+        Some(text) => super::pi_family_auth::parse_auth_store(text, &path)?,
+        None => Default::default(),
+    };
+    super::pi_family_auth::apply_set_api_key(&mut map, &provider_id, &key)?;
+    let content = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map_err(|e| format!("[PI_FAMILY_AUTH_WRITE] serialize: {e}"))?;
+    write_pi_file(&distro, target, &format!("{content}\n"), hash.as_deref()).await
+}
+
+/// 删除发行版内 pi 的一个 api_key 凭据。oauth 凭据拒删。
+#[tauri::command]
+pub async fn wsl_pi_auth_delete(distro: String, provider_id: String) -> Result<(), String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = pi_targets(&probe);
+    let target = pi_target(&targets, "auth")?;
+    let text = read_pi_file(&distro, target).await?;
+    let Some(text) = text else {
+        return Ok(()); // nothing to delete
+    };
+    let path = target.path();
+    let hash = sha256_hex(text.as_bytes());
+    let mut map = super::pi_family_auth::parse_auth_store(&text, &path)?;
+    super::pi_family_auth::apply_delete_credential(&mut map, &provider_id)?;
+    let content = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map_err(|e| format!("[PI_FAMILY_AUTH_WRITE] serialize: {e}"))?;
+    write_pi_file(&distro, target, &format!("{content}\n"), Some(&hash)).await
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WslPiModelsRead {
+    pub path: String,
+    pub exists: bool,
+    /// 原样文本（JSONC 注释保留）；缺失/空文件为 None。
+    pub text: Option<String>,
+    /// 编辑器初始草稿：缺失时给示例模板。
+    pub template: String,
+    pub providers: Vec<super::pi_family_auth::CustomProviderSummary>,
+    pub parse_error: Option<String>,
+    /// 读时的 sha256，写回时做冲突检测。
+    pub hash: Option<String>,
+}
+
+/// 读发行版内 pi 的 models.json：原样文本 + provider 摘要 + 解析错误。
+#[tauri::command]
+pub async fn wsl_pi_models_read(distro: String) -> Result<WslPiModelsRead, String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    let targets = pi_targets(&probe);
+    let target = pi_target(&targets, "models")?;
+    let text = read_pi_file(&distro, target).await?;
+    let template = super::pi_family_auth::MODELS_TEMPLATE_JSON.to_string();
+    let Some(text) = text else {
+        return Ok(WslPiModelsRead {
+            path: target.path(),
+            exists: false,
+            text: None,
+            template,
+            providers: Vec::new(),
+            parse_error: None,
+            hash: None,
+        });
+    };
+    let hash = sha256_hex(text.as_bytes());
+    let (providers, parse_error) = if text.trim().is_empty() {
+        (Vec::new(), None)
+    } else {
+        match super::pi_family_auth::validate_models_config_text("pi", &text) {
+            Ok(value) => (super::pi_family_auth::summarize_providers(&value), None),
+            Err(error) => (Vec::new(), Some(error)),
+        }
+    };
+    Ok(WslPiModelsRead {
+        path: target.path(),
+        exists: true,
+        text: Some(text),
+        template,
+        providers,
+        parse_error,
+        hash: Some(hash),
+    })
+}
+
+/// 写发行版内 pi 的 models.json：先在后端做松散结构校验（不合法不落盘），
+/// 再带冲突检测原子写。文本 verbatim 保存，注释与字段顺序保留。
+#[tauri::command]
+pub async fn wsl_pi_models_write(
+    distro: String,
+    text: String,
+    expected_hash: Option<String>,
+) -> Result<(), String> {
+    let distro = checked_distro(&distro)?.to_string();
+    let probe = wsl_probe::ensure(&distro).await.map_err(|e| e.code())?;
+    // 校验在前（不发起 wsl.exe 调用）；错误串与主机 `pi_family_models_config_write` 一致。
+    super::pi_family_auth::validate_models_config_text("pi", &text)?;
+    let targets = pi_targets(&probe);
+    let target = pi_target(&targets, "models")?;
+    write_pi_file(&distro, target, &text, expected_hash.as_deref()).await
+}
+
+/// sha256 十六进制。与 config_read_script 里 `sha256sum` 的输出一致。
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +1001,7 @@ mod tests {
         let caps = wsl_cli_capabilities();
         assert_eq!(caps.engines, vec!["claude", "kimi", "codex", "pi", "minimax"]);
         assert_eq!(caps.editable_engines, vec!["claude", "codex", "kimi"]);
+        assert_eq!(caps.auth_engines, vec!["pi"]);
     }
 
     // ── 官方配置读写 ───────────────────────────────────────────
@@ -886,5 +1141,100 @@ mod tests {
             .starts_with("WSL_CLI_CONFIG_WRITE_FAILED:"));
         assert!(parse_config_write("__CCGUI__CFG_WRITTEN config\n", 1).is_ok());
         assert!(parse_config_write("", 1).is_err());
+    }
+
+    // ── pi 供应商认证 ──────────────────────────────────────────
+
+    #[test]
+    fn pi_targets_follow_agent_dir() {
+        let probe = probe_with_dirs(
+            "__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n\
+             __CCGUI__PI_AGENT_DIR=/data/pi/\n",
+        );
+        let targets = pi_targets(&probe);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].key, "auth");
+        assert!(targets[0].secret);
+        assert_eq!(targets[0].path(), "/data/pi/auth.json");
+        assert_eq!(targets[1].key, "models");
+        assert!(!targets[1].secret);
+        assert_eq!(targets[1].path(), "/data/pi/models.json");
+
+        // 未配置环境变量时回退 $HOME/.pi/agent。
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        let targets = pi_targets(&probe);
+        assert_eq!(targets[0].path(), "/home/me/.pi/agent/auth.json");
+        assert_eq!(targets[1].path(), "/home/me/.pi/agent/models.json");
+    }
+
+    /// 通用编辑器对 pi 保持关闭：auth.json 明文不允许进 webview。
+    #[test]
+    fn generic_config_targets_stay_closed_for_pi() {
+        let probe = probe_with_dirs("__CCGUI__HOME=/home/me\n__CCGUI__PATH=/bin\n");
+        assert!(config_targets("pi", &probe).is_empty());
+    }
+
+    #[test]
+    fn pi_auth_snapshots_mask_keys_and_keep_oauth() {
+        let text = r#"{"openai-codex": {"type": "oauth", "refresh": "r"},
+                        "anthropic": {"type": "api_key", "key": "sk-ant-1234567890abcd"},
+                        "custom-x": {"type": "api_key", "key": "keepme", "env": {"A": "B"}}}"#;
+        let map = super::super::pi_family_auth::parse_auth_store(text, "auth.json").unwrap();
+        let (providers, oauth) = super::super::pi_family_auth::auth_snapshots(&map);
+        let anthropic = providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!(anthropic.state, "configured");
+        let masked = anthropic.masked_key.as_deref().unwrap();
+        assert!(masked.starts_with("sk-ant"));
+        assert!(masked.ends_with("abcd"));
+        assert!(!masked.contains("123456"));
+        assert_eq!(oauth, vec!["openai-codex".to_string()]);
+    }
+
+    #[test]
+    fn pi_auth_apply_set_and_delete_rules() {
+        use super::super::pi_family_auth::{apply_delete_credential, apply_set_api_key};
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "openai-codex".to_string(),
+            serde_json::json!({"type": "oauth", "refresh": "r"}),
+        );
+
+        // oauth-only provider 拒写、空 key 拒收。
+        assert!(apply_set_api_key(&mut map, "github-copilot", "x").is_err());
+        assert!(apply_set_api_key(&mut map, "anthropic", "  \n ").is_err());
+        // oauth 条目拒删。
+        assert!(apply_delete_credential(&mut map, "openai-codex").is_err());
+        // 正常设置 + 删除。
+        apply_set_api_key(&mut map, "anthropic", "sk-ant-test-123456").unwrap();
+        assert_eq!(
+            map["anthropic"]["key"],
+            serde_json::json!("sk-ant-test-123456")
+        );
+        assert!(apply_delete_credential(&mut map, "anthropic").unwrap());
+        assert!(!map.contains_key("anthropic"));
+        // 不存在的条目删除 = 无事可做。
+        assert!(!apply_delete_credential(&mut map, "anthropic").unwrap());
+        // oauth 与未知条目在写入后原样保留。
+        apply_set_api_key(&mut map, "openai", "sk-test-openai-1").unwrap();
+        assert_eq!(map["openai-codex"]["type"], "oauth");
+    }
+
+    #[test]
+    fn pi_models_read_reports_parse_error_and_summary() {
+        // JSONC 注释 + 非法结构分别走 summary 与 parse_error 分支。
+        let ok = "{\n  // relay\n  \"providers\": {\"r\": {\"baseUrl\": \"https://x/v1\", \"models\": [{\"id\": \"m1\"}]}}\n}";
+        let value = super::super::pi_family_auth::validate_models_config_text("pi", ok).unwrap();
+        let summaries = super::super::pi_family_auth::summarize_providers(&value);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].model_count, 1);
+
+        assert!(super::super::pi_family_auth::validate_models_config_text("pi", "{bad").is_err());
+        assert!(
+            super::super::pi_family_auth::validate_models_config_text(
+                "pi",
+                "{\"providers\": {\"r\": {\"models\": [{}]}}}"
+            )
+            .is_err()
+        );
     }
 }

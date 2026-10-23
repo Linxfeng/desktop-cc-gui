@@ -2425,6 +2425,8 @@ export const en: Messages = {
       configWriteFailed: "Could not write the config inside the distro: {{message}}",
       configReadFailed: "Could not read the config inside the distro: {{message}}",
       reRead: "Read again",
+      piAuthOauthHint:
+        "No built-in terminal in the WSL scope yet: start pi inside the distro and run {{command}} to log in.",
     },
     noticeExitUnproven:
       "Processes from a session in {{distro}} may still be running (teardown unconfirmed). If they hold resources, check with ps in a WSL terminal.",

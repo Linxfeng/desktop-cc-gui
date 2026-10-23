@@ -112,19 +112,47 @@ export function useEngineModels(
     ipc.getCliConfig().then(setCliConfig).catch(() => {});
   }, []);
   // The settings CLI page mutates provider config and custom models outside
-  // this tree; refetch so the picker tracks both immediately.
+  // this tree; refetch so the picker tracks both immediately. An event with
+  // `detail.engine` (pi 认证 / 模型编辑) also re-probes that one engine's
+  // catalog — pi filters its menu by stored credentials, and the probe effect
+  // below runs once per engine, so without this the menu only refreshed on
+  // restart. Events without detail keep the original channel-config-only
+  // behavior.
   useEffect(() => {
-    const reload = () => {
+    const reload = (event?: Event) => {
       ipc.getCliConfig().then(setCliConfig).catch(() => {});
       ipc
         .getAppSettings()
         .then((s) => setCustomModels(s.customModels ?? {}))
         .catch(() => {});
+      const engineId = (event as CustomEvent | undefined)?.detail?.engine;
+      if (typeof engineId === "string") {
+        // Catalog 从桶里移除后，probe effect（依赖 `catalogs`）会重新探测
+        // 该引擎；`probed` 集合也必须同步清掉，否则它认为已探过会跳过。
+        const probed = probedByWs.current[wsKey];
+        probed?.delete(`${engineId}:0`);
+        probed?.delete(`${engineId}:1`);
+        setLocalCatalogs((prev) => {
+          if (!(engineId in prev)) return prev;
+          const next = { ...prev };
+          delete next[engineId];
+          return next;
+        });
+        setRemoteCatalogsByWs((prev) => {
+          const bucket = prev[wsKey];
+          if (!bucket || !(engineId in bucket)) return prev;
+          const nextBucket = { ...bucket };
+          delete nextBucket[engineId];
+          return { ...prev, [wsKey]: nextBucket };
+        });
+      }
     };
     reload();
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
     return () => window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
-  }, []);
+    // wsKey 只影响被清的桶;切工作区走 probe effect 的正常流程。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsKey]);
   // Catalog for the active workspace. Until the workspace's context is known
   // the shared local catalog proves nothing about it (it may be a remote one),
   // so the picker starts empty there and fills as the workspace's probes land.

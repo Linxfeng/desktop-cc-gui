@@ -951,7 +951,7 @@ export function CliHeaderActions({ engine }: { engine: EngineId }) {
 
 | 工作项 | 内容 | 关键依赖 | 契约增量 |
 | --- | --- | --- | --- |
-| Pi 认证 | Pi API Key / `models.json` 编辑：掩码、只写 key、模型菜单刷新 | 本次的文件服务；secret 单独评审 | `auth`、`capabilities.apiKey/models` |
+| Pi 认证 | Pi API Key / `models.json` 编辑：掩码、只写 key、模型菜单刷新 | 本次的文件服务；secret 单独评审 | 已实现（`docs/plans/2026-10-23-wsl-pi-auth.md`）：`authEngines` + `wsl_pi_*` 五命令 |
 | WSL 终端与 OAuth | WSL 终端 + Pi/omp OAuth 登录 | 原方案的终端能力 | `capabilities.oauth` |
 | 高级配置 | 每发行版自定义配置目录/模型、手动更新提示（minimax 状态已在本次实现） | 文件服务与 Pi 认证 | 每发行版设置键、`capabilities.update` |
 
