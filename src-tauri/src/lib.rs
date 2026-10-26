@@ -47,6 +47,7 @@ pub mod terminal;
 pub mod updater;
 pub mod usage;
 pub mod web;
+pub mod window_state;
 
 use std::sync::Arc;
 use tauri::Emitter;
@@ -306,6 +307,9 @@ pub fn run() {
             // 状态必须已经就位。设置改动需重启应用。
             #[cfg(target_os = "windows")]
             let settings = settings::read_settings().unwrap_or_default();
+            // 窗口大小/位置/最大化/全屏跨启动记忆（issue #1381）。窗口以隐藏
+            // 状态建出来，几何与状态先应用再 show，避免先闪默认尺寸。
+            let (window_restore, saved_window) = window_state::restore_plan(app.handle());
             let mut window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -313,7 +317,10 @@ pub fn run() {
             )
             .title("CC GUI")
             .inner_size(1400.0, 900.0)
-            .min_inner_size(900.0, 600.0);
+            .min_inner_size(900.0, 600.0)
+            // 隐藏建窗，摆好几何再 show：最大化必须发生在几何之后，否则系统
+            // 记录的「还原矩形」是建窗默认值，取消最大化会跳回错误尺寸。
+            .visible(false);
             #[cfg(target_os = "macos")]
             {
                 // 原 tauri.conf.json: titleBarStyle "Overlay" + hiddenTitle true。
@@ -330,9 +337,15 @@ pub fn run() {
                     window_builder = window_builder.shadow(true);
                 }
             }
-            window_builder
+            let main_window = window_builder
                 .build()
                 .expect("failed to create main window");
+            if let Err(error) =
+                window_state::apply_and_track(&main_window, &window_restore, saved_window)
+            {
+                eprintln!("[window] restore failed, showing default window: {error}");
+                let _ = main_window.show();
+            }
             // Replace the automatic macOS menu with the same one minus its
             // Close Window (⌘W) item; the frontend shortcut runtime owns that
             // key and closes the tab in view (see app_menu.rs).
