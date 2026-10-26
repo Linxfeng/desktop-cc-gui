@@ -40,12 +40,22 @@ pub(super) fn parse_agy_session(
         for (step_type, payload) in steps {
             match step_type {
                 STEP_USER => {
-                    if let Some(turn) = user_iter.next() {
+                    // Prefer the CLI's own prompt log (history.jsonl); fall
+                    // back to the user text recorded in the step payload
+                    // itself — newer agy builds may not write history.jsonl
+                    // at all, and without this fallback every user row
+                    // vanishes from reloaded history (upstream #1388).
+                    let turn = user_iter.next().or_else(|| {
+                        user_text_from_step(&payload)
+                            .map(|text| UserTurn { text, ts_ms: None })
+                    });
+                    if let Some(turn) = turn {
                         seq += 1;
                         // agy's history.jsonl records the effective prompt verbatim,
                         // internal system/request tail included — strip it
                         // exactly like the other engines' user rows.
-                        let visible = super::extract::strip_internal_prompt_tail(&turn.text);
+                        let visible =
+                            super::extract::strip_internal_prompt_tail(&turn.text);
                         messages.push(plain_message(seq, "user", visible.to_string(), turn.ts_ms));
                     }
                 }
@@ -246,7 +256,36 @@ fn pick_assistant(texts: &[ProtoText]) -> Option<String> {
         .map(|t| t.text.as_str())
         .filter(|t| looks_like_assistant(t))
         .collect();
-    longest_prose(&primary).map(|s| sanitize_assistant(&s))
+    // Depth is the walker's relative nesting, which agy layout changes can
+    // shift by a level; when no depth-1 candidate survived, retry field 1 at
+    // any depth — prose filters reject uuids, ids and fragments anyway
+    // (upstream #1388: only the last stretch of a reply survived reload).
+    let fallback: Vec<&str> = if primary.is_empty() {
+        texts
+            .iter()
+            .filter(|t| t.field == 1)
+            .map(|t| t.text.as_str())
+            .filter(|t| looks_like_assistant(t))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let candidates = if primary.is_empty() { &fallback } else { &primary };
+    longest_prose(candidates).map(|s| sanitize_assistant(&s))
+}
+
+/// User text in a STEP_USER payload lives at depth 1 / field 2. When
+/// history.jsonl is absent (newer agy builds) this payload is the only
+/// record of the prompt.
+fn user_text_from_step(payload: &[u8]) -> Option<String> {
+    let texts = proto_strings(payload);
+    let candidates: Vec<&str> = texts
+        .iter()
+        .filter(|t| t.depth == 1 && t.field == 2)
+        .map(|t| t.text.as_str())
+        .filter(|t| is_clean_text(t) && !t.trim().is_empty())
+        .collect();
+    longest_prose(&candidates)
 }
 
 fn longest_prose(texts: &[&str]) -> Option<String> {
@@ -298,7 +337,14 @@ fn looks_like_tool_fragment(text: &str) -> bool {
         "\":\"",
         "\",\"",
     ];
-    MARKERS.iter().any(|m| text.contains(m)) || text.matches('|').count() >= 3
+    // A pipe-heavy SINGLE line without CJK reads like a tool summary column
+    // dump; markdown tables are multi-line and usually contain CJK — those
+    // must survive as assistant prose (upstream #1388: a reply whose only
+    // table made the whole message vanish from reloaded history).
+    let pipe_dump = text.matches('|').count() >= 3
+        && !text.contains('\n')
+        && !has_cjk(text);
+    MARKERS.iter().any(|m| text.contains(m)) || pipe_dump
 }
 
 fn looks_like_status_ping(text: &str) -> bool {
@@ -590,8 +636,14 @@ mod tests {
         ));
     }
 
+    /// agy_home() reads the process-global ANTIGRAVITY_HOME; tests that
+    /// override it must not run concurrently with each other (or with the
+    /// live-data test that reads the real home).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn user_turns_strip_the_internal_prompt_tail() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // agy's history.jsonl records the effective prompt verbatim, internal
         // system/request tail included; user rows must strip it like every
         // other engine's.
@@ -629,6 +681,7 @@ mod tests {
 
     #[test]
     fn parses_live_agy_conversation_if_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let path = crate::engine::agy::agy_home()
             .join("conversations")
             .join("55541c2b-d633-420a-b1ff-39cbaf07a231.db");
@@ -746,6 +799,161 @@ mod tests {
         assert_eq!(replies, [visible.as_str()]);
         assert_eq!(summary.preview, visible);
         assert_eq!(summary.message_count, 1);
+    }
+
+    #[test]
+    fn user_turns_fall_back_to_step_payload_without_history_jsonl() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Newer agy builds do not write history.jsonl; the STEP_USER payload
+        // (depth 1 / field 2) is then the only record of the prompt. Without
+        // the fallback every user row disappears on reload (upstream #1388).
+        let scratch =
+            std::env::temp_dir().join(format!("ccgui-agy-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let previous = std::env::var_os("ANTIGRAVITY_HOME");
+        std::env::set_var("ANTIGRAVITY_HOME", &scratch);
+        // No history.jsonl in scratch on purpose.
+        let payload = {
+            let inner = encode_string_field(2, "第一轮提问");
+            let mut blob = Vec::new();
+            write_varint(&mut blob, (20 << 3) | 2);
+            write_varint(&mut blob, inner.len() as u64);
+            blob.extend(inner);
+            blob
+        };
+        let path = scratch.join("conv-fallback.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO steps VALUES(0, ?1, ?2)",
+                rusqlite::params![STEP_USER, payload],
+            )
+            .unwrap();
+        }
+        let parsed = parse_agy_session(&path, &HashSet::new());
+        match previous {
+            Some(value) => std::env::set_var("ANTIGRAVITY_HOME", value),
+            None => std::env::remove_var("ANTIGRAVITY_HOME"),
+        }
+        std::fs::remove_dir_all(&scratch).unwrap();
+        let users: Vec<&str> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(users, ["第一轮提问"]);
+    }
+
+    #[test]
+    fn assistant_text_survives_nesting_depth_drift() {
+        // The visible reply normally sits at depth 1 / field 1; an agy layout
+        // change can nest it one level deeper. Only keeping depth-1 candidates
+        // dropped the whole reply on reload (upstream #1388).
+        let innermost = encode_string_field(1, "这是助手的中文回复内容，必须完整保留。");
+        let mut level1 = Vec::new();
+        write_varint(&mut level1, (20 << 3) | 2);
+        write_varint(&mut level1, innermost.len() as u64);
+        level1.extend(innermost);
+        let mut payload = Vec::new();
+        write_varint(&mut payload, (20 << 3) | 2);
+        write_varint(&mut payload, level1.len() as u64);
+        payload.extend(level1);
+        let texts = proto_strings(&payload);
+        assert!(
+            texts.iter().all(|t| t.depth != 1 || t.field != 1),
+            "fixture must nest the reply below depth 1"
+        );
+        assert_eq!(
+            pick_assistant(&texts).as_deref(),
+            Some("这是助手的中文回复内容，必须完整保留。")
+        );
+    }
+
+    #[test]
+    fn multi_turn_steps_parse_into_ordered_messages() {
+        // Real agy 1.2.x layout: alternating STEP_USER (field 2) and
+        // STEP_ASSISTANT (field 1, plus a field 8 copy) rows in one db.
+        let payload = |step_type, fields: Vec<Vec<u8>>| {
+            // One wrapper level, matching real agy STEP_USER payloads
+            // (user text is recorded at walk depth 1 / field 2).
+            let mut blob = Vec::new();
+            for f in fields {
+                write_varint(&mut blob, (20 << 3) | 2);
+                write_varint(&mut blob, f.len() as u64);
+                blob.extend(f);
+            }
+            (step_type, blob)
+        };
+        let assistant = |text: &str| {
+            let mut blob = Vec::new();
+            let inner = encode_string_field(1, text);
+            write_varint(&mut blob, (20 << 3) | 2);
+            write_varint(&mut blob, inner.len() as u64);
+            blob.extend(inner);
+            blob
+        };
+        let steps = vec![
+            payload(STEP_USER, vec![encode_string_field(2, "第一轮提问")]),
+            (
+                STEP_ASSISTANT,
+                assistant("这是第一轮的中文回复内容，字数足够通过过滤。"),
+            ),
+            payload(STEP_USER, vec![encode_string_field(2, "第二轮提问")]),
+            (
+                STEP_ASSISTANT,
+                assistant("这是第二轮的中文回复内容，字数足够通过过滤。"),
+            ),
+        ];
+        let path = std::env::temp_dir().join(format!("ccgui-agy-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB);",
+            )
+            .unwrap();
+            for (i, (step_type, blob)) in steps.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO steps VALUES(?1, ?2, ?3)",
+                    rusqlite::params![i as i64, step_type, blob],
+                )
+                .unwrap();
+            }
+        }
+        let parsed = parse_agy_session(&path, &HashSet::new());
+        std::fs::remove_file(&path).unwrap();
+        let roles: Vec<(&str, &str)> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("user", "第一轮提问"),
+                ("assistant", "这是第一轮的中文回复内容，字数足够通过过滤。"),
+                ("user", "第二轮提问"),
+                ("assistant", "这是第二轮的中文回复内容，字数足够通过过滤。"),
+            ]
+        );
+    }
+
+    #[test]
+    fn assistant_reply_with_markdown_table_survives() {
+        // A reply whose table rows carry 3+ pipes used to be classified as a
+        // tool fragment, dropping the ENTIRE reply from reloaded history
+        // (upstream #1388). Multi-line CJK tables are prose, not tool dumps.
+        let reply = "## 排版测试\n\n| 名称 | 类型 | 说明 |\n| --- | --- | --- |\n| 示例 | 字符串 | 演示内容 |";
+        assert!(
+            looks_like_assistant(reply),
+            "markdown table reply must read as assistant prose"
+        );
+        // Single-line pipe dumps without CJK still read as tool summaries.
+        assert!(looks_like_tool_fragment("col_a | col_b | col_c | col_d"));
     }
 
     #[test]
