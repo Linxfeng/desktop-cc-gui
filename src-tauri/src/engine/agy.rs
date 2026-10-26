@@ -202,7 +202,15 @@ fn push_conversation_id(value: &Value, out: &mut Vec<EngineEvent>) {
 }
 
 fn parse_step_update(step: &Value, out: &mut Vec<EngineEvent>) {
-    if let Some(delta) = string_field(step, "text_delta") {
+    // Deltas are verbatim stream chunks: whitespace at either edge is real
+    // content (the space in `## `, list/table newlines, code indentation) and
+    // splitting can land anywhere, so trimming here glues markdown together
+    // (upstream #1427/#1387). Only drop the delta when it is entirely empty.
+    if let Some(delta) = step
+        .get("text_delta")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         out.push(EngineEvent::Delta(delta.to_string()));
     }
     let Some(tool) = step.get("tool_info").filter(|v| v.is_object()) else {
@@ -394,6 +402,39 @@ mod tests {
             e,
             EngineEvent::Done { session_id: Some(id), usage: Some(_) } if id == "abc-1"
         )));
+    }
+
+    #[test]
+    fn delta_whitespace_is_stream_content_not_padding() {
+        // A chunk boundary can land on any character; the edge whitespace is
+        // markdown syntax (`## `, `\n` between table rows, code indentation),
+        // not padding. Trimming it used to glue headings/lists/tables together
+        // and break copied code (upstream #1427/#1387).
+        let delta = events(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"## \"}}",
+        );
+        match &delta[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "## "),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let newline = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"\n"}}"#,
+        );
+        match &newline[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "\n"),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let indent = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"    code"}}"#,
+        );
+        match &indent[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "    code"),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let empty = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":""}}"#,
+        );
+        assert!(empty.is_empty(), "empty delta must stay dropped: {empty:?}");
     }
 
     #[test]
