@@ -13,12 +13,16 @@
  * (script-src has no 'unsafe-inline'). Keep both external; see the guard in
  * tests/platform-build.test.ts. */
 #boot-splash {
+  /* 固定在视口上，不依赖祖先高度：html/body/#root 的 height:100% 来自
+   * src/index.css，要等 JS bundle 加载后才生效。在那之前 #root 是 auto 高，
+   * 100% 会塌成内容高，启动占位就贴在窗口顶部，直到应用样式到位才跳到中间。 */
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 12px;
-  height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #6b7280;
 }
@@ -36,12 +40,16 @@
   }
 }
 .boot-failure {
+  /* 与启动占位同理：固定在视口，避免应用样式未生效时贴顶。 */
+  position: fixed;
+  inset: 0;
+  overflow: auto;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  /* safe center：内容超出视口时回退到顶对齐并可滚动，而不是把标题挤出屏幕。 */
+  justify-content: safe center;
   gap: 16px;
-  height: 100%;
   padding: 32px;
   box-sizing: border-box;
   text-align: center;
