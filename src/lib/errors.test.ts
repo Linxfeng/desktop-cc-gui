@@ -84,3 +84,17 @@ it("localizes the settings CLI-path rejection reasons", async () => {
   await i18n.changeLanguage("en");
   expect(errorText("WSL_CLI_PATH_INVALID:notAbsolute")).toContain("absolute path");
 });
+
+it("distinguishes git ownership failures from a missing repository", async () => {
+  await i18n.changeLanguage("zh");
+  const unsafe = errorText("GIT_UNSAFE_REPO:repository path 'C:/x' is not owned by current user");
+  expect(unsafe).toContain("所有权不受信任");
+  expect(unsafe).toContain("safe.directory");
+  expect(unsafe).toContain("C:/x");
+  const open = errorText("GIT_OPEN_FAILED:path too long");
+  expect(open).toContain("无法打开 Git 仓库");
+  expect(open).toContain("path too long");
+  await i18n.changeLanguage("en");
+  expect(errorText("GIT_UNSAFE_REPO:x")).toContain("safe.directory");
+  expect(errorText("GIT_OPEN_FAILED:x")).toContain("Could not open the git repository");
+});

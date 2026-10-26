@@ -360,7 +360,26 @@ pub async fn git_tree_status(levels: Vec<GitTreeLevel>) -> Result<GitTreeStatus,
 }
 
 pub(crate) fn open_repo(path: &str) -> Result<Repository, String> {
-    Repository::discover(path).map_err(|_| "NOT_A_REPO".to_string())
+    Repository::discover(path).map_err(map_open_repo_error)
+}
+
+/// libgit2 打开仓库失败的分类。
+///
+/// 旧实现把**所有**错误都报成 `NOT_A_REPO`：Windows 上常见的「所有权不受
+/// 信任」（仓库由其它用户/管理员创建）、路径过长、仓库损坏、无权限等，
+/// 在界面上全部被误报成「不是 Git 仓库」，用户无法判断真正原因。
+/// 这里按错误类型分流：确实不是仓库才给 `NOT_A_REPO`（前端据此显示空态），
+/// 其余错误保留可操作的具体信息。
+fn map_open_repo_error(error: git2::Error) -> String {
+    if error.code() == git2::ErrorCode::NotFound {
+        return "NOT_A_REPO".to_string();
+    }
+    let message = error.message().trim().to_string();
+    let lower = message.to_lowercase();
+    if lower.contains("not owned by current user") || lower.contains("dubious ownership") {
+        return format!("GIT_UNSAFE_REPO:{message}");
+    }
+    format!("GIT_OPEN_FAILED:{message}")
 }
 
 /// WSL UNC 路径 → 发行版内 git 后端；其余路径继续走本机 git2（`None`）。
@@ -2389,5 +2408,53 @@ mod tests {
         }
         assert!(web_guard_wsl_path(r"C:\Users\me\repo").is_ok());
         assert!(web_guard_wsl_path("/home/me/repo").is_ok());
+    }
+
+    #[test]
+    fn open_repo_error_mapping_keeps_real_causes() {
+        assert_eq!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::NotFound,
+                git2::ErrorClass::Repository,
+                "could not find repository"
+            )),
+            "NOT_A_REPO"
+        );
+        assert!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::GenericError,
+                git2::ErrorClass::Os,
+                "repository path 'C:/x' is not owned by current user"
+            ))
+            .starts_with("GIT_UNSAFE_REPO:")
+        );
+        assert!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::GenericError,
+                git2::ErrorClass::Os,
+                "path too long"
+            ))
+            .starts_with("GIT_OPEN_FAILED:")
+        );
+    }
+
+    #[test]
+    fn open_repo_non_repo_is_not_a_repo() {
+        let scratch = Scratch::new();
+        match open_repo(scratch.0.to_str().unwrap()) {
+            Err(error) => assert_eq!(error, "NOT_A_REPO"),
+            Ok(_) => panic!("plain directory should not open as a repository"),
+        }
+    }
+
+    /// 中文/空格路径不应被误判为「不是仓库」。
+    #[test]
+    fn open_repo_supports_unicode_paths() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("中文 目录");
+        let repo = Repository::init(&path).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        let opened = open_repo(path.to_str().unwrap()).expect("unicode path opens");
+        assert!(opened.workdir().is_some());
     }
 }

@@ -1359,6 +1359,9 @@ export const en: Messages = {
     remoteBranch: "Remote branch",
     back: "Back",
     notARepo: "Current workspace is not a git repository",
+    unsafeRepo:
+      "The git repository's ownership is not trusted: {{message}}. Add the directory to safe.directory (git config --global --add safe.directory <path>), or reopen/clone it as the current user.",
+    openFailed: "Could not open the git repository: {{message}}",
     diffTooLarge: "Diff too large, truncated",
     noChanges: "No changes",
     uncommittedChanges: "uncommitted changes",
