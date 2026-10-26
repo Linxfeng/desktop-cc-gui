@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_SEARCH_RESULTS: usize = 200;
+pub(crate) const MAX_SEARCH_RESULTS: usize = 200;
 /// @-mention file index: bounds the walk on monster trees (the gitignore
 /// filter drops build output, the cap is the last line of defense).
 pub(crate) const MAX_INDEX_ENTRIES: usize = 20_000;
@@ -556,6 +556,24 @@ pub async fn search_text(
     path: String,
     query: String,
 ) -> Result<Vec<SearchHit>, String> {
+    // WSL 工作区：发行版内 `rg`（UNC 遍历在 V23 里慢两个数量级）。授权检查
+    // 与主机路径一致，换后端不放宽。缺 `rg` 时回退主机遍历：慢但结果不变。
+    if let Some(unc) = crate::engine::wsl_path::parse_wsl_unc(&path) {
+        {
+            let db = Arc::clone(db.inner());
+            let check_path = path.clone();
+            tauri::async_runtime::spawn_blocking(move || ensure_allowed(&check_path, &db))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        match crate::engine::wsl_index::search(&unc, &query).await {
+            Ok(hits) => return Ok(hits),
+            Err(error) if error == crate::engine::wsl_index::RG_MISSING => {
+                eprintln!("[wsl] search_text: rg missing, falling back to UNC traversal");
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let db = Arc::clone(db.inner());
     tauri::async_runtime::spawn_blocking(move || search_text_blocking(&db, &path, &query))
         .await

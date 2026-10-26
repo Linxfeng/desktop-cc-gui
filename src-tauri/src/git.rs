@@ -345,6 +345,13 @@ fn tree_status_blocking(levels: Vec<GitTreeLevel>, snapshots: &mut TreeSnapshots
 
 #[tauri::command]
 pub async fn git_tree_status(levels: Vec<GitTreeLevel>) -> Result<GitTreeStatus, String> {
+    // WSL 工作区：一次短调用在发行版内批量取状态（同一仓库的兄弟目录复用）。
+    if levels
+        .iter()
+        .any(|level| crate::engine::wsl_path::parse_wsl_unc(&level.path).is_some())
+    {
+        return crate::git_wsl::tree_status(levels).await;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         tree_status_blocking(levels, &mut TreeSnapshots::new(true))
     })
@@ -354,6 +361,24 @@ pub async fn git_tree_status(levels: Vec<GitTreeLevel>) -> Result<GitTreeStatus,
 
 pub(crate) fn open_repo(path: &str) -> Result<Repository, String> {
     Repository::discover(path).map_err(|_| "NOT_A_REPO".to_string())
+}
+
+/// WSL UNC 路径 → 发行版内 git 后端；其余路径继续走本机 git2（`None`）。
+///
+/// 分派只按路径形状：插件登记的 SSH 远程 WSL 工作区路径是 Linux 路径，
+/// 不会命中本机后端（脚本入口只接受 UNC 形态的本机工作区）。
+fn wsl_repo(path: &str) -> Option<crate::engine::wsl_path::WslUncPath> {
+    crate::engine::wsl_path::parse_wsl_unc(path)
+}
+
+/// Web 访问端守卫：WSL 工作区的 Git 只在桌面端可用。Web token 不应获得
+/// 发行版内任意 git 写操作（推送、提交、checkout）的能力，与「Web 端不
+/// 支持本机 WSL」的既有决定一致。
+pub fn web_guard_wsl_path(path: &str) -> Result<(), String> {
+    if crate::engine::wsl_path::parse_wsl_unc(path).is_some() {
+        return Err("WSL_GIT_DESKTOP_ONLY".to_string());
+    }
+    Ok(())
 }
 
 fn status_label(status: git2::Status) -> &'static str {
@@ -623,6 +648,9 @@ fn git_status_blocking(path: &str) -> Result<GitStatus, String> {
 
 #[tauri::command]
 pub async fn git_status(path: String) -> Result<GitStatus, String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::status(&unc).await;
+    }
     tauri::async_runtime::spawn_blocking(move || git_status_blocking(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -690,13 +718,19 @@ fn git_diff_blocking(path: &str, file: &str, staged: bool) -> Result<String, Str
 
 #[tauri::command]
 pub async fn git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::diff(&unc, &file, staged).await;
+    }
     tauri::async_runtime::spawn_blocking(move || git_diff_blocking(&path, &file, staged))
         .await
         .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::stage(&unc, &files).await;
+    }
     let repo = open_repo(&path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     for file in &files {
@@ -716,7 +750,10 @@ pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::unstage(&unc, &files).await;
+    }
     let repo = open_repo(&path)?;
     let head = repo.head().and_then(|h| h.peel_to_commit());
     let mut index = repo.index().map_err(|e| e.to_string())?;
@@ -767,7 +804,10 @@ pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
 /// untracked path is deleted from disk. Staged deletions (in HEAD, removed
 /// from the index) are not offered discard in the UI; here they are a no-op.
 #[tauri::command]
-pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::discard(&unc, &files).await;
+    }
     let repo = open_repo(&path)?;
     let workdir = repo
         .workdir()
@@ -793,7 +833,10 @@ pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_commit(path: String, message: String) -> Result<String, String> {
+pub async fn git_commit(path: String, message: String) -> Result<String, String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::commit(&unc, &message).await;
+    }
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("empty commit message".to_string());
@@ -976,6 +1019,9 @@ fn fetch_options(config: git2::Config) -> git2::FetchOptions<'static> {
 
 #[tauri::command]
 pub async fn git_push(path: String) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::push(&unc).await;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let repo = open_repo(&path)?;
         let branch = current_branch_name(&repo)?;
@@ -1100,6 +1146,9 @@ fn git_pull_blocking(path: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn git_pull(path: String) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::pull(&unc).await;
+    }
     tauri::async_runtime::spawn_blocking(move || git_pull_blocking(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -1123,7 +1172,10 @@ pub struct BranchInfo {
 }
 
 #[tauri::command]
-pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::branches(&unc).await;
+    }
     let repo = open_repo(&path)?;
     // No is_current flag: consumers compare against the live status branch —
     // a cached flag here goes stale on external (CLI) checkouts.
@@ -1223,7 +1275,10 @@ fn checkout_remote_branch(
 }
 
 #[tauri::command]
-pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
+pub async fn git_checkout(path: String, branch: String) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::checkout(&unc, &branch).await;
+    }
     let repo = open_repo(&path)?;
     // A remote-tracking branch never receives HEAD directly (that would
     // detach it): it is materialized as a local tracking branch instead.
@@ -1249,7 +1304,10 @@ pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_create_branch(path: String, name: String) -> Result<(), String> {
+pub async fn git_create_branch(path: String, name: String) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::create_branch(&unc, &name).await;
+    }
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("empty branch name".to_string());
@@ -2070,8 +2128,8 @@ mod tests {
         assert_eq!(status.behind, None, "status={status:?}");
     }
 
-    #[test]
-    fn branches_list_locals_then_remote_tracking_skipping_origin_head() {
+    #[tokio::test]
+    async fn branches_list_locals_then_remote_tracking_skipping_origin_head() {
         let scratch = Scratch::new();
         let origin_path = scratch.0.join("origin");
         let origin = Repository::init(&origin_path).unwrap();
@@ -2091,7 +2149,9 @@ mod tests {
             .reference_symbolic("refs/remotes/origin/HEAD", &remote_head, true, "test")
             .unwrap();
 
-        let branches = git_branches(local_path.to_string_lossy().into_owned()).unwrap();
+        let branches = git_branches(local_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"origin/v1.0.9"), "names={names:?}");
         assert!(!names.contains(&"origin/HEAD"), "names={names:?}");
@@ -2107,8 +2167,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checkout_remote_branch_creates_local_tracking_branch() {
+    #[tokio::test]
+    async fn checkout_remote_branch_creates_local_tracking_branch() {
         let scratch = Scratch::new();
         let origin_path = scratch.0.join("origin");
         let origin = Repository::init(&origin_path).unwrap();
@@ -2123,6 +2183,7 @@ mod tests {
             local_path.to_string_lossy().into_owned(),
             "origin/v1.0.9".to_string(),
         )
+        .await
         .unwrap();
 
         let head_ref = local.head().unwrap();
@@ -2138,8 +2199,8 @@ mod tests {
         assert_eq!((status.ahead, status.behind), (Some(0), Some(0)), "{status:?}");
     }
 
-    #[test]
-    fn checkout_remote_branch_keeps_existing_local_branch() {
+    #[tokio::test]
+    async fn checkout_remote_branch_keeps_existing_local_branch() {
         let scratch = Scratch::new();
         let origin_path = scratch.0.join("origin");
         let origin = Repository::init(&origin_path).unwrap();
@@ -2167,6 +2228,7 @@ mod tests {
             local_path.to_string_lossy().into_owned(),
             "origin/feature".to_string(),
         )
+        .await
         .unwrap();
 
         assert_eq!(local.head().unwrap().target(), Some(local_tip));
@@ -2176,8 +2238,8 @@ mod tests {
         assert!(branch.upstream().is_err());
     }
 
-    #[test]
-    fn discard_restores_worktree_from_index_preserving_staged_hunks() {
+    #[tokio::test]
+    async fn discard_restores_worktree_from_index_preserving_staged_hunks() {
         for (autocrlf, expected) in [(false, "staged\n"), (true, "staged\r\n")] {
             let scratch = Scratch::new();
             let repo = Repository::init(&scratch.0).unwrap();
@@ -2205,6 +2267,7 @@ mod tests {
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["a.txt".to_string()],
             )
+            .await
             .unwrap();
 
             assert_eq!(
@@ -2223,8 +2286,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discard_restores_unstaged_deletion() {
+    #[tokio::test]
+    async fn discard_restores_unstaged_deletion() {
         for (autocrlf, expected) in [(false, "keep\n"), (true, "keep\r\n")] {
             let scratch = Scratch::new();
             let repo = Repository::init(&scratch.0).unwrap();
@@ -2241,6 +2304,7 @@ mod tests {
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["a.txt".to_string()],
             )
+            .await
             .unwrap();
 
             assert_eq!(
@@ -2251,8 +2315,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discard_keeps_staged_new_file_content() {
+    #[tokio::test]
+    async fn discard_keeps_staged_new_file_content() {
         for (autocrlf, expected) in [(false, "fresh\n"), (true, "fresh\r\n")] {
             let scratch = Scratch::new();
             let repo = Repository::init(&scratch.0).unwrap();
@@ -2274,6 +2338,7 @@ mod tests {
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["new.txt".to_string()],
             )
+            .await
             .unwrap();
 
             assert_eq!(
@@ -2284,8 +2349,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discard_removes_untracked_file() {
+    #[tokio::test]
+    async fn discard_removes_untracked_file() {
         let scratch = Scratch::new();
         let repo = Repository::init(&scratch.0).unwrap();
         commit_file(&repo, "a.txt", "a\n");
@@ -2296,6 +2361,7 @@ mod tests {
             scratch.0.to_string_lossy().into_owned(),
             vec!["sub/new.txt".to_string()],
         )
+        .await
         .unwrap();
 
         assert!(!scratch.0.join("sub/new.txt").exists());
@@ -2303,5 +2369,25 @@ mod tests {
             std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
             "a\n"
         );
+    }
+
+    /// Web 访问端守卫：WSL 工作区的 Git 只在桌面端可用；UNC 的三种形态
+    /// 都要识别，普通主机路径不受影响。
+    #[test]
+    fn web_guard_rejects_wsl_paths_only() {
+        for path in [
+            r"\\wsl.localhost\Ubuntu\home\me\repo",
+            r"\\wsl$\Ubuntu\home\me\repo",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\me\repo",
+            "//wsl.localhost/Ubuntu/home/me/repo",
+        ] {
+            assert_eq!(
+                web_guard_wsl_path(path).unwrap_err(),
+                "WSL_GIT_DESKTOP_ONLY",
+                "{path}"
+            );
+        }
+        assert!(web_guard_wsl_path(r"C:\Users\me\repo").is_ok());
+        assert!(web_guard_wsl_path("/home/me/repo").is_ok());
     }
 }

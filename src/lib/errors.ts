@@ -28,6 +28,10 @@ const WSL_ERROR_PREFIXES: [prefix: string, key: string][] = [
   ["WSL_CLI_CONFIG_INVALID_TOML:", "wsl.cli.configInvalid"],
   ["WSL_CLI_CONFIG_WRITE_FAILED:", "wsl.cli.configWriteFailed"],
   ["WSL_CLI_CONFIG_READ_FAILED:", "wsl.cli.configReadFailed"],
+  ["WSL_GIT_MISSING", "wsl.git.missing"],
+  ["WSL_GIT_FAILED:", "wsl.git.failed"],
+  ["WSL_GIT_AUTH_FAILED:", "wsl.git.authFailed"],
+  ["WSL_GIT_DESKTOP_ONLY", "wsl.git.desktopOnly"],
   ["WSL_EXIT_UNPROVEN:", "wsl.error.exitUnproven"],
   ["WSL_RG_MISSING", "wsl.error.generic"],
 ];

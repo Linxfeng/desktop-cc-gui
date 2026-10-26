@@ -64,6 +64,103 @@ pub async fn list_files(
     }
 }
 
+/// 全文搜索脚本：发行版内 `rg --json`，语义对齐主机
+/// `contains_case_insensitive`（固定串 + 忽略大小写）。结果上限由解析侧截断，
+/// 输出本身加 4 MiB 上限，避免超大仓库把 IPC 打满。
+///
+/// 必须显式给路径 `.`：脚本经 stdin 送进 `bash -s`，rg 看到非 tty 的 stdin
+/// 会把它当成输入源（搜到空内容），不给路径就永远搜不到文件。
+pub(crate) fn search_script(workspace: &str, query: &str) -> String {
+    let quoted = wsl_transport::sh_quote(workspace);
+    let pattern = wsl_transport::sh_quote(query);
+    format!(
+        "cd -- {quoted} || exit 61\n\
+         command -v rg >/dev/null 2>&1 || {{ echo '{NO_RG_MARK}' >&2; exit 127; }}\n\
+         rg --json --no-messages --fixed-strings --ignore-case -e {pattern} . | head -c 4194304\n\
+         exit 0"
+    )
+}
+
+/// 在发行版内全文搜索。`rg` 缺失返回 [`RG_MISSING`]，由调用方回退 UNC 遍历。
+pub async fn search(unc: &WslUncPath, query: &str) -> Result<Vec<crate::files::SearchHit>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let transport = wsl_transport::local_transport(unc);
+    let script = search_script(&unc.linux_path, trimmed);
+    match wsl_transport::run_script_output(&transport, &script).await {
+        Ok(raw) => Ok(parse_search_output(
+            &raw,
+            &unc.distro,
+            &unc.linux_path,
+            crate::files::MAX_SEARCH_RESULTS,
+        )),
+        Err(error) if error.contains(NO_RG_MARK) => Err(RG_MISSING.to_string()),
+        Err(error) => Err(error),
+    }
+}
+
+/// `rg --json` 的 match 事件 → SearchHit（纯函数）。
+///
+/// 路径相对 cwd，转成 UNC 绝对路径（与工作区路径同一形态）；
+/// 非 UTF-8 行 rg 只给 `bytes`，跳过而不是猜。
+pub(crate) fn parse_search_output(
+    raw: &str,
+    distro: &str,
+    workspace: &str,
+    cap: usize,
+) -> Vec<crate::files::SearchHit> {
+    let mut hits = Vec::new();
+    for line in raw.lines() {
+        if hits.len() >= cap {
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("match") {
+            continue;
+        }
+        let Some(data) = event.get("data") else {
+            continue;
+        };
+        let Some(rel) = data
+            .get("path")
+            .and_then(|p| p.get("text"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let text = data
+            .get("lines")
+            .and_then(|l| l.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(200)
+            .collect::<String>();
+        let line_no = data
+            .get("line_number")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        hits.push(crate::files::SearchHit {
+            path: super::wsl_path::to_wsl_unc(
+                distro,
+                &format!(
+                    "{}/{}",
+                    workspace.trim_end_matches('/'),
+                    rel.trim_start_matches("./")
+                ),
+            ),
+            line: line_no,
+            text,
+        });
+    }
+    hits
+}
+
 /// 解析 `rg --files` 输出并补齐目录项(纯函数)。
 ///
 /// `rg` 只列文件,而既有索引同时包含目录(@-mention 里 `@src/` 这类前缀很
@@ -165,5 +262,47 @@ mod tests {
         assert!(all.contains("--no-ignore --hidden"));
         assert!(all.contains("!node_modules/**"));
         assert!(all.contains("!target/**"));
+    }
+
+    #[test]
+    fn search_script_quotes_pattern_and_workspace() {
+        let script = search_script("/home/me/my repo", "it's a \"quote\"");
+        assert!(script.contains("cd -- '/home/me/my repo'"));
+        assert!(script.contains("--fixed-strings --ignore-case"));
+        assert!(
+            script.contains("-e 'it'\\''s a \"quote\"' ."),
+            "pattern 与显式路径都要在: {script}"
+        );
+        assert!(script.contains("command -v rg"));
+    }
+
+    #[test]
+    fn parses_rg_match_events_into_unc_hits() {
+        let raw = concat!(
+            r#"{"type":"begin","data":{"path":{"text":"src/a.ts"}}}"#,
+            "\n",
+            r#"{"type":"match","data":{"path":{"text":"src/a.ts"},"lines":{"text":"  const x = 1;\n"},"line_number":12,"absolute_offset":120,"submatches":[]}}"#,
+            "\n",
+            r#"{"type":"match","data":{"path":{"bytes":"L3RtcC94"},"lines":{"text":"skip"},"line_number":1}}"#,
+            "\n",
+            r#"{"type":"end","data":{"path":{"text":"src/a.ts"}}}"#,
+            "\n",
+            "not json at all\n",
+        );
+        let hits = parse_search_output(raw, "Ubuntu-24.04", "/home/me/repo", 200);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 12);
+        assert_eq!(hits[0].text, "const x = 1;");
+        assert_eq!(
+            hits[0].path,
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\repo\src\a.ts"
+        );
+    }
+
+    #[test]
+    fn search_results_are_capped() {
+        let line = r#"{"type":"match","data":{"path":{"text":"a.ts"},"lines":{"text":"x"},"line_number":1}}"#;
+        let raw = vec![line; 20].join("\n");
+        assert_eq!(parse_search_output(&raw, "D", "/w", 5).len(), 5);
     }
 }

@@ -2367,6 +2367,13 @@ export const zh = {
       piAuthOauthHint:
         "WSL 作用域暂无内置终端：请在发行版内启动 pi 后执行 {{command}} 完成登录。",
     },
+    git: {
+      missing:
+        "发行版内没有 git：请先在发行版内安装（如 sudo apt install git）后重试。",
+      failed: "Git 操作失败：{{message}}",
+      authFailed: "Git 认证失败：请检查凭据 / SSH key 配置（{{message}}）",
+      desktopOnly: "WSL 工作区的 Git 操作只在桌面端可用。",
+    },
     noticeExitUnproven:
       "{{distro}} 内的会话进程可能仍在运行（回收未确认）。如占用资源，请在 WSL 终端里用 ps 检查。",
     noticeRgMissing:

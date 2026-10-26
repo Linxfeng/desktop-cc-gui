@@ -2428,6 +2428,13 @@ export const en: Messages = {
       piAuthOauthHint:
         "No built-in terminal in the WSL scope yet: start pi inside the distro and run {{command}} to log in.",
     },
+    git: {
+      missing:
+        "git is not installed inside the distro: install it (e.g. sudo apt install git) and try again.",
+      failed: "Git operation failed: {{message}}",
+      authFailed: "Git authentication failed: check your credentials / SSH key ({{message}})",
+      desktopOnly: "Git operations on WSL workspaces are only available on the desktop app.",
+    },
     noticeExitUnproven:
       "Processes from a session in {{distro}} may still be running (teardown unconfirmed). If they hold resources, check with ps in a WSL terminal.",
     noticeRgMissing:

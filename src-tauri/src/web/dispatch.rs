@@ -1140,61 +1140,79 @@ pub(super) async fn dispatch(
         // git
         "git_status" => {
             let a: PathArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_status(a.path).await)
         }
         "git_repository_summaries" => {
             let a: PathsArgs = parse_args(&raw)?;
+            for path in &a.paths {
+                crate::git::web_guard_wsl_path(path)?;
+            }
             ser(Ok(crate::git::git_repository_summaries(a.paths).await))
         }
         "git_file_colors" => {
             let a: GitFilesArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_file_colors(a.path, a.files).await)
         }
         "git_tree_status" => {
             let a: GitTreeArgs = parse_args(&raw)?;
+            for level in &a.levels {
+                crate::git::web_guard_wsl_path(&level.path)?;
+            }
             ser(crate::git::git_tree_status(a.levels).await)
         }
         "git_diff" => {
             let a: GitDiffArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_diff(a.path, a.file, a.staged).await)
         }
         "git_stage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_stage(a.path, a.files))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_stage(a.path, a.files).await)
         }
         "git_unstage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_unstage(a.path, a.files))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_unstage(a.path, a.files).await)
         }
         // Same shared changes panel as the desktop, so the remote client's
         // 「撤销更改」 must route too (it falls through to unknown otherwise).
         "git_discard" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_discard(a.path, a.files))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_discard(a.path, a.files).await)
         }
         "git_commit" => {
             let a: GitCommitArgs = parse_args(&raw)?;
-            ser(crate::git::git_commit(a.path, a.message))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_commit(a.path, a.message).await)
         }
         "git_push" => {
             let a: PathArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_push(a.path).await)
         }
         "git_pull" => {
             let a: PathArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_pull(a.path).await)
         }
         "git_branches" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_branches(a.path))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_branches(a.path).await)
         }
         "git_checkout" => {
             let a: GitCheckoutArgs = parse_args(&raw)?;
-            ser(crate::git::git_checkout(a.path, a.branch))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_checkout(a.path, a.branch).await)
         }
         "git_create_branch" => {
             let a: GitCreateBranchArgs = parse_args(&raw)?;
-            ser(crate::git::git_create_branch(a.path, a.name))
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_create_branch(a.path, a.name).await)
         }
         // open-app
         "open_workspace_in" => {

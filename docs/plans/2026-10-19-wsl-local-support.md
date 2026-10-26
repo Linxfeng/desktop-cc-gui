@@ -398,9 +398,9 @@ V12/V13 已证实：杀 `wsl.exe` 会让 Linux 会话收到 SIGHUP，普通进�
 
 ### 阶段 2：开发体验补齐（约 10–14 个工作日）
 
-1. **Git**（4–6 天）：`git_wsl.rs`，status/diff/log/stage/commit 走 `wsl.exe --exec /bin/sh -c '<LAUNCHER>' … git -C <linux> …`，用 `--porcelain=v2 -z` 等机读格式；`git.rs` 入口按工作区分派。阶段 1 期间 git2 打开 UNC 失败（V24 推断为所有权校验）时显示"WSL 工作区 Git 面板将在后续版本支持"，不报错堆栈。
+1. **Git**（已实现，`docs/plans/2026-10-26-wsl-git-and-search.md`）：新增 `git_wsl.rs`，status/diff/stage/unstage/discard/commit/push/pull/branches/checkout/create-branch 与文件树装饰全部在发行版内执行（`git -C <repo root>` + `--porcelain=v2 -z` / `--numstat -z` 机读格式）；`git.rs` 按 UNC 形状分派，主机路径不变；Web dispatch 显式拒绝 WSL 路径。未覆盖 worktree 子系统与 `workspace_vcs_metadata`。
 2. **终端**（1–2 天）：WSL 工作区的终端 = `wsl.exe -d <d> --cd <linux>`（交互登录 shell；终端场景 `--cd` 失败落到 `/` 可接受，但仍先检查 UNC `is_dir`）；`TERM`、UTF-8 locale 经 WSLENV 传入。需实测 ConPTY 下 resize 与中文输入。
-3. **全文搜索**（1 天）：`files.rs::search_text` 走发行版内 `rg --json`。
+3. **全文搜索**（已实现）：`files.rs::search_text` 走发行版内 `rg --json`，缺 `rg` 时回退 UNC 遍历（同 `wsl_index` 约定）；脚本必须显式给 rg 路径，否则 stdin 被当作输入源。
 4. **Own 传输放开**（3–4 天）：§5.6 阶段 2 列，codex app-server 优先（恢复 `request_user_input` 问答通道），再到 ACP 系；协议 cwd 转换单测移植 `AcpWslCwd.test.ts` 4 条。
 5. **启动兜底回收**（0.5 天）：§5.7 第 4 条。
 

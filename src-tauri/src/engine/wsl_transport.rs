@@ -1170,15 +1170,26 @@ pub async fn run_script_output(
     transport: &WslTransport,
     script_body: &str,
 ) -> Result<String, String> {
+    run_script_output_with_timeout(transport, script_body, REMOTE_CALL_TIMEOUT).await
+}
+
+/// [`run_script_output`] 的可调预算版本：网络类操作（git push/pull）远超
+/// 短调用的 30s 预算，不能套同一个 deadline。
+pub async fn run_script_output_with_timeout(
+    transport: &WslTransport,
+    script_body: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     match &transport.backend {
-        WslBackend::Ssh { .. } => run_script_output_ssh(transport, script_body).await,
-        WslBackend::Local => run_script_output_local(transport, script_body).await,
+        WslBackend::Ssh { .. } => run_script_output_ssh(transport, script_body, timeout).await,
+        WslBackend::Local => run_script_output_local(transport, script_body, timeout).await,
     }
 }
 
 async fn run_script_output_ssh(
     transport: &WslTransport,
     script_body: &str,
+    timeout: std::time::Duration,
 ) -> Result<String, String> {
     let script_id = uuid::Uuid::new_v4().simple().to_string();
     let remote_path = format!("/tmp/ccgui-wsl-{script_id}.sh");
@@ -1195,12 +1206,12 @@ async fn run_script_output_ssh(
     // 这里,远端挂起不得拖死前端。kill_on_drop:超时后 output future 被
     // 丢弃即 SIGKILL 本地 ssh(远端脚本落盘即删,无残留面)。
     command.kill_on_drop(true);
-    let output = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, command.output()).await {
+    let output = match tokio::time::timeout(timeout, command.output()).await {
         Ok(result) => result.map_err(|e| format!("远程命令执行失败: {e}"))?,
         Err(_) => {
             return Err(format!(
                 "远程命令超时({}s,检查远程主机 wsl.exe 是否无响应)",
-                REMOTE_CALL_TIMEOUT.as_secs()
+                timeout.as_secs()
             ));
         }
     };
@@ -1217,8 +1228,9 @@ async fn run_script_output_ssh(
 async fn run_script_output_local(
     transport: &WslTransport,
     script_body: &str,
+    timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let bytes = exec_local(transport, script_body, REMOTE_CALL_TIMEOUT).await?;
+    let bytes = exec_local(transport, script_body, timeout).await?;
     // 先解码再剥噪声:旧版 WSL 的 UTF-16LE 输出靠 NUL 判定,若先剥噪声
     // (内部 lossy + 删 NUL),解码兜底就再也识别不到(§10 P1-6)。
     Ok(strip_transport_noise_text(
