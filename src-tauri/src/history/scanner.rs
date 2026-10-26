@@ -498,6 +498,96 @@ fn prune_opencode_hidden_sessions(db: &crate::db::Db) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Conservative existence check: only NotFound counts as gone. Permission
+/// errors, device-not-ready, offline SMB roots and similar failures must
+/// never wipe indexed history.
+fn definitely_missing(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// UNC roots (`\\server\share`, `\\wsl.localhost\...`) have unreliable
+/// existence semantics from the host. `\\?\C:\...` is a local extended-length
+/// path and must NOT be treated as remote; `\\?\UNC\...` is UNC again.
+fn is_remote_path(path: &str) -> bool {
+    if path.starts_with("\\\\?\\UNC\\") {
+        return true;
+    }
+    if path.starts_with("\\\\?\\") {
+        return false;
+    }
+    path.starts_with("\\\\")
+}
+
+/// Phase B follow-up: drop rows whose transcript file is definitely gone.
+/// Files deleted outside the app (CLI-side cleanup, engine-home migration,
+/// leftovers from older versions) used to stay in `sessions` forever, listed
+/// as unopenable ghost sessions (upstream #1083 / #1086 / #1103 / #1104).
+///
+/// Deletion is conservative on purpose:
+/// - only rows whose file_path is not in this scan's FULL candidate set
+///   (reused/unchanged candidates must not be dropped: the reparsed rows are
+///   only a subset);
+/// - fs::metadata must fail with NotFound, never another error;
+/// - remote UNC paths are skipped, and OpenCode's synthetic
+///   `opencode.db#session-id` addresses are skipped too — they are not real
+///   files, so metadata on them is always NotFound (their row-level lifecycle
+///   is handled by explicit opencode deletion, not file GC).
+fn prune_missing_file_sessions(
+    db: &crate::db::Db,
+    candidates: &[Candidate],
+) -> Result<bool, String> {
+    let live: HashSet<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
+    // Short lock for the row read; all file probing happens outside the lock
+    // so metadata I/O cannot stretch the write-side critical section.
+    let rows: Vec<(String, String, String)> = {
+        let conn = db.0.lock();
+        let mut stmt = conn
+            .prepare("SELECT engine, session_id, file_path FROM sessions WHERE file_path <> ''")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => out.push(row),
+                Err(e) => eprintln!("[scanner] skipping undecodable session row in file GC: {e}"),
+            }
+        }
+        out
+    };
+    let mut dead: Vec<(String, String)> = Vec::new();
+    for (engine, session_id, file_path) in rows {
+        let path = PathBuf::from(&file_path);
+        if live.contains(&path)
+            || is_remote_path(&file_path)
+            || super::split_opencode_db_path(&path).is_some()
+        {
+            continue;
+        }
+        if definitely_missing(&path) {
+            dead.push((engine, session_id));
+        }
+    }
+    if dead.is_empty() {
+        return Ok(false);
+    }
+    let conn = db.0.lock();
+    for (engine, id) in &dead {
+        conn.execute(
+            "DELETE FROM sessions WHERE engine=?1 AND session_id=?2",
+            rusqlite::params![engine, id],
+        )
+        .map_err(|e| e.to_string())?;
+        crate::engine::plan_review::delete_reviews_for_session(&conn, engine, id)?;
+    }
+    Ok(true)
+}
+
 fn prune_stale_sessions(db: &crate::db::Db) -> Result<bool, String> {
     let outside = prune_codex_sessions_outside_home(db)?;
     let subagent = prune_hidden_subagent_sessions(db)?;
@@ -648,6 +738,7 @@ fn scan_inner(
         &tier1,
         !tier1.retitle_pending || retitle_complete,
     )?;
+    prune_missing_file_sessions(db, &candidates)?;
     prune_stale_sessions(db)?;
     super::codex_titles::sync(db)?;
     on_changed();
@@ -1538,6 +1629,10 @@ pub(super) mod tests {
             .join("sessions")
             .join("rollout-keep.jsonl");
         std::fs::create_dir_all(rollout.parent().unwrap()).map_err(|e| e.to_string())?;
+        // The transcript must actually exist: this test verifies the default
+        // home is not pruned by path prefix, and a real session has a real
+        // file (missing files are now reclaimed by the file-existence GC).
+        std::fs::write(&rollout, "{}\n").map_err(|e| e.to_string())?;
         let _guard = HomeGuard::set(&home);
         let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
         {
@@ -1603,6 +1698,132 @@ pub(super) mod tests {
             .map_err(|e| e.to_string())?
         };
         assert_eq!(count, 0);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    fn session_count(db: &crate::db::Db, engine: &str, session_id: &str) -> i64 {
+        db.0.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE engine=?1 AND session_id=?2",
+                rusqlite::params![engine, session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn scan_prunes_transcripts_deleted_outside_the_app() -> Result<(), String> {
+        // A transcript deleted outside the app (CLI cleanup, home migration)
+        // must not stay listed forever (upstream #1083 / #1086 / #1103).
+        let home = scratch_dir(&format!("gc-external-{}", uuid::Uuid::new_v4()));
+        let _guard = HomeGuard::set(&home);
+        struct HomeEnv(Option<std::ffi::OsString>);
+        impl Drop for HomeEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CODEX_HOME", value),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+        let _env = HomeEnv(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", home.join(".codex"));
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [workspace.to_string_lossy().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        let rollout = |id: &str| -> Result<PathBuf, String> {
+            let path = home
+                .join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("10")
+                .join("26")
+                .join(format!("rollout-2026-10-26T00-00-00-{id}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            let text = serde_json::json!({"type": "session_meta", "payload": {
+                "id": id, "cwd": workspace.to_string_lossy()
+            }})
+            .to_string()
+                + "\n";
+            std::fs::write(&path, text).map_err(|e| e.to_string())?;
+            Ok(path)
+        };
+        let keep = rollout("keep")?;
+        let gone = rollout("gone")?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        assert_eq!(session_count(&db, "codex", "gone"), 1);
+        // Delete outside the app: the next scan drops the dead row and keeps
+        // the unchanged (reused) one.
+        std::fs::remove_file(&gone).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "gone"), 0);
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        // Deleting again (already gone) is harmless.
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn file_gc_skips_remote_and_synthetic_paths() -> Result<(), String> {
+        let home = scratch_dir(&format!("gc-shapes-{}", uuid::Uuid::new_v4()));
+        let _guard = HomeGuard::set(&home);
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        let live_file = home.join("live.jsonl");
+        std::fs::write(&live_file, "{}\n").map_err(|e| e.to_string())?;
+        let ghost_file = home.join("ghost.jsonl"); // never created
+        let synthetic = super::super::opencode_db_session_path(
+            &home.join("opencode.db"),
+            "abc123",
+        );
+        {
+            let conn = db.0.lock();
+            for (engine, id, path) in [
+                ("claude", "live", live_file.to_string_lossy().into_owned()),
+                ("claude", "ghost", ghost_file.to_string_lossy().into_owned()),
+                ("claude", "unc", "\\\\server\\share\\ghost.jsonl".to_string()),
+                ("claude", "extended", "\\\\?\\UNC\\server\\share\\x.jsonl".to_string()),
+                ("claude", "extended-local", format!("\\\\?\\{}", ghost_file.to_string_lossy())),
+                ("opencode", "synthetic", synthetic.to_string_lossy().into_owned()),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title) VALUES(?1, ?2, ?3, ?4, 1, 1, 't')",
+                    rusqlite::params![engine, id, workspace.to_string_lossy(), path],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        let candidates = vec![Candidate {
+            engine: "claude",
+            path: live_file.clone(),
+            known_id: Some("live".into()),
+            known_workspace: Some(workspace.to_string_lossy().into_owned()),
+        }];
+        assert!(prune_missing_file_sessions(&db, &candidates)?);
+        // Local ghost row removed; live, UNC, extended-UNC and OpenCode's
+        // synthetic db#session-id address must survive.
+        assert_eq!(session_count(&db, "claude", "ghost"), 0);
+        assert_eq!(session_count(&db, "claude", "live"), 1);
+        assert_eq!(session_count(&db, "claude", "unc"), 1);
+        assert_eq!(session_count(&db, "claude", "extended"), 1);
+        // `\\?\C:\...` is a LOCAL extended-length path: still GC-eligible.
+        assert_eq!(session_count(&db, "claude", "extended-local"), 0);
+        assert_eq!(session_count(&db, "opencode", "synthetic"), 1);
+        // Idempotent: nothing left to prune.
+        assert!(!prune_missing_file_sessions(&db, &candidates)?);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())
