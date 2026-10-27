@@ -3,7 +3,6 @@ import type { MarketPlugin } from "@/lib/ipc";
 import {
   categorizePlugin,
   categoryCounts,
-  githubAvatarUrl,
   githubLoginFor,
   indexUpdatedAt,
   isOfficialPlugin,
@@ -108,13 +107,6 @@ describe("githubLoginFor", () => {
     expect(githubLoginFor({ author: "-leading" })).toBeNull();
     expect(githubLoginFor({ author: "trailing-" })).toBeNull();
     expect(githubLoginFor({ author: "a".repeat(40) })).toBeNull();
-  });
-});
-
-describe("githubAvatarUrl", () => {
-  it("asks GitHub for the account avatar at 2× the chip size, capped", () => {
-    expect(githubAvatarUrl("libo-zhou", 20)).toBe("https://github.com/libo-zhou.png?size=40");
-    expect(githubAvatarUrl("libo-zhou", 400)).toBe("https://github.com/libo-zhou.png?size=460");
   });
 });
 

@@ -54,7 +54,12 @@ const ITEMS: ProcessItem[] = [
 
 async function render(
   items: ProcessItem[] = ITEMS,
-  props: { autoExpand?: boolean; turnLive?: boolean; thinkingAutoCollapse?: boolean } = {},
+  props: {
+    autoExpand?: boolean;
+    turnLive?: boolean;
+    thinkingAutoCollapse?: boolean;
+    answered?: boolean;
+  } = {},
 ) {
   await act(async () => {
     root.render(
@@ -62,6 +67,7 @@ async function render(
         items={items}
         autoExpand={props.autoExpand ?? true}
         turnLive={props.turnLive}
+        answered={props.answered}
         thinkingAutoCollapse={props.thinkingAutoCollapse}
         processId={1}
         seenTools={seenTools}
@@ -201,13 +207,13 @@ describe("ProcessDisclosure bounded history", () => {
     const text = "中文与 emoji 👨‍👩‍👧‍👦\n".repeat(300);
     await render([...items, { type: "thinking", text, live: true }], { turnLive: true });
     expect(container.querySelector(".whitespace-pre-wrap")!.textContent).toBe(text);
-    await render([...items, { type: "thinking", text }], { turnLive: true });
+    await render([...items, { type: "thinking", text }], { turnLive: true, answered: true });
     expect(headerExpanded()).toBe(false);
     expect(container.querySelector(".whitespace-pre-wrap")).toBeNull();
     await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
     expect(container.querySelector(".whitespace-pre-wrap")!.textContent).toBe(text);
-    await render([...items, { type: "thinking", text, live: true }], { turnLive: true });
-    await render([...items, { type: "thinking", text }], { turnLive: true });
+    await render([...items, { type: "thinking", text, live: true }], { turnLive: true, answered: true });
+    await render([...items, { type: "thinking", text }], { turnLive: false, answered: true });
     expect(headerExpanded()).toBe(true);
   });
 });
@@ -300,12 +306,76 @@ describe("ProcessDisclosure tool args", () => {
 });
 
 describe("ProcessDisclosure thinking expansion", () => {
-  it("folds thinking when the stream settles by default", async () => {
+  it("keeps a running thinking process expanded until the answer starts", async () => {
     await render([{ type: "thinking", text: "先分析需求", live: true }], { turnLive: true });
     expect(headerExpanded()).toBe(true);
     expect(container.textContent).toContain("先分析需求");
 
+    // Thinking settles as a tool starts, but the run is still going: stay open.
     await render([{ type: "thinking", text: "先分析需求" }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+    expect(container.textContent).toContain("先分析需求");
+
+    // Assistant text starts after the run: now it may fold.
+    await render([{ type: "thinking", text: "先分析需求" }], { turnLive: true, answered: true });
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("folds a settled thinking run when the turn ends with no answer text", async () => {
+    await render([{ type: "thinking", text: "先分析需求", live: true }], { turnLive: true });
+    await render([{ type: "thinking", text: "先分析需求" }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    await render([{ type: "thinking", text: "先分析需求" }], { turnLive: false });
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("stays open through thinking resume and folds once, when text follows the run", async () => {
+    await render([{ type: "thinking", text: "先分析需求", live: true }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    // A thinking block ended at the tool boundary; keep the run visible.
+    await render([{ type: "thinking", text: "先分析需求" }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    // Reasoning resumes after the tool call: still open.
+    const withResumed: ProcessItem[] = [
+      { type: "thinking", text: "先分析需求" },
+      { type: "tool", text: "Read" },
+      { type: "thinking", text: "再检查一下", live: true },
+    ];
+    await render(withResumed, { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+    expect(container.textContent).toContain("再检查一下");
+
+    // Answer text begins after the run: fold once.
+    await render(
+      withResumed.map((item) => ({ ...item, live: false })),
+      { turnLive: true, answered: true },
+    );
+    expect(headerExpanded()).toBe(false);
+
+    // Later thinking in the same run does not reopen a run that has text.
+    await render(withResumed, { turnLive: true, answered: true });
+    expect(headerExpanded()).toBe(false);
+
+    // A deliberate click still opens the whole run.
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[aria-expanded]")!.click();
+    });
+    expect(headerExpanded()).toBe(true);
+    expect(container.textContent).toContain("先分析需求");
+    expect(container.textContent).toContain("再检查一下");
+  });
+
+  it("folds a run when a newer process run takes over", async () => {
+    await render([{ type: "thinking", text: "先分析需求", live: true }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    await render([{ type: "thinking", text: "先分析需求", live: true }], {
+      turnLive: true,
+      autoExpand: false,
+    });
     expect(headerExpanded()).toBe(false);
   });
 
@@ -319,6 +389,14 @@ describe("ProcessDisclosure thinking expansion", () => {
 
     await render([{ type: "thinking", text: "先分析需求" }], {
       turnLive: true,
+      thinkingAutoCollapse: false,
+    });
+    expect(headerExpanded()).toBe(true);
+    expect(container.textContent).toContain("先分析需求");
+
+    await render([{ type: "thinking", text: "先分析需求" }], {
+      turnLive: false,
+      answered: true,
       thinkingAutoCollapse: false,
     });
     expect(headerExpanded()).toBe(true);

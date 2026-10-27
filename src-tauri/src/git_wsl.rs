@@ -128,6 +128,24 @@ async fn run(unc: &WslUncPath, script: &str) -> Result<String, String> {
     wsl_transport::run_script_output(&transport, script).await
 }
 
+/// Read-only origin lookup for the sidebar avatar. Discovery failures and
+/// missing/non-GitHub remotes intentionally fall back to the folder icon, just
+/// like the host implementation; no credential or remote operation is needed.
+pub async fn workspace_owner(unc: &WslUncPath) -> Option<String> {
+    let script = format!(
+        "{}\
+         url=$(git -C \"$root\" config --get remote.origin.url 2>/dev/null) || exit 0\n\
+         printf '%s' \"$url\" | base64 -w0\n\
+         exit 0\n",
+        repo_prelude(&unc.linux_path),
+    );
+    let raw = run(unc, &script).await.ok()?;
+    let raw = classify(&raw, &unc.linux_path).ok()?;
+    let encoded: String = raw.lines().map(str::trim).collect();
+    let url = decode_b64(&encoded)?;
+    crate::git::github_login(&url)
+}
+
 // ── status ─────────────────────────────────────────────────────────────────
 
 /// porcelain v2 的一条记录。

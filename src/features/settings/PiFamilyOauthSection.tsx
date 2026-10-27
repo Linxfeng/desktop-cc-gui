@@ -1,11 +1,11 @@
-/** 订阅授权 group — read-only OAuth status rows plus a 登录 button that hands
- *  the interactive flow to the built-in terminal (extracted from
- *  PiFamilyAuthSection).
+/** 订阅授权 group — OAuth status rows plus CLI-owned login/logout actions in
+ *  the built-in terminal (extracted from PiFamilyAuthSection).
  *
- *  `onLaunchLogin = null`（WSL 作用域没有内置终端）时不渲染按钮：改为一行
- *  降级说明（在发行版内终端执行 `/login <arg>`），不提供点了无效的假按钮。 */
+ *  终端动作传 `null`（WSL 作用域没有内置终端）时不渲染对应按钮：登录改为一行
+ *  降级说明，登出不提供依赖 host 终端的假入口。 */
 import { useTranslation } from "react-i18next";
 import LogIn from "lucide-react/dist/esm/icons/log-in";
+import LogOut from "lucide-react/dist/esm/icons/log-out";
 import Terminal from "lucide-react/dist/esm/icons/terminal";
 import {
   SettingsCard,
@@ -20,12 +20,15 @@ export function PiFamilyOauthSection({
   providers,
   oauthActive,
   onLaunchLogin,
+  onLaunchLogout,
 }: {
   engine: "pi" | "omp";
   providers: readonly PiFamilyOauthProvider[];
   oauthActive: ReadonlySet<string>;
   /** null = 终端不可用（WSL 作用域）：隐藏按钮，只给降级说明。 */
   onLaunchLogin: ((provider: PiFamilyOauthProvider) => void) | null;
+  /** null = 终端不可用（WSL 作用域）：不提供 host 终端登出入口。 */
+  onLaunchLogout: ((provider: PiFamilyOauthProvider) => void) | null;
 }) {
   const { t } = useTranslation();
   return (
@@ -39,6 +42,9 @@ export function PiFamilyOauthSection({
       <SettingsCard>
         {providers.map((provider) => {
           const subscribed = provider.statusIds.some((id) => oauthActive.has(id));
+          const loginCommand = engine === "pi"
+            ? `pi /login ${provider.loginArg}`
+            : `omp auth-broker login ${provider.loginArg}`;
           return (
             <div className={ROW} key={provider.id}>
               <BrandIcon iconSrc={provider.iconSrc} />
@@ -61,11 +67,7 @@ export function PiFamilyOauthSection({
                 <button
                   type="button"
                   onClick={() => onLaunchLogin(provider)}
-                  title={
-                    engine === "pi"
-                      ? `pi /login ${provider.loginArg}`
-                      : `omp auth-broker login ${provider.loginArg}`
-                  }
+                  title={loginCommand}
                   className="flex shrink-0 items-center gap-1 rounded-lg border border-border-button-default px-2.5 py-1 text-body-2-medium text-text-primary hover:bg-background-secondary-hover"
                 >
                   <LogIn className="size-3.5" aria-hidden />
@@ -77,8 +79,18 @@ export function PiFamilyOauthSection({
                   title={t("wsl.cli.piAuthOauthHint", { command: `/login ${provider.loginArg}` })}
                 >
                   <Terminal className="size-3.5" aria-hidden />
-                  <code className="truncate">{`pi /login ${provider.loginArg}`}</code>
+                  <code className="truncate">{loginCommand}</code>
                 </span>
+              )}
+              {subscribed && onLaunchLogout && (
+                <button
+                  type="button"
+                  onClick={() => onLaunchLogout(provider)}
+                  className="flex shrink-0 items-center gap-1 rounded-lg border border-border-button-default px-2.5 py-1 text-body-2-medium text-text-primary hover:bg-background-secondary-hover"
+                >
+                  <LogOut className="size-3.5" aria-hidden />
+                  {t(engine === "pi" ? "settings.piAuthGoToLogout" : "settings.piAuthLogout")}
+                </button>
               )}
             </div>
           );

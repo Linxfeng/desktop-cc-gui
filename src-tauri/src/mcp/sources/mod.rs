@@ -335,6 +335,36 @@ const SOURCES: &[Source] = &[
         writable: false,
         readonly_reason_code: REASON_DSH_PLUGIN,
     },
+    // CodeBuddy natively supports MCP (官方 .codebuddy 目录文档：
+    // ~/.codebuddy/mcp.json 与项目 .mcp.json，CLI 有 codebuddy mcp 子命令)。
+    // 写语义尚未在真实 CLI 上对拍，先只读接入。
+    json_source!(
+        "codebuddy_user",
+        "codebuddy",
+        "user",
+        Some(Toggle::Enabled),
+        false,
+        false,
+        REASON_UNVERIFIED_WRITE
+    ),
+    json_source!(
+        "codebuddy_local",
+        "codebuddy",
+        "project",
+        Some(Toggle::Enabled),
+        false,
+        false,
+        REASON_UNVERIFIED_WRITE
+    ),
+    json_source!(
+        "codebuddy_project",
+        "codebuddy",
+        "project",
+        Some(Toggle::Enabled),
+        false,
+        false,
+        REASON_SHARED_PROJECT_FILE
+    ),
 ];
 
 /// dsh 里一个 MCP 服务 = 一个 `dsh-mcp-client` 插件实例。
@@ -483,6 +513,10 @@ fn dsh_home() -> PathBuf {
     crate::engine::engine_home(Some("DSH_HOME"), ".dsh")
 }
 
+fn codebuddy_home() -> PathBuf {
+    crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy")
+}
+
 fn join_all(home: PathBuf, names: &[&str]) -> Vec<PathBuf> {
     names.iter().map(|name| home.join(name)).collect()
 }
@@ -495,8 +529,14 @@ fn candidate_paths(id: &str, workspace: Option<&str>) -> Vec<PathBuf> {
         "kimi_local" => workspace_path
             .map(|path| vec![path.join(".kimi-code").join("mcp.json")])
             .unwrap_or_default(),
-        "kimi_project" | "qoder_project" | "qoder_cn_project" => workspace_path
-            .map(|path| vec![path.join(".mcp.json")])
+        "kimi_project" | "qoder_project" | "qoder_cn_project" | "codebuddy_project" => {
+            workspace_path
+                .map(|path| vec![path.join(".mcp.json")])
+                .unwrap_or_default()
+        }
+        "codebuddy_user" => vec![codebuddy_home().join("mcp.json")],
+        "codebuddy_local" => workspace_path
+            .map(|path| vec![path.join(".codebuddy").join("mcp.json")])
             .unwrap_or_default(),
         "grok_user" => vec![grok_home().join("config.toml")],
         "grok_project" => workspace_path

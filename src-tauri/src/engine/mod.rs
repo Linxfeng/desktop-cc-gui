@@ -13,6 +13,7 @@ pub(crate) fn resolve_claude_channel_model(
     claude_channel::resolve_model(selected, Some(provider), env)
 }
 pub mod codex;
+pub mod codebuddy;
 mod codex_app;
 mod codex_provider_env;
 mod codex_read_only;
@@ -294,6 +295,7 @@ pub fn engine_by_id(id: &str) -> Option<Box<dyn Engine>> {
         "claude" => Some(Box::new(claude::ClaudeEngine::new())),
         "kimi" => Some(Box::new(kimi::KimiEngine)),
         "minimax" => Some(Box::new(minimax::MiniMaxEngine)),
+        "codebuddy" => Some(Box::new(codebuddy::CodeBuddyEngine::new())),
         "grok" => Some(Box::new(grok::GrokEngine)),
         "codex" => Some(Box::new(codex::CodexEngine)),
         "pi" => Some(Box::new(pi_family::pi())),
@@ -677,6 +679,12 @@ fn prepare_launch(
         ("claude", Some(provider)) => {
             claude_channel::apply(&mut built, provider, &channel_env, &req)
         }
+        ("codebuddy", Some(_)) => codebuddy::apply_channel(
+            &mut built,
+            &channel_env,
+            req.model.as_deref(),
+            &crate::paths::app_home().join("codebuddy-staging"),
+        ),
         ("kimi", Some(_)) => kimi::apply_channel(&mut built.command, &channel_env, &req),
         ("codex", Some(provider)) => {
             codex::apply_channel(&mut built.command, provider, &channel_env, &req)
@@ -2009,6 +2017,100 @@ mod prompt_contribution_tests {
             prompt,
             "visible\n\n[CCGUI internal system-tail]\nsystem context\n\n[CCGUI internal request-tail]\nrequest context"
         );
+    }
+}
+
+#[cfg(test)]
+mod codebuddy_launch_tests {
+    use super::*;
+
+    struct ScratchHome {
+        dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_profile: Option<std::ffi::OsString>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new() -> Self {
+            let lock = crate::paths::HOME_ENV_LOCK.lock();
+            let dir = std::env::temp_dir().join(format!(
+                "ccgui-codebuddy-launch-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("USERPROFILE", &dir);
+            Self {
+                dir,
+                previous_home,
+                previous_profile,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_profile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn channel_model_reaches_overlay_when_request_has_no_model() {
+        let home = ScratchHome::new();
+        let mut config = crate::config::CliConfig::default();
+        let section = config.section_mut("codebuddy").unwrap();
+        section.providers.insert(
+            "channel".into(),
+            serde_json::json!({"model":"channel-model"}),
+        );
+        section.current = Some("channel".into());
+        crate::paths::ensure_dirs().unwrap();
+        crate::settings::atomic_write(
+            &crate::paths::config_path(),
+            &serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let launch = prepare_launch(
+            "codebuddy",
+            home.dir.join("workspace").to_str().unwrap(),
+            None,
+            "hello".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(launch.req.model, None);
+        assert_eq!(launch.built.cleanup_files.len(), 1);
+        let overlay: Value = serde_json::from_slice(
+            &std::fs::read(&launch.built.cleanup_files[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overlay["model"], "channel-model");
+        assert_eq!(overlay["env"]["CODEBUDDY_MODEL"], "channel-model");
+        cleanup_staged_files(&launch.built.cleanup_files);
     }
 }
 

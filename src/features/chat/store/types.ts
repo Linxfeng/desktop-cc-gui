@@ -129,11 +129,12 @@ export interface ChatStore {
    * history list, migrating the engine pref off a disabled CLI. */
   refreshEngines: () => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
-  /** 登记工作区。成功时返回**登记后的路径**（后端会把 `\\wsl$` 归一成
-   *  `\\wsl.localhost`，两者不是同一个字符串），失败返回 null 并只留
-   *  actionError。调用方要接着开会话时必须用返回值，不能用自己手里的原始
-   *  路径，否则页签指向一个没有登记行的目录（见 handleAddWorkspace）。 */
-  addWorkspace: (path: string, meta?: Record<string, unknown>) => Promise<string | null>;
+  /** 登记工作区（单个 / 多个目录同一入口，侧栏「添加工作区」支持一次多选）：
+   *  返回真正登记成功且经后端归一化的路径（失败原因只留 actionError）——后端会把
+   *  `\\wsl$` 归一成 `\\wsl.localhost`，零工作区的「新建会话」必须取首个成功
+   *  返回值接着开待发会话，不能使用原始选择路径（见 use-chat-sidebar 的
+   *  handleAddWorkspace）。 */
+  addWorkspaces: (paths: string[]) => Promise<string[]>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
   removeWorkspace: (id: string) => Promise<void>;
   selectSession: (

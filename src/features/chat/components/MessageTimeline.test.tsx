@@ -611,3 +611,75 @@ describe("chat column width (宽幕布)", () => {
     expect(inner.className).toContain("max-w-[750px]");
   });
 });
+
+describe("process run fold timing", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(async () => {
+    await i18n.changeLanguage("zh");
+    useChatStore.setState({ thinkingAutoCollapse: true });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    useChatStore.setState({ thinkingAutoCollapse: true });
+  });
+
+  it("keeps a running process open and folds it only when answer text follows", async () => {
+    const messages: Message[] = [
+      { seq: 1, role: "user", text: "做一下", ts: null },
+      { seq: 2, role: "thinking", text: "先看文件", ts: null, live: true },
+      { seq: 3, role: "tool", text: "Read", ts: null },
+    ];
+    const renderSession = async (next: Message[]) => {
+      await act(async () => {
+        root.render(
+          <MessageTimeline
+            session={{ ...EMPTY_SESSION, messages: next, streaming: true }}
+            streaming
+            onLoadEarlier={() => {}}
+            workspacePath="/ws"
+          />,
+        );
+      });
+    };
+    const header = () => container.querySelector("button[aria-expanded]");
+
+    await renderSession(messages);
+    expect(header()!.getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain("先看文件");
+
+    // Thinking settled at the tool boundary, but no answer text yet: keep open.
+    await renderSession([...messages.slice(0, 2), { ...messages[2] }]);
+    expect(header()!.getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain("先看文件");
+
+    // Assistant text appears after the run: now fold.
+    await renderSession([
+      ...messages,
+      { seq: 4, role: "assistant", text: "答复", ts: null, live: true },
+    ]);
+    expect(header()!.getAttribute("aria-expanded")).toBe("false");
+    expect(container.textContent).toContain("答复");
+
+    // The next turn's process run opens; the previous turn's answer text must
+    // not keep marking the new run as answered.
+    await renderSession([
+      ...messages,
+      { seq: 4, role: "assistant", text: "答复", ts: null },
+      { seq: 5, role: "user", text: "再改一下", ts: null },
+      { seq: 6, role: "thinking", text: "第二轮分析", ts: null, live: true },
+    ]);
+    expect(
+      [...container.querySelectorAll("button[aria-expanded]")].map((button) =>
+        button.getAttribute("aria-expanded"),
+      ),
+    ).toEqual(["false", "true"]);
+    expect(container.textContent).toContain("第二轮分析");
+  });
+});

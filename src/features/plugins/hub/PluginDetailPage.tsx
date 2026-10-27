@@ -20,9 +20,9 @@ import {
   type PluginInfo,
   type PluginUpdate,
 } from "@/lib/ipc";
+import { githubAvatarUrl } from "@/lib/github-avatar";
 import {
   categorizePlugin,
-  githubAvatarUrl,
   githubLoginFor,
   indexUpdatedAt,
   isOfficialPlugin,

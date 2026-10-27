@@ -15,6 +15,7 @@ export type McpEngineId =
   | "qoder"
   | "qoder-cn"
   | "dsh"
+  | "codebuddy"
   | "pi";
 
 /** Backend source ids; the UI only renders them (`mcp.source.<id>`). */
@@ -41,6 +42,9 @@ export type McpConfigSource =
   | "qoder_cn_user"
   | "qoder_cn_local"
   | "qoder_cn_project"
+  | "codebuddy_user"
+  | "codebuddy_local"
+  | "codebuddy_project"
   | "dsh_profile";
 
 /** native（原生支持）/ plugin（由插件提供）/ none（不内置 MCP）。 */

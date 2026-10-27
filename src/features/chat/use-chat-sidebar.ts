@@ -9,7 +9,7 @@ import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/a
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { copyText } from "@/lib/clipboard";
 import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
-import { isWeb, pickDirectory } from "@/lib/platform";
+import { isWeb, pickDirectories } from "@/lib/platform";
 import { recentPointerAnchor } from "@/lib/pointer-anchor";
 import { parseDraftSessionKey, sessionKey, useChatStore, sortedWorkspaceGroups } from "./store";
 import { dismissCenterSurfaces } from "./center-surfaces";
@@ -58,12 +58,12 @@ export function useChatSidebar({
     })),
   );
   // Store actions are stable references — one shallow subscription for all.
-  const { selectSession, startNewChat, addWorkspace, reorderWorkspaces, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
+  const { selectSession, startNewChat, addWorkspaces, reorderWorkspaces, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
     useChatStore(
       useShallow((s) => ({
         selectSession: s.selectSession,
         startNewChat: s.startNewChat,
-        addWorkspace: s.addWorkspace,
+        addWorkspaces: s.addWorkspaces,
         reorderWorkspaces: s.reorderWorkspaces,
         pinSession: s.pinSession,
         archiveSession: s.archiveSession,
@@ -217,23 +217,24 @@ export function useChatSidebar({
     return result;
   }, [workspaces, archivedIds, workspaceAliases]);
 
-  /** 「添加工作区」：选目录并登记。返回**登记后的路径**（取消 / web 模式 /
-   *  登记失败返回 null），调用方据此接下一步——「新建会话」在没有工作区时要
-   *  接着把会话开出来，否则用户点的是新会话，拿到的只有一次选目录。用登记后
-   *  的路径而不是选中的原始路径：后端会把 `\\wsl$` 归一成 `\\wsl.localhost`，
-   *  原始路径没有对应的工作区行。登记失败时 store 已经把错误放进错误条，这里
+  /** 「添加工作区」：选目录并登记（对话框支持一次多选多个文件夹，逐个登记，
+   *  单个失败不影响其余）。返回首个登记成功且经后端归一化的路径（取消 / web
+   *  模式 / 全部失败返回 null），调用方据此接下一步——「新建会话」在没有工作区时
+   *  要接着把会话开出来。后端会把 `\\wsl$` 归一成 `\\wsl.localhost`，因此不能用
+   *  原始选择路径替代登记行的 path。登记失败时 store 已经把错误放进错误条，这里
    *  只负责不继续往下走。 */
   const handleAddWorkspace = useCallback(async (): Promise<string | null> => {
     // 移动端/网页访问模式没有目录选择器，侧栏也不渲染添加入口。
     if (isWeb) return null;
     try {
-      const path = await pickDirectory(t("chat.addWorkspace"));
-      if (!path) return null;
-      return await addWorkspace(path);
+      const paths = await pickDirectories(t("chat.addWorkspace"));
+      if (paths.length === 0) return null;
+      const added = await addWorkspaces(paths);
+      return added[0] ?? null;
     } catch {
       return null;
     }
-  }, [t, addWorkspace]);
+  }, [t, addWorkspaces]);
 
   const handleThreadSelect = useCallback(
     (id: string) => {

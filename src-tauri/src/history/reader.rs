@@ -956,6 +956,10 @@ fn delete_session_disk(engine: &str, path: &Path) -> Result<(), String> {
                 Err(e) => Err(format!("remove {}: {e}", path.display())),
             }
         }
+        // codebuddy: a session id can exist under more than one project dir
+        // (resume/move). The scan keeps the newest copy, so removing only the
+        // recorded path would let a sibling resurrect the session.
+        "codebuddy" => delete_codebuddy_session_disk(path),
         // opencode: the db row points at `storage/session/<project>/<id>.json`;
         // the transcript also lives in `storage/message/<id>/` and one
         // `storage/part/<msg>/` dir per message — all under the same storage root.
@@ -965,6 +969,40 @@ fn delete_session_disk(engine: &str, path: &Path) -> Result<(), String> {
         // 扫描"复活"(dsh 曾落进 kimi/grok 兜底 arm,锚定校验必失败而删不掉)。
         _ => Err(format!("delete_session: unknown engine {engine}")),
     }
+}
+
+/// codebuddy: single-file transcripts under CLI-private project dirs. Resolve
+/// the session id from the recorded file, then remove every copy before
+/// reporting success. A missing or confirmed-damaged recorded copy can use its
+/// filename stem; an unreadable copy cannot, because its real id is unknown.
+fn delete_codebuddy_session_disk(path: &Path) -> Result<(), String> {
+    let mut paths = vec![path.to_path_buf()];
+    let stem = || {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+    };
+    let session_id = match super::discovery::codebuddy_session_id(path) {
+        Ok(Some(session_id)) => Some(session_id),
+        Ok(None) => stem(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => stem(),
+        Err(_) => None,
+    };
+    if let Some(session_id) = session_id {
+        for sibling in super::discovery::codebuddy_session_paths(&session_id) {
+            if !paths.contains(&sibling) {
+                paths.push(sibling);
+            }
+        }
+    }
+    for candidate in paths {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", candidate.display())),
+        }
+    }
+    Ok(())
 }
 
 /// kimi/grok/dsh:db 行指向会话目录内的主转录本,删除整个会话目录
@@ -1810,6 +1848,52 @@ mod tests {
         dir
     }
 
+    struct CodebuddyConfigGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl CodebuddyConfigGuard {
+        fn set(config_dir: &Path) -> Self {
+            let lock = crate::history::scanner::tests::HOME_LOCK.lock();
+            let previous = std::env::var_os("CODEBUDDY_CONFIG_DIR");
+            std::env::set_var("CODEBUDDY_CONFIG_DIR", config_dir);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for CodebuddyConfigGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("CODEBUDDY_CONFIG_DIR", value),
+                None => std::env::remove_var("CODEBUDDY_CONFIG_DIR"),
+            }
+        }
+    }
+
+    fn write_codebuddy_copy(
+        config_dir: &Path,
+        project: &str,
+        file_name: &str,
+        session_id: &str,
+    ) -> PathBuf {
+        let project_dir = config_dir.join("projects").join(project);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join(file_name);
+        let line = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [],
+            "sessionId": session_id,
+            "cwd": "/ws",
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    }
+
     /// One omp rollout whose assistant turn carries two look-alike frames.
     fn write_session(path: &Path, workspace: &Path, text: &str) {
         let lines = [
@@ -2451,6 +2535,88 @@ mod tests {
                 assert_eq!(count, 1, "{engine}: {table}");
             }
         }
+    }
+
+    #[test]
+    fn delete_codebuddy_missing_recorded_copy_removes_all_duplicates() {
+        let scratch = Scratch::new();
+        let config_dir = scratch.0.join("codebuddy-config");
+        let _guard = CodebuddyConfigGuard::set(&config_dir);
+        let recorded = write_codebuddy_copy(&config_dir, "newest", "dup.jsonl", "dup");
+        let older = write_codebuddy_copy(&config_dir, "older", "older.jsonl", "dup");
+        let damaged = config_dir
+            .join("projects")
+            .join("damaged")
+            .join("dup.jsonl");
+        std::fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+        std::fs::write(&damaged, "not json\n").unwrap();
+        let unrelated = write_codebuddy_copy(&config_dir, "other", "other.jsonl", "other");
+        std::fs::remove_file(&recorded).unwrap();
+
+        delete_codebuddy_session_disk(&recorded).unwrap();
+
+        assert!(!recorded.exists());
+        assert!(!older.exists());
+        assert!(!damaged.exists());
+        assert!(unrelated.exists());
+        // A repeated delete still sees the desired disk state: everything is gone.
+        delete_codebuddy_session_disk(&recorded).unwrap();
+    }
+
+    #[test]
+    fn delete_codebuddy_damaged_recorded_copy_uses_stem() {
+        let scratch = Scratch::new();
+        let config_dir = scratch.0.join("codebuddy-config");
+        let _guard = CodebuddyConfigGuard::set(&config_dir);
+        let recorded = config_dir
+            .join("projects")
+            .join("recorded")
+            .join("dup.jsonl");
+        std::fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+        std::fs::write(&recorded, "not json\n").unwrap();
+        let sibling = write_codebuddy_copy(&config_dir, "sibling", "copy.jsonl", "dup");
+
+        delete_codebuddy_session_disk(&recorded).unwrap();
+
+        assert!(!recorded.exists());
+        assert!(!sibling.exists());
+    }
+
+    #[test]
+    fn delete_codebuddy_skips_unreadable_same_stem_with_different_id() {
+        let scratch = Scratch::new();
+        let config_dir = scratch.0.join("codebuddy-config");
+        let _guard = CodebuddyConfigGuard::set(&config_dir);
+        let recorded = write_codebuddy_copy(&config_dir, "recorded", "a.jsonl", "a");
+        let confirmed = write_codebuddy_copy(&config_dir, "confirmed", "copy.jsonl", "a");
+        let unreadable = write_codebuddy_copy(&config_dir, "uncertain", "a.jsonl", "B");
+        std::fs::remove_file(&recorded).unwrap();
+        crate::history::discovery::inject_codebuddy_head_io_error(&unreadable);
+
+        delete_codebuddy_session_disk(&recorded).unwrap();
+
+        assert!(!confirmed.exists());
+        assert!(unreadable.is_file());
+        // The one-shot failure is gone; the untouched file really belongs to B.
+        assert_eq!(
+            crate::history::discovery::codebuddy_session_id(&unreadable).unwrap(),
+            Some("B".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_codebuddy_returns_real_io_errors() {
+        let scratch = Scratch::new();
+        let config_dir = scratch.0.join("codebuddy-config");
+        let _guard = CodebuddyConfigGuard::set(&config_dir);
+        // remove_file on a directory fails on both Unix and Windows.
+        let recorded = scratch.0.join("not-a-transcript.jsonl");
+        std::fs::create_dir(&recorded).unwrap();
+
+        let error = delete_codebuddy_session_disk(&recorded).unwrap_err();
+
+        assert!(error.contains("remove "), "{error}");
+        assert!(recorded.is_dir());
     }
 
     /// qoder sessions are a single jsonl — the plain remove_file arm.

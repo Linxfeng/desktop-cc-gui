@@ -78,6 +78,23 @@ export async function pickDirectory(title: string): Promise<string | null> {
 }
 
 /**
+ * Multi-directory picker (「添加工作区」一次选多个目录): native dialog on
+ * desktop; on web there is no filesystem dialog, so fall back to typing one
+ * absolute path (same as pickDirectory). A cancelled dialog resolves to an
+ * empty list.
+ */
+export async function pickDirectories(title: string): Promise<string[]> {
+  if (isWeb) {
+    const entered = window.prompt(title);
+    const trimmed = entered?.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  const selected = await openDialog({ directory: true, multiple: true, title });
+  if (!selected) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}
+
+/**
  * File picker: native dialog on desktop; on web there is no filesystem
  * dialog, so fall back to typing the absolute path (same as pickDirectory).
  */

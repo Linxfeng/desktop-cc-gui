@@ -473,6 +473,13 @@ export interface ProviderModelList {
   models: string[];
   endpoint: string;
 }
+export interface CodeBuddyAccountStatus {
+  loggedIn: boolean;
+  /** "found" = credential store probe hit; "unknown" = the guessed service
+   *  names missed, which is not proof of being logged out. */
+  detection: "found" | "unknown";
+}
+
 
 export interface WorkspaceGroup {
   id: string;
@@ -495,6 +502,7 @@ export interface CliConfig {
   qoder: ProviderSection;
   "qoder-cn": ProviderSection;
   minimax: ProviderSection;
+  codebuddy: ProviderSection;
 }
 
 export interface AppSettings {
@@ -522,6 +530,7 @@ export interface AppSettings {
   qoderBin: string | null;
   qoderCnBin: string | null;
   minimaxBin: string | null;
+  codebuddyBin: string | null;
   defaultModels: Record<string, string>;
   /** Per-engine user-added custom model ids (设置 → CLI → 自定义模型). */
   customModels: Record<string, string[]>;
@@ -1011,6 +1020,13 @@ export interface RepositorySummary {
   untracked: number;
 }
 
+/** GitHub account behind a workspace's `origin` remote; non-github.com and
+ *  non-git workspaces are omitted. */
+export interface WorkspaceOwner {
+  path: string;
+  login: string;
+}
+
 /** Per-entry git state for one loaded tree level. `repository` marks an
  *  exact repo-root directory (blue name); plain folders never carry color. */
 export type FileTreeColor = "modified" | "untracked" | "repository";
@@ -1397,6 +1413,13 @@ export interface PetPackage extends PetSummary {
   frameCounts?: number[];
 }
 
+/** Native host and resolved shell behind a terminal PTY. Web-access clients
+ * must use this rather than their browser platform when quoting input. */
+export interface TerminalHostInfo {
+  platform: string;
+  shellPath: string;
+}
+
 export const ipc = {
   // config
   getCliConfig: () => invoke<CliConfig>("get_cli_config"),
@@ -1444,6 +1467,9 @@ export const ipc = {
     invoke<WslPiModelsRead>("wsl_pi_models_read", { distro }),
   wslPiModelsWrite: (distro: string, text: string, expectedHash?: string | null) =>
     invoke<void>("wsl_pi_models_write", { distro, text, expectedHash: expectedHash ?? null }),
+  // codebuddy account status
+  codebuddyAccountStatus: (force = false) =>
+    invoke<CodeBuddyAccountStatus>("codebuddy_account_status", { force }),
   // cc-switch interop
   checkCcSwitch: () => invoke<CcSwitchStatus>("check_cc_switch"),
   dismissCcSwitch: (hash: string) => invoke<void>("dismiss_cc_switch", { hash }),
@@ -1729,6 +1755,7 @@ export const ipc = {
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
   // terminal
+  terminalHostInfo: () => invoke<TerminalHostInfo>("terminal_host_info"),
   /** Idempotent: re-opening a live session id is a no-op on the backend. */
   terminalOpen: (args: { id: string; cwd: string; cols: number; rows: number }) =>
     invoke<void>("terminal_open", args),
@@ -1885,6 +1912,9 @@ export const ipc = {
   gitStatus: (path: string) => invoke<GitStatus>("git_status", { path }),
   gitRepositorySummaries: (paths: string[]) =>
     invoke<RepositorySummary[]>("git_repository_summaries", { paths }),
+  /** Owner avatars for sidebar rows (GitHub `origin` remote → login). */
+  gitWorkspaceOwners: (paths: string[]) =>
+    invoke<WorkspaceOwner[]>("git_workspace_owners", { paths }),
   gitFileColors: (path: string, files: string[]) =>
     invoke<Record<string, FileTreeColor>>("git_file_colors", { path, files }),
   gitTreeStatus: (levels: GitTreeLevel[]) =>

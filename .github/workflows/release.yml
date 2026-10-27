@@ -223,7 +223,25 @@ jobs:
             exit 1
           fi
 
-          xcrun stapler staple "$DMG"
+          # `stapler` re-fetches the ticket over CloudKit, so a single dropped
+          # connection (`NSURLErrorDomain -1005`, "The staple and validate
+          # action failed! Error 68") fails the step even though notary had
+          # already accepted the DMG — that is what killed the x86_64 job
+          # while arm64 stapled fine minutes earlier. Retry with backoff; a
+          # ticket that is genuinely bad still fails on every attempt.
+          stapled=0
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$DMG"; then
+              stapled=1
+              break
+            fi
+            echo "::warning::stapler attempt $attempt failed; retrying"
+            sleep $((attempt * 15))
+          done
+          if [ "$stapled" != 1 ]; then
+            echo "::error::could not staple the notary ticket onto $DMG"
+            exit 1
+          fi
 
       - name: Package artifacts
         run: |

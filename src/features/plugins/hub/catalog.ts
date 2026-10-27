@@ -108,13 +108,6 @@ export function isOfficialPlugin(entry: { author: string; repo?: string }): bool
   return githubLoginFor(entry)?.toLowerCase() === OFFICIAL_PLUGIN_LOGIN;
 }
 
-/** Real avatar from GitHub's username endpoint. 2× the CSS size keeps the
- *  chip crisp on retina; 460 is the largest size the endpoint accepts. */
-export function githubAvatarUrl(login: string, cssSize: number): string {
-  const size = Math.min(460, Math.max(1, Math.round(cssSize * 2)));
-  return `https://github.com/${login}.png?size=${size}`;
-}
-
 /** Index `updatedAt` (RFC 3339 UTC) → Date. An absent or unparsable stamp
  *  yields null so the detail rail skips the row instead of printing
  *  "Invalid Date" — the index is off-machine data, never trusted blindly. */

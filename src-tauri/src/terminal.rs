@@ -63,6 +63,24 @@ fn resolve_shell_path() -> String {
     }
 }
 
+/// Host facts needed to quote input for the shell that actually owns the PTY.
+/// This deliberately comes from the native host: web-access renderers may run
+/// on a different OS from the terminal.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalHostInfo {
+    platform: &'static str,
+    shell_path: String,
+}
+
+#[tauri::command]
+pub fn terminal_host_info() -> TerminalHostInfo {
+    TerminalHostInfo {
+        platform: std::env::consts::OS,
+        shell_path: resolve_shell_path(),
+    }
+}
+
 /// Force a UTF-8 locale so tools emitting non-ASCII (git, ls, CLIs) don't
 /// fall back to garbled C-locale output.
 fn resolve_locale() -> String {

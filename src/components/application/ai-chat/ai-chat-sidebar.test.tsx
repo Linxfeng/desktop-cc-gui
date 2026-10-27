@@ -409,6 +409,69 @@ it("keeps right-click inert when no thread handler is wired", async () => {
   expect(document.body.querySelector("[role='menu']")).toBeNull();
 });
 
+it("collapsed workspace groups keep their rows mounted for instant re-expand", async () => {
+  await act(async () => {
+    root.render(
+      <AiChatSidebar
+        repos={[]}
+        sections={[
+          {
+            id: "g1",
+            name: "开源项目",
+            repos: [repo("a"), repo("b")],
+          },
+        ]}
+      />,
+    );
+  });
+  const groupHeader = rowFor("开源项目");
+  const repoRow = rowFor("a");
+
+  await act(async () => groupHeader.click());
+
+  expect(groupHeader.getAttribute("aria-expanded")).toBe("false");
+  // Rows stay mounted under a clipped + inert region: remounting them would
+  // recreate the row avatar <img> and flash the folder fallback on re-expand.
+  const region = [...node.querySelectorAll<HTMLElement>("[aria-hidden='true']")].find(
+    (el) => (el.getAttribute("class") ?? "").includes("grid-rows-[0fr]"),
+  );
+  if (!region) throw new Error("no collapsed group region");
+  expect(region.hasAttribute("inert")).toBe(true);
+  expect(rowFor("a")).toBe(repoRow);
+
+  await act(async () => groupHeader.click());
+
+  expect(groupHeader.getAttribute("aria-expanded")).toBe("true");
+  // Same DOM node, so the avatar image (once loaded) is never reloaded.
+  expect(rowFor("a")).toBe(repoRow);
+});
+
+it("a group collapsed from a previous session mounts its rows on first expand", async () => {
+  localStorage.setItem(
+    "ccgui-next.sidebarCollapsedGroups:v1",
+    JSON.stringify(["g1"]),
+  );
+  await act(async () => {
+    root.render(
+      <AiChatSidebar
+        repos={[]}
+        sections={[{ id: "g1", name: "开源项目", repos: [repo("a")] }]}
+      />,
+    );
+  });
+  // keepMounted never force-mounts a group the user has not expanded in this
+  // session: a persisted-collapsed group costs no row/avatar work at startup.
+  expect(rowFor("开源项目").getAttribute("aria-expanded")).toBe("false");
+  expect(
+    [...node.querySelectorAll<HTMLElement>("button[aria-expanded]")].some((el) =>
+      el.textContent?.includes("a"),
+    ),
+  ).toBe(false);
+
+  await act(async () => rowFor("开源项目").click());
+  expect(rowFor("a")).toBeTruthy();
+});
+
 it("renders empty groups instead of hiding them", async () => {
   await act(async () => {
     root.render(

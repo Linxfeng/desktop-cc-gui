@@ -932,6 +932,9 @@ mod tests {
 
     fn init_repo(dir: &Path) -> git2::Repository {
         let repo = git2::Repository::init(dir).unwrap();
+        // These end-to-end cases explicitly create from `master`; do not let a
+        // user-level init.defaultBranch or libgit2 default change the fixture.
+        repo.set_head("refs/heads/master").unwrap();
         commit_file(&repo, dir, "init.txt", "one\n");
         repo
     }

@@ -118,6 +118,7 @@ export const en: Messages = {
     searchScopeTitle: "Title",
     searchScopeContent: "Content",
     addWorkspace: "Add workspace",
+    addWorkspaceHint: "Add workspace (you can select several folders at once)",
     removeWorkspace: "Remove workspace",
     newGroup: "New group",
     inputPlaceholder: "Type a message. Enter to send, Shift+Enter for newline, or @ to reference, # for agents",
@@ -817,7 +818,7 @@ export const en: Messages = {
     sendShortcutCmdEnterCtrl: "Ctrl+Enter",
     thinkingAutoCollapse: "Fold thinking when it finishes",
     thinkingAutoCollapseDesc:
-      "Turn off to keep the thinking process expanded after thinking settles (no layout jump); click the header to fold it manually",
+      "Turn off to keep the thinking process expanded during the turn; click the header to fold it manually",
     promptHistory: "History completion",
     promptHistoryDesc:
       "Tab accepts a history suggestion while typing; ↑↓ recall history when the input is empty",
@@ -994,6 +995,7 @@ export const en: Messages = {
       qoder: "Qoder CLI",
       "qoder-cn": "Qoder CLI (CN)",
       minimax: "MiniMax",
+      codebuddy: "CodeBuddy CLI",
     },
     cliManage: "CLI Management",
     groupSystem: "System",
@@ -1166,12 +1168,35 @@ export const en: Messages = {
     cliNotInstalledGroup: "Not installed",
     cliEdit: "Edit",
     cliDelete: "Delete",
+    codebuddyAccountTitle: "Account Login",
+    codebuddyAccountHint:
+      "Authenticate with Tencent Cloud / WeCom / WeChat account (/login)",
+    codebuddyAccountRefresh: "Refresh Status",
+    codebuddyAccountChecking: "Checking…",
+    codebuddyAccountCheckingDesc: "Reading the OS credential store",
+    codebuddyAccountError: "Status Check Failed",
+    codebuddyAccountErrorDesc: "Could not read the login status; try Refresh Status",
+    codebuddyAccountLoggedIn: "Logged In",
+    codebuddyAccountUnknown: "Status Unknown",
+    codebuddyAccountUnknownDesc:
+      "Could not confirm login state in the OS credential store; if you already ran /login in a terminal, it works as-is",
+    codebuddyAccountReady: "Credentials ready for chat",
+    codebuddyAccountLogin: "Terminal Login",
+    codebuddyAccountRelogin: "Switch Account",
+    codebuddyLoginNoWorkspace:
+      "Open a project first: the login runs in a workspace terminal",
+    codebuddyLoginFailed: "Could not open the login terminal",
     piAuthOauthTitle: "Subscription Authorization",
     piAuthOauthHint:
       "OAuth sign-in with automatic token refresh, stored by the CLI itself",
     piAuthSubscribed: "Authorized · auto-refresh",
     piAuthNotSubscribed: "Not authorized",
     piAuthLogin: "Sign in",
+    piAuthLogout: "Sign out",
+    piAuthGoToLogout: "Go to sign out",
+    piAuthLogoutConfirm: "Sign out of {{name}} in the terminal? This may affect all authorized accounts for this provider.",
+    piAuthGoToLogoutConfirm: "Open Pi to sign out of {{name}}? Choose the account in the CLI.",
+    piAuthLogoutNoWorkspace: "Open a project first; sign-out runs in the built-in terminal",
     piAuthLoginNoWorkspace:
       "Open a project first — OAuth sign-in runs in the built-in terminal",
     piAuthOauthDescClaude: "Claude Pro / Max subscription",
@@ -1242,6 +1267,7 @@ export const en: Messages = {
 
     langZh: "中文",
     langEn: "English",
+    langKo: "한국어",
     grantedRoots: "Granted Directories",
     grantedRootsDesc:
       "Directories outside workspaces that you explicitly allowed",
@@ -1532,6 +1558,7 @@ export const en: Messages = {
     installingPct: "Installing {{pct}}%",
     installPickTitle: "Choose a plugin directory (with manifest.json)",
     assetPickTitle: "Choose a resource directory for this plugin",
+    assetFilePickTitle: "Choose a resource file and allow this plugin to read its parent directory",
     uninstall: "Uninstall",
     uninstallConfirm: 'Uninstall plugin "{{name}}"? (its saved data is kept for 30 days)',
     reload: "Reload",
@@ -2300,6 +2327,9 @@ export const en: Messages = {
       qoder_cn_user: "User settings.json",
       qoder_cn_local: "Workspace settings.local.json",
       qoder_cn_project: "Project .mcp.json (shared)",
+      codebuddy_user: "User mcp.json",
+      codebuddy_local: "Workspace .codebuddy/mcp.json",
+      codebuddy_project: "Project .mcp.json (shared)",
       dsh_profile: "Profile plugin config",
     },
     scope: {

@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
+import { githubAvatarUrl } from "@/lib/github-avatar";
 import type { MarketPlugin } from "@/lib/ipc";
-import { githubAvatarUrl, githubLoginFor, isOfficialPlugin } from "./catalog";
+import { githubLoginFor, isOfficialPlugin } from "./catalog";
 import { MarketActionButton } from "./MarketActionButton";
 import { PluginAvatar } from "./PluginAvatar";
 

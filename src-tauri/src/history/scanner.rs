@@ -1,8 +1,8 @@
 use super::discovery::{
-    codex_candidates, discover_agy, discover_claude, discover_grok, discover_kimi,
-    discover_minimax, discover_opencode, discover_qoder, dsh_candidates, identify_head,
-    is_codex_subagent_file, is_dsh_subagent_file, opencode_db_visible_sessions, path_is_under,
-    pi_family_candidates,
+    codebuddy_transcripts, codex_candidates, discover_agy, discover_claude, discover_codebuddy_in,
+    discover_grok, discover_kimi, discover_minimax, discover_opencode, discover_qoder,
+    dsh_candidates, identify_head, is_codex_subagent_file, is_dsh_subagent_file,
+    opencode_db_visible_sessions, path_is_under, pi_family_candidates,
 };
 use super::{same_or_child, scan_summary_file, split_opencode_db_path, stat_signature, ScanSummary};
 use serde::Serialize;
@@ -77,10 +77,14 @@ pub(super) fn scan_with_guard(
 
 // ---------- phase helpers (each stage is lock-free except where noted) ----------
 
-/// Enumerate every candidate session file (readdir/index only, no content).
+/// Enumerate every candidate session file (filename/index engines use no content).
 fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // CodeBuddy project dirs are CLI-private, so attribution needs each
+    // transcript's recorded cwd. Its bounded cache reads only new/changed heads,
+    // once per file rather than once per workspace.
+    let codebuddy = codebuddy_transcripts();
     for workspace_path in workspaces {
         let workspace = PathBuf::from(workspace_path);
         // Filename/index-keyed engines identify cheaply per workspace.
@@ -99,6 +103,7 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
                 crate::engine::qoder::QoderDistribution::Cn,
             ))
             .chain(discover_opencode(&workspace))
+            .chain(discover_codebuddy_in(&codebuddy, &workspace))
         {
             if seen_paths.insert(file.file_path.clone()) {
                 candidates.push(Candidate {
@@ -1022,6 +1027,108 @@ pub(super) mod tests {
             assert_eq!(preview, "answer");
         }
         assert_eq!(scan_with(&db, || {})?.reparsed, 0);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn scan_codebuddy_reads_only_new_or_changed_identity_heads() -> Result<(), String> {
+        let home = scratch_dir(&format!("scan-codebuddy-cache-{}", uuid::Uuid::new_v4()));
+        let workspace_a = home.join("ws-a");
+        let workspace_b = home.join("ws-b");
+        let config_dir = home.join("codebuddy-config");
+        let project_dir = config_dir.join("projects").join("private-project-name");
+        std::fs::create_dir_all(&workspace_a).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&workspace_b).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&project_dir).map_err(|e| e.to_string())?;
+        let first = project_dir.join("first.jsonl");
+        let second = project_dir.join("second.jsonl");
+        let write_transcript = |path: &Path, id: &str, cwd: &Path, title: &str| {
+            let line = serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": title}],
+                "sessionId": id,
+                "cwd": cwd.to_string_lossy(),
+            });
+            std::fs::write(path, format!("{line}\n")).map_err(|e| e.to_string())
+        };
+        write_transcript(&first, "first", &workspace_a, "first title")?;
+
+        let _home_guard = HomeGuard::set(&home);
+        struct ConfigGuard(Option<std::ffi::OsString>);
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CODEBUDDY_CONFIG_DIR", value),
+                    None => std::env::remove_var("CODEBUDDY_CONFIG_DIR"),
+                }
+            }
+        }
+        let previous_config = std::env::var_os("CODEBUDDY_CONFIG_DIR");
+        std::env::set_var("CODEBUDDY_CONFIG_DIR", &config_dir);
+        let _config_guard = ConfigGuard(previous_config);
+
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        {
+            let conn = db.0.lock();
+            for (id, workspace) in [("wa", &workspace_a), ("wb", &workspace_b)] {
+                conn.execute(
+                    "INSERT INTO workspaces(id, path, name) VALUES(?1, ?2, ?2)",
+                    rusqlite::params![id, workspace.to_string_lossy()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        let workspace_for = |id: &str| {
+            db.0.lock()
+                .query_row(
+                    "SELECT workspace_path FROM sessions WHERE engine='codebuddy' AND session_id=?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())
+        };
+
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("first")?, workspace_a.to_string_lossy().as_ref());
+
+        // The tier-1 no-op path still enumerates CodeBuddy before its gate, but
+        // the unchanged transcript's content must not be opened again.
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 0);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 0);
+
+        // A newly appearing file changes the tier-1 signature. Identify only
+        // that file; the existing head remains cached.
+        write_transcript(&second, "second", &workspace_b, "second title")?;
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("second")?, workspace_b.to_string_lossy().as_ref());
+
+        // Changing size and recorded cwd invalidates just this head and updates
+        // the complete history row through the normal scan pipeline.
+        write_transcript(&second, "second", &workspace_a, "updated second title")?;
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("second")?, workspace_a.to_string_lossy().as_ref());
+        let title: String = db
+            .0
+            .lock()
+            .query_row(
+                "SELECT title FROM sessions WHERE engine='codebuddy' AND session_id='second'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        assert_eq!(title, "updated second title");
+
+        drop(workspace_for);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())

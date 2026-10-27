@@ -453,6 +453,7 @@ pub fn run() {
             plugins::storage::plugin_document_storage_remove,
             plugins::storage::plugin_document_storage_list,
             plugins::assets::plugin_asset_grant_directory,
+            plugins::assets::plugin_asset_grant_file,
             plugins::assets::plugin_asset_list_directories,
             plugins::assets::plugin_asset_revoke_directory,
             plugins::assets::plugin_reveal_path,
@@ -495,6 +496,7 @@ pub fn run() {
             engine::wsl_notice::wsl_take_unproven_notices,
             settings::set_wsl_engine_path,
             settings::get_wsl_engine_paths,
+            engine::codebuddy::codebuddy_account_status,
             engine::pi_family_auth::pi_family_auth_list,
             engine::pi_family_auth::pi_family_auth_set_api_key,
             engine::pi_family_auth::pi_family_auth_delete_credential,
@@ -593,6 +595,7 @@ pub fn run() {
             // git
             git::git_status,
             git::git_repository_summaries,
+            git::git_workspace_owners,
             git::git_file_colors,
             git::git_tree_status,
             git::git_diff,
@@ -617,6 +620,7 @@ pub fn run() {
             open_app::get_program_icon,
             open_app::reveal_in_file_manager,
             // terminal
+            terminal::terminal_host_info,
             terminal::terminal_open,
             terminal::terminal_write,
             terminal::terminal_resize,

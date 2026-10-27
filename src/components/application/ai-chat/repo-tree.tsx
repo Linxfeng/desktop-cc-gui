@@ -14,6 +14,7 @@ import Plus from "lucide-react/dist/esm/icons/plus";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import X from "lucide-react/dist/esm/icons/x";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
+import { WorkspaceAvatar } from "@/components/application/ai-chat/workspace-avatar";
 import { paginateThreads } from "@/components/application/ai-chat/repo-pagination";
 import { ipc } from "@/lib/ipc";
 import { useWorktreeStore } from "@/features/worktree/store";
@@ -309,7 +310,8 @@ function RepoHeaderRow({
           isDragging && "cursor-grabbing",
         )}
       >
-        {/* One slot, two affordances: folder by default; on row hover it
+        {/* One slot, two affordances: the repo's GitHub owner avatar when its
+            origin remote has one (else the folder glyph); on row hover it
             fades out and the reorder grip fades in (when reorder is
             enabled). Plain click toggles collapse; press-and-move drags. */}
         <span
@@ -319,7 +321,10 @@ function RepoHeaderRow({
           )}
           aria-hidden
         >
-          <Icon className="size-4 text-foreground-icon-secondary" />
+          <WorkspaceAvatar
+            path={repo.path}
+            fallback={<Icon className="size-4 text-foreground-icon-secondary" />}
+          />
         </span>
         {dragHandleProps && (
           <span
@@ -634,16 +639,26 @@ function prefersReducedMotion(): boolean {
 }
 
 /** Height disclosure shared by the sidebar's expandable regions (repo thread
- *  lists, the WORKTREES group): the grid track goes 1fr ⇄ 0fr so the region's
- *  real box grows and shrinks and the rows below are pushed smoothly.
- *  Content stays mounted until the close animation ends (instant unmount
- *  pops; unmount + opacity fade leaves a compositor ghost), then drops out of
- *  the DOM and the a11y tree. Reduced motion cuts straight to the end. */
-function SidebarDisclosure({
+ *  lists, the WORKTREES group, workspace groups): the grid track goes
+ *  1fr ⇄ 0fr so the region's real box grows and shrinks and the rows below
+ *  are pushed smoothly. Content stays mounted until the close animation ends
+ *  (instant unmount pops; unmount + opacity fade leaves a compositor ghost),
+ *  then drops out of the DOM and the a11y tree. Reduced motion cuts straight
+ *  to the end.
+ *
+ *  `keepMounted` is for regions whose rows must keep their DOM identity —
+ *  workspace groups (their row avatars re-decode and flash the folder glyph
+ *  when a remount recreates the `<img>`): once shown, the closed rows stay in
+ *  the DOM behind `inert` + `aria-hidden`. A group that starts collapsed is
+ *  still mounted lazily on its first expand, so never-seen rows cost nothing
+ *  at startup. */
+export function SidebarDisclosure({
   expanded,
+  keepMounted = false,
   children,
 }: {
   expanded: boolean;
+  keepMounted?: boolean;
   children: ReactNode;
 }) {
   const [mounted, setMounted] = useState(expanded);
@@ -652,13 +667,16 @@ function SidebarDisclosure({
       setMounted(true);
       return;
     }
+    // keepMounted only protects rows that have already been shown; it never
+    // force-mounts a group the user has not expanded yet.
+    if (keepMounted) return;
     if (prefersReducedMotion()) {
       setMounted(false);
       return;
     }
     const timeout = window.setTimeout(() => setMounted(false), SIDEBAR_COLLAPSE_MS);
     return () => window.clearTimeout(timeout);
-  }, [expanded]);
+  }, [expanded, keepMounted]);
 
   return (
     <div

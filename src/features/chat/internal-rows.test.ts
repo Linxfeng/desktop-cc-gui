@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { en } from "@/i18n/en";
+import { ko } from "@/i18n/ko";
 import { zh } from "@/i18n/zh";
 import {
   COMPACT_COMMAND_TEXT,
@@ -19,6 +20,7 @@ describe("host compaction rows", () => {
   it("recognises the resume nudge in every shipped locale", () => {
     expect(isResumeNudgeRow({ role: "user", text: zh.chat.autoCompactResume })).toBe(true);
     expect(isResumeNudgeRow({ role: "user", text: en.chat.autoCompactResume })).toBe(true);
+    expect(isResumeNudgeRow({ role: "user", text: ko.chat.autoCompactResume })).toBe(true);
   });
 
   // The nudge goes through the ordinary send path, which appends extra text

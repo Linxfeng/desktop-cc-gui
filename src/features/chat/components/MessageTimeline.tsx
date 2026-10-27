@@ -51,6 +51,7 @@ const TimelineRowView = memo(function TimelineRowView({
   workspacePath,
   turnLive,
   autoExpand,
+  answered,
   thinkingAutoCollapse,
   seenTools,
   searchTarget,
@@ -59,9 +60,13 @@ const TimelineRowView = memo(function TimelineRowView({
   workspacePath: string;
   /** True while the current turn is still streaming; suppresses the footer. */
   turnLive: boolean;
-  /** True on the timeline's last process row: it rides open until a newer
-   * one appears, and stays open once the turn settles. */
+  /** True on the timeline's last process row: it opens on arrival and rides
+   * the live tail; a thinking run may still fold once answer text follows it
+   * or the turn ends. */
   autoExpand: boolean;
+  /** True when assistant text exists after this process run in the same turn:
+   *  the point the run may fold instead of disappearing mid-process. */
+  answered: boolean;
   /** False keeps a settled thinking row expanded (设置 → 通用 → 行为). */
   thinkingAutoCollapse: boolean;
   seenTools: Set<string>;
@@ -93,6 +98,7 @@ const TimelineRowView = memo(function TimelineRowView({
         items={row.items}
         autoExpand={autoExpand}
         turnLive={turnLive}
+        answered={answered}
         thinkingAutoCollapse={thinkingAutoCollapse}
         processId={row.firstSeq}
         seenTools={seenTools}
@@ -561,6 +567,27 @@ export const MessageTimeline = memo(function MessageTimeline({
     }
     return null;
   }, [rows]);
+  // Whether assistant text follows a process run in the same turn. That is
+  // when the run may fold (setting on): folding on a thinking-settled edge
+  // hides a process whose tools are still running. O(n) reverse scan, reset
+  // at every user/curtain turn boundary.
+  const processAnswered = useMemo(() => {
+    const answered = new Array<boolean>(rows.length).fill(false);
+    let textAfter = false;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.kind === "curtain") {
+        textAfter = false;
+      } else if (row.kind === "process") {
+        answered[i] = textAfter;
+      } else if (row.message.role === "user") {
+        textAfter = false;
+      } else if (row.message.role === "assistant") {
+        textAfter = true;
+      }
+    }
+    return answered;
+  }, [rows]);
   // Live stream rows are ordinary rows that grow in place; the only extra
   // tail item is the turn-status indicator below them.
   // The tail indicator stays mounted AND visible for the whole turn — a
@@ -760,6 +787,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                       rowKey(rows[item.index]) === lastProcessKey ||
                       item.index === currentSearchRow
                     }
+                    answered={processAnswered[item.index]}
                     thinkingAutoCollapse={thinkingAutoCollapse}
                     seenTools={seenTools}
                     searchTarget={item.index === currentSearchRow ? processSearchTarget : undefined}

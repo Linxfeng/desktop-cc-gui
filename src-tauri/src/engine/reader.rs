@@ -902,13 +902,19 @@ impl Drop for VirtualRunGuard {
     }
 }
 
-/// Remove leftover channel staging dirs (`claude-staging`/`grok-staging`
-/// under app_home) from a crashed run: they hold per-send credentials and
-/// must not linger on disk. Live runs recreate them per send, so sweeping
-/// at startup is safe. Only these two known names are touched.
+/// Remove leftover staging dirs (`claude-staging`/`grok-staging`/
+/// `codex-plan-staging`/`codebuddy-staging` under app_home) from a crashed
+/// run: they hold per-send credentials and must not linger on disk. Live runs
+/// recreate them per send, so sweeping at startup is safe. Only these known
+/// names are touched.
 pub fn sweep_staging_dirs() {
     let home = crate::paths::app_home();
-    for name in ["claude-staging", "grok-staging", "codex-plan-staging"] {
+    for name in [
+        "claude-staging",
+        "grok-staging",
+        "codex-plan-staging",
+        "codebuddy-staging",
+    ] {
         let dir = home.join(name);
         if dir.exists() {
             if let Err(error) = std::fs::remove_dir_all(&dir) {

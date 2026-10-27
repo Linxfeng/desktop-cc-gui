@@ -49,7 +49,7 @@ function useWslBackend(distro: string): PiFamilyAuthBackend {
 export function WslPiAuthSection({ distro }: { distro: string }) {
   const { t } = useTranslation();
   const backend = useWslBackend(distro);
-  // WSL 无内置终端：登录按钮不渲染，PiFamilyOauthSection 改为降级说明。
+  // WSL 无内置终端：登录按钮改为降级说明，也不提供 host 终端登出入口。
   const onLaunchLogin = useCallback(() => {}, []);
   const auth = usePiFamilyAuthState("pi", backend, onLaunchLogin);
 
@@ -60,6 +60,7 @@ export function WslPiAuthSection({ distro }: { distro: string }) {
         providers={auth.oauthProviders}
         oauthActive={auth.oauthActive}
         onLaunchLogin={null}
+        onLaunchLogout={null}
       />
 
       <PiFamilyApiKeySection

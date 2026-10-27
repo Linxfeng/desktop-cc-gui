@@ -3,9 +3,8 @@
  * `usePiFamilyAuth` (shared with the WSL panel); this file binds it to the
  * host IPC backend (`pi_family_*`) and the built-in terminal OAuth launch.
  *
- * - 订阅授权 group (PiFamilyOauthSection): read-only OAuth status + a 登录
- *   button that hands the interactive flow to the built-in terminal
- *   (`launchPiFamilyLogin`).
+ * - 订阅授权 group (PiFamilyOauthSection): OAuth status + CLI-owned login/logout
+ *   flows in the built-in terminal.
  * - API Key group (PiFamilyApiKeySection): search / featured-vs-all /
  *   three-state rows / inline key editor / delete with confirmation. Keys
  *   never round-trip to the frontend — list carries only a masked display
@@ -25,8 +24,13 @@ import { useNavigate } from "react-router-dom";
 import { ConfirmDialog } from "@/components/dialogs";
 import { ipc } from "@/lib/ipc";
 import { PI_FAMILY_APIKEY_PROVIDERS } from "./piFamilyAuthCatalog";
-import { launchPiFamilyLogin } from "./piFamilyLogin";
+import {
+  launchPiFamilyLogin,
+  launchPiFamilyLogout,
+  waitForPiFamilyLogout,
+} from "./piFamilyLogin";
 import type { PiFamilyOauthProvider } from "./piFamilyAuthCatalog";
+import { notifyCliConfigChanged } from "./providers";
 import { PiFamilyApiKeySection } from "./PiFamilyApiKeySection";
 import {
   PiFamilyCustomSection,
@@ -63,6 +67,8 @@ export function PiFamilyAuthSection({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const backend = useHostBackend(engine);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [logoutTarget, setLogoutTarget] = useState<PiFamilyOauthProvider | null>(null);
   // The CLI owns the interactive OAuth flow: close the settings overlay so
   // the user sees the terminal the login runs in.
   const onLaunchLogin = useCallback(
@@ -77,8 +83,29 @@ export function PiFamilyAuthSection({
     },
     [engine, navigate, t],
   );
-  const [notice, setNotice] = useState<string | null>(null);
   const auth = usePiFamilyAuthState(engine, backend, onLaunchLogin, openCustomEditorSignal);
+
+  const handleConfirmLogout = useCallback(async () => {
+    if (!logoutTarget) return;
+    const target = logoutTarget;
+    const providerId = target.statusIds.find((id) => auth.oauthActive.has(id));
+    setLogoutTarget(null);
+    // The credential state may have changed while the confirmation was open.
+    if (!providerId) return;
+    try {
+      const launched = await launchPiFamilyLogout(engine, providerId);
+      if (!launched) {
+        setNotice(t("settings.piAuthLogoutNoWorkspace"));
+        return;
+      }
+      navigate("/");
+      void waitForPiFamilyLogout(engine, target.statusIds).then((changed) => {
+        if (changed) notifyCliConfigChanged(engine);
+      });
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, [auth.oauthActive, engine, logoutTarget, navigate, t]);
 
   return (
     <div className="flex w-full flex-col gap-6" data-testid="pi-family-auth-section">
@@ -94,6 +121,7 @@ export function PiFamilyAuthSection({
         providers={auth.oauthProviders}
         oauthActive={auth.oauthActive}
         onLaunchLogin={auth.handleLaunchLogin}
+        onLaunchLogout={setLogoutTarget}
       />
 
       {/* ── API Key ── */}
@@ -157,6 +185,14 @@ export function PiFamilyAuthSection({
           message={t("settings.piAuthDeleteConfirm", { name: auth.deleteTarget.name })}
           onConfirm={() => void auth.handleDelete()}
           onCancel={() => auth.setDeleteTarget(null)}
+        />
+      )}
+      {logoutTarget && (
+        <ConfirmDialog
+          danger
+          message={t(engine === "pi" ? "settings.piAuthGoToLogoutConfirm" : "settings.piAuthLogoutConfirm", { name: logoutTarget.name })}
+          onConfirm={() => void handleConfirmLogout()}
+          onCancel={() => setLogoutTarget(null)}
         />
       )}
       {auth.customDeleteTarget && (
