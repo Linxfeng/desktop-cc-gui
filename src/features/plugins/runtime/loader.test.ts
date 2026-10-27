@@ -207,6 +207,43 @@ describe("loader", () => {
     expect(getPluginState("lp-future")).toBe("incompatible");
   });
 
+  it("compares minAppVersion against the fork version's base (1.1.8-fork.1 ≙ 1.1.8)", async () => {
+    // fork 版本带 -fork.N 后缀，SDK 的 compareVersions 只认纯数字段：校验按
+    // 基线比较，不低于基线的 minAppVersion 不得把插件判成 incompatible。
+    const baseCase = fakeBackend();
+    baseCase.appVersion = async () => "1.1.8-fork.1";
+    let baseRan = false;
+    await loadPlugin(
+      {
+        info: info("lp-fork-base", { minAppVersion: "1.1.8" }),
+        manifest: builtinManifest("lp-fork-base"),
+        builtinActivate: () => {
+          baseRan = true;
+        },
+      },
+      baseCase,
+    );
+    expect(baseRan).toBe(true);
+    expect(getPluginState("lp-fork-base")).toBe("active");
+
+    // 高于基线的要求仍然拒绝。
+    const futureCase = fakeBackend();
+    futureCase.appVersion = async () => "1.1.8-fork.1";
+    let futureRan = false;
+    await loadPlugin(
+      {
+        info: info("lp-fork-future", { minAppVersion: "1.1.9" }),
+        manifest: builtinManifest("lp-fork-future"),
+        builtinActivate: () => {
+          futureRan = true;
+        },
+      },
+      futureCase,
+    );
+    expect(futureRan).toBe(false);
+    expect(getPluginState("lp-fork-future")).toBe("incompatible");
+  });
+
   it("loads a declarative plugin from directory files and unloads its CSS", async () => {
     const backend = fakeBackend({
       "lp-css/manifest.json": JSON.stringify({

@@ -27,22 +27,35 @@ function readLastSeenVersion(): string | null {
 
 /**
  * 版本号比较：`a` 比 `b` 新返回正数、旧返回负数、相同返回 0。段位按数字比、
- * 缺位补 0；段位不是纯数字（预发布后缀之类）一律按「认不出」处理成相等——
+ * 缺位补 0。本 fork 的版本带 `-fork.N` 修订后缀（如 1.1.8-fork.1）：先比数字
+ * 基线，基线相同时裸基线视为 fork 线的起点，带 `-fork.N` 的修订比它新、再按
+ * N 比。其余认不出的形式（其他预发布后缀之类）一律按「认不出」处理成相等——
  * 宁可少宣布一次，也不把降级或认不出的版本号说成「新版本」。
  */
 export function compareVersions(a: string, b: string): number {
-  const segments = (version: string) =>
-    normalizeVersion(version)
-      .split(".")
-      .map((part) => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
-  const left = segments(a);
-  const right = segments(b);
-  if (left.some(Number.isNaN) || right.some(Number.isNaN)) return 0;
-  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
-    const diff = (left[i] ?? 0) - (right[i] ?? 0);
+  const parse = (version: string) => {
+    const normalized = normalizeVersion(version);
+    const forkMatch = normalized.match(/^(.*)-fork\.(\d+)$/);
+    const base = forkMatch ? forkMatch[1] : normalized;
+    const fork = forkMatch ? Number(forkMatch[2]) : null;
+    const segments = base.split(".").map((part) => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
+    if (segments.some(Number.isNaN)) return null;
+    return { segments, fork };
+  };
+  const left = parse(a);
+  const right = parse(b);
+  if (!left || !right) return 0;
+  for (let i = 0; i < Math.max(left.segments.length, right.segments.length); i += 1) {
+    const diff = (left.segments[i] ?? 0) - (right.segments[i] ?? 0);
     if (diff !== 0) return diff > 0 ? 1 : -1;
   }
-  return 0;
+  // 数字基线相同：裸基线视作 fork 线的起点，-fork.N 修订排在其后并按 N 比。
+  if (left.fork === null || right.fork === null) {
+    if (left.fork === right.fork) return 0;
+    return left.fork === null ? -1 : 1;
+  }
+  if (left.fork === right.fork) return 0;
+  return left.fork > right.fork ? 1 : -1;
 }
 
 /**

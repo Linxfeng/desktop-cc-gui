@@ -351,6 +351,7 @@ fn fresh_negative(distro: &str) -> Option<ProbeError> {
 }
 
 /// `%SystemRoot%\System32\wsl.exe`。不从 PATH 解析,避免同名程序劫持。
+#[cfg(windows)]
 pub(crate) fn wsl_exe() -> Result<std::path::PathBuf, ProbeError> {
     let root = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)

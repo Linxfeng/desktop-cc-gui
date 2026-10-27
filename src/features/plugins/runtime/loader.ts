@@ -117,6 +117,12 @@ function disposeHandle(handle: PluginHandle): void {
 
 const CRASH_QUARANTINE_THRESHOLD = 3;
 
+/** 版本串去掉 `-prerelease` / `+build` 后缀后的数字基线（"1.1.8-fork.1" →
+ *  "1.1.8"）。fork 构建包含其基线的全部内容，基线比较即 fork 语义。 */
+function baseVersion(version: string): string {
+  return version.split(/[-+]/, 1)[0] ?? version;
+}
+
 interface ActivePlugin {
   handle: PluginHandle;
   /** Cleanup returned by activate (runs before the disposer stack). */
@@ -255,7 +261,10 @@ export async function loadPlugin(
   loading.add(id);
   try {
     const appVersion = await backend.appVersion();
-    if (info.minAppVersion && compareVersions(info.minAppVersion, appVersion) > 0) {
+    // Fork 版本带 -fork.N 后缀（如 1.1.8-fork.1），SDK 的 compareVersions 只认
+    // 纯数字段；minAppVersion 按基线比较——fork 构建包含其基线的全部内容。
+    // 传给插件上下文的仍是完整版本串（ctx.host.appVersion 如实暴露）。
+    if (info.minAppVersion && compareVersions(info.minAppVersion, baseVersion(appVersion)) > 0) {
       setState(id, "incompatible", `requires app ≥ ${info.minAppVersion}`);
       return;
     }

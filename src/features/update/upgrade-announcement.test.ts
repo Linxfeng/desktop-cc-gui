@@ -134,4 +134,16 @@ describe("compareVersions", () => {
     expect(compareVersions("1.1.0-beta.1", "1.0.9")).toBe(0);
     expect(compareVersions("1.0.9-beta.1", "1.0.9")).toBe(0);
   });
+
+  it("orders the fork's -fork.N revision scheme", () => {
+    // 基线相同：-fork.N 修订比裸基线新，N 按数字比。
+    expect(compareVersions("1.1.8-fork.1", "1.1.8")).toBeGreaterThan(0);
+    expect(compareVersions("1.1.8", "1.1.8-fork.1")).toBeLessThan(0);
+    expect(compareVersions("1.1.8-fork.2", "1.1.8-fork.1")).toBeGreaterThan(0);
+    expect(compareVersions("1.1.8-fork.1", "1.1.8-fork.1")).toBe(0);
+    // 基线不同仍先比基线（合并上游新版后 fork 修订整体前进）。
+    expect(compareVersions("1.1.9-fork.1", "1.1.8-fork.2")).toBeGreaterThan(0);
+    expect(compareVersions("1.1.8-fork.2", "1.1.9-fork.1")).toBeLessThan(0);
+    expect(compareVersions("v1.1.8-fork.1", "1.1.8-fork.1")).toBe(0);
+  });
 });

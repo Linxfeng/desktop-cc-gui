@@ -174,8 +174,15 @@ pub(crate) fn validate_manifest(
                 manifest.id
             )
         })?;
-        let current = semver_triple(env!("CARGO_PKG_VERSION"))
-            .ok_or_else(|| format!("unparseable app version {}", env!("CARGO_PKG_VERSION")))?;
+        // 应用自身的版本可能带 -fork.N 后缀（如 1.1.8-fork.1）：按基线比较，
+        // fork 构建包含其基线的全部内容。minAppVersion 本身仍要求纯 x.y.z。
+        let current = semver_triple(
+            env!("CARGO_PKG_VERSION")
+                .split(['-', '+'])
+                .next()
+                .unwrap_or_default(),
+        )
+        .ok_or_else(|| format!("unparseable app version {}", env!("CARGO_PKG_VERSION")))?;
         if required > current {
             return Err(format!(
                 "{}: requires app >= {min}, this is {}",

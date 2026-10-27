@@ -34,8 +34,8 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::版本号格式应为 X.Y.Z，收到: '$INPUT_VERSION'"
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-fork\.[0-9]+)?$ ]]; then
+            echo "::error::版本号格式应为 X.Y.Z 或 X.Y.Z-fork.N，收到: '$INPUT_VERSION'"
             exit 1
           fi
           CONFIG_VERSION=$(python3 -c "import json,pathlib;print(json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version'])")
@@ -48,231 +48,6 @@ jobs:
             exit 1
           fi
           echo "version check ok: v${INPUT_VERSION}"
-
-  build_macos:
-    name: macos (${{ matrix.arch }})
-    runs-on: ${{ matrix.platform }}
-    environment: release
-    needs: preflight
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            arch: aarch64
-          - platform: macos-15-intel
-            arch: x86_64
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "10.13"
-      CODESIGN_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
-      NOTARY_PROFILE_NAME: ${{ vars.NOTARY_PROFILE_NAME }}
-      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-          cache-bin: false
-          shared-key: v1-macos-${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}-rust
-          cache-on-failure: true
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile --ignore-scripts
-
-      - name: Import signing certificate
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN=build.keychain
-          CERT_PATH=cert.p12
-
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH" 2>/dev/null || \
-            echo "$APPLE_CERTIFICATE_P12" | base64 -D > "$CERT_PATH"
-
-          security create-keychain -p "" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "" "$KEYCHAIN"
-          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security list-keychains -d user -s "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
-
-      - name: Configure notarytool credentials
-        env:
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-          APPLE_API_PRIVATE_KEY_B64: ${{ secrets.APPLE_API_PRIVATE_KEY_B64 }}
-        run: |
-          set -euo pipefail
-          mkdir -p private_keys
-          echo "$APPLE_API_PRIVATE_KEY_B64" | base64 --decode > private_keys/AuthKey.p8
-          xcrun notarytool store-credentials "$NOTARY_PROFILE_NAME" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID" \
-            --key "private_keys/AuthKey.p8"
-
-      # Single-binary app (openssl vendored, no daemon subcomponent), so Tauri
-      # can codesign mid-bundle — unlike the 0.9.x flow that re-signed after.
-      # With TAURI_SIGNING_PRIVATE_KEY set, `createUpdaterArtifacts` also emits
-      # "CC GUI.app.tar.gz" + .sig for the updater channel.
-      - name: Build app bundle (signed)
-        env:
-          NODE_OPTIONS: "--max-old-space-size=8192"
-          APPLE_SIGNING_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        # bundle_dmg.sh (AppleScript/Finder + hdiutil) is known-flaky on
-        # headless runners — tauri recommends retrying rather than failing
-        # the whole build. cargo reuse keeps a retry cheap (~16 min compile
-        # is incremental on the second attempt).
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if pnpm exec tauri build --bundles app,dmg; then
-              exit 0
-            fi
-            echo "::warning::tauri build attempt $attempt failed; retrying"
-          done
-          echo "::error::tauri build failed after 3 attempts"
-          exit 1
-
-      - name: Notarize and staple DMG
-        # `notarytool submit --wait` treats a single timed-out status poll
-        # (NSURLErrorDomain -1001, a 60s request to appstoreconnect) as fatal:
-        # that failed the x86_64 job while the same step was Accepted on
-        # arm64 minutes earlier. Submit without `--wait` and poll `info`
-        # ourselves, so one dropped request costs a retry rather than the
-        # whole release.
-        run: |
-          set -euo pipefail
-          DMG=$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)
-          test -n "$DMG"
-
-          submission=$(xcrun notarytool submit "$DMG" \
-            --keychain-profile "$NOTARY_PROFILE_NAME")
-          printf '%s\n' "$submission"
-          id=$(printf '%s\n' "$submission" \
-            | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-            | head -n 1 || true)
-          if [ -z "$id" ]; then
-            echo "::error::no submission id in notarytool output"
-            exit 1
-          fi
-
-          accepted=0
-          for attempt in $(seq 1 60); do
-            # `info` can exit non-zero while still printing the status, so read
-            # the status from the output either way: only a poll that yields
-            # no status at all counts as lost.
-            if info=$(xcrun notarytool info "$id" \
-              --keychain-profile "$NOTARY_PROFILE_NAME" \
-              --output-format json 2>&1); then
-              poll_ok=1
-            else
-              poll_ok=0
-            fi
-            status=$(printf '%s' "$info" \
-              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
-            if [ -z "$status" ]; then
-              status=$(printf '%s' "$info" \
-                | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' \
-                | head -n 1 | sed -E 's/.*"([^"]+)"$/\1/' || true)
-            fi
-            if [ "$poll_ok" != 1 ] && [ -z "$status" ]; then
-              echo "::warning::notary status poll $attempt failed: $(printf '%s' "$info" | tail -n 1)"
-            fi
-            case "$status" in
-              Accepted)
-                echo "notary accepted submission $id"
-                accepted=1
-                break
-                ;;
-              Invalid)
-                echo "::error::notary rejected $DMG"
-                xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE_NAME" || true
-                exit 1
-                ;;
-              *)
-                echo "notary status: ${status:-unavailable} (poll $attempt/60)"
-                ;;
-            esac
-            sleep 20
-          done
-
-          if [ "$accepted" != 1 ]; then
-            echo "::error::notary did not accept the submission within 20 minutes"
-            exit 1
-          fi
-
-          # `stapler` re-fetches the ticket over CloudKit, so a single dropped
-          # connection (`NSURLErrorDomain -1005`, "The staple and validate
-          # action failed! Error 68") fails the step even though notary had
-          # already accepted the DMG — that is what killed the x86_64 job
-          # while arm64 stapled fine minutes earlier. Retry with backoff; a
-          # ticket that is genuinely bad still fails on every attempt.
-          stapled=0
-          for attempt in 1 2 3 4 5; do
-            if xcrun stapler staple "$DMG"; then
-              stapled=1
-              break
-            fi
-            echo "::warning::stapler attempt $attempt failed; retrying"
-            sleep $((attempt * 15))
-          done
-          if [ "$stapled" != 1 ]; then
-            echo "::error::could not staple the notary ticket onto $DMG"
-            exit 1
-          fi
-
-      - name: Package artifacts
-        run: |
-          set -euo pipefail
-          VERSION=$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          config = json.loads(Path("src-tauri/tauri.conf.json").read_text())
-          print(config["version"])
-          PY
-          )
-          ARCH="${{ matrix.arch }}"
-          mkdir -p release-artifacts
-
-          mv src-tauri/target/release/bundle/dmg/*.dmg \
-            "release-artifacts/ccgui_${VERSION}_${ARCH}.dmg"
-          mv "src-tauri/target/release/bundle/macos/CC GUI.app.tar.gz" \
-            "release-artifacts/ccgui_${ARCH}.app.tar.gz"
-          mv "src-tauri/target/release/bundle/macos/CC GUI.app.tar.gz.sig" \
-            "release-artifacts/ccgui_${ARCH}.app.tar.gz.sig"
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: |
-            release-artifacts/ccgui_*_${{ matrix.arch }}.dmg
-            release-artifacts/ccgui_${{ matrix.arch }}.app.tar.gz
-            release-artifacts/ccgui_${{ matrix.arch }}.app.tar.gz.sig
-          if-no-files-found: error
 
   build_linux:
     name: linux (x86_64)
@@ -464,7 +239,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     needs:
-      - build_macos
       - build_linux
       - build_windows
     steps:
@@ -473,13 +247,6 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: macos-*
-          path: release-artifacts
-          merge-multiple: true
 
       - name: Download Linux AppImage
         uses: actions/download-artifact@v4
@@ -513,8 +280,6 @@ jobs:
           PY
           )
 
-          SIGNATURE_AARCH64=$(cat release-artifacts/ccgui_aarch64.app.tar.gz.sig)
-          SIGNATURE_X86_64=$(cat release-artifacts/ccgui_x86_64.app.tar.gz.sig)
           LAST_TAG=$(git tag --sort=-version:refname \
             | grep -v "^v${VERSION}$" \
             | head -n 1 || true)
@@ -564,22 +329,19 @@ jobs:
 
           python3 - <<PY
           import json
+          import os
           from datetime import datetime, timezone
           from pathlib import Path
 
           notes = Path("release-artifacts/release-notes.md").read_text().strip()
           artifacts_dir = Path("release-artifacts")
 
-          platforms = {
-            "darwin-aarch64": {
-              "url": "https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/ccgui_aarch64.app.tar.gz",
-              "signature": "${SIGNATURE_AARCH64}",
-            },
-            "darwin-x86_64": {
-              "url": "https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/ccgui_x86_64.app.tar.gz",
-              "signature": "${SIGNATURE_X86_64}",
-            }
-          }
+          # Fork builds Windows + Linux only (no Apple signing credentials),
+          # so no darwin-* platforms here. URLs use the running repository so
+          # they always point at this fork's release, never upstream's.
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          platforms = {}
 
           appimages = list(artifacts_dir.rglob("*.AppImage"))
 
@@ -606,7 +368,7 @@ jobs:
             sig_path = appimage.with_suffix(appimage.suffix + ".sig")
             if sig_path.exists():
               platforms[f"linux-{arch}"] = {
-                "url": f"https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/{asset_name(appimage.name)}",
+                "url": f"https://github.com/{repo}/releases/download/v${VERSION}/{asset_name(appimage.name)}",
                 "signature": sig_path.read_text().strip(),
               }
 
@@ -615,7 +377,7 @@ jobs:
             sig_path = Path(str(nsis_exe) + ".sig")
             if sig_path.exists():
               platforms["windows-x86_64"] = {
-                "url": f"https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/{asset_name(nsis_exe.name)}",
+                "url": f"https://github.com/{repo}/releases/download/v${VERSION}/{asset_name(nsis_exe.name)}",
                 "signature": sig_path.read_text().strip(),
               }
               break
@@ -646,12 +408,6 @@ jobs:
 
           ASSETS=()
           for pattern in \
-            "release-artifacts/ccgui_${VERSION}_aarch64.dmg" \
-            "release-artifacts/ccgui_${VERSION}_x86_64.dmg" \
-            "release-artifacts/ccgui_aarch64.app.tar.gz" \
-            "release-artifacts/ccgui_aarch64.app.tar.gz.sig" \
-            "release-artifacts/ccgui_x86_64.app.tar.gz" \
-            "release-artifacts/ccgui_x86_64.app.tar.gz.sig" \
             "release-artifacts/*.AppImage" \
             "release-artifacts/*.AppImage.sig" \
             "release-artifacts/*.rpm" \
@@ -671,72 +427,7 @@ jobs:
             --target "$GITHUB_SHA" \
             "${ASSETS[@]}"
 
-      - name: Bump version and open PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION=$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          data = json.loads(Path("src-tauri/tauri.conf.json").read_text())
-          print(data["version"])
-          PY
-          )
-
-          # Decimal rollover: patch rolls 1.0.9 -> 1.1.0, minor rolls
-          # 1.9.9 -> 2.0.0 (each segment carries at 10).
-          NEXT_VERSION=$(python3 - <<'PY' "$VERSION"
-          import sys
-
-          version = sys.argv[1]
-          parts = version.split(".")
-          if len(parts) != 3:
-              raise SystemExit("Expected version like X.Y.Z")
-
-          major, minor, patch = (int(p) for p in parts)
-          patch += 1
-          if patch >= 10:
-              patch = 0
-              minor += 1
-          if minor >= 10:
-              minor = 0
-              major += 1
-          print(f"{major}.{minor}.{patch}")
-          PY
-          )
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          python3 - <<PY
-          import json
-          from pathlib import Path
-
-          pkg = Path("package.json")
-          data = json.loads(pkg.read_text())
-          data["version"] = "$NEXT_VERSION"
-          pkg.write_text(json.dumps(data, indent=2) + "\n")
-
-          conf = Path("src-tauri/tauri.conf.json")
-          data = json.loads(conf.read_text())
-          data["version"] = "$NEXT_VERSION"
-          conf.write_text(json.dumps(data, indent=2) + "\n")
-
-          cargo = Path("src-tauri/Cargo.toml")
-          text = cargo.read_text()
-          text = text.replace('version = "$VERSION"', 'version = "$NEXT_VERSION"', 1)
-          cargo.write_text(text)
-          PY
-
-          git checkout -b "v${NEXT_VERSION}"
-          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
-          git commit -m "chore: bump version to ${NEXT_VERSION}"
-          git push origin "v${NEXT_VERSION}"
-
-          gh pr create \
-            --title "chore: bump version to ${NEXT_VERSION}" \
-            --body "Post-release version bump to ${NEXT_VERSION}." \
-            --base main \
-            --head "v${NEXT_VERSION}"
+      # No auto-bump step: fork versions carry a `-fork.N` prerelease suffix,
+      # so the next version is bumped by hand at release time (e.g.
+      # 1.1.8-fork.1 -> 1.1.8-fork.2, or 1.1.9-fork.1 after merging upstream
+      # v1.1.9).

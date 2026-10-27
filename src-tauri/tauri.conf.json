@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CC GUI",
-  "version": "1.1.8",
+  "version": "1.1.8-fork.1",
   "identifier": "com.zhukunpenglinyutong.ccgui",
   "build": {
     "beforeDevCommand": "npx vite",
@@ -65,9 +65,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENCOUY2RkIzOUFFNTBBQjgKUldTNEN1V2FzMitmeXpxVWkxMXUrM05UVHRJQTNaTHNZcVo4SktSQUJNSVM2VDEzSzVtaUhHWGcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkwREY2N0JFMzBBMzA5MzAKUldRd0NhTXd2bWZma1AxS2FVUHN0aFdOY2ZJMTd4MWNZYlBGOXIyNTI5QmRNWHJwN05WRzhZMmYK",
       "endpoints": [
-        "https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/latest/download/latest.json"
+        "https://github.com/Linxfeng/desktop-cc-gui/releases/latest/download/latest.json"
       ]
     }
   }

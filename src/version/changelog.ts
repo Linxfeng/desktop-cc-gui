@@ -29,6 +29,42 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.1.8-fork.1",
+    date: "2026-10-27",
+    content: {
+      zh: `本 fork（Linxfeng/desktop-cc-gui）首个独立 release，基线为上游 v1.1.8（含其全部变更），在此之上新增以下修复与功能。版本号采用「上游基线 + -fork.N 修订」方案，永不与上游版本撞号；自动更新已切换到本 fork 自己的发布频道（独立的签名密钥与 latest.json）。
+
+✨ 新功能
+- **WSL 工作区支持**：新增本机 WSL 工作区，Claude / Codex / Pi CLI 均可在 WSL 作用域内运行；CLI 管理区分本机与 WSL 作用域及只读状态；WSL 作用域内支持官方配置白名单读写、Pi 供应商认证、Git 面板与全文搜索。
+
+🐛 修复
+- **记住窗口大小、位置与最大化 / 全屏状态**：重启后恢复上次的窗口布局。
+- **启动占位固定在视口**：修复启动 loading 先贴顶、加载完成后才跳居中的闪烁。
+- **历史扫描清理死行会话**：源文件已消失的会话不再作为幽灵会话复活。
+- **历史重载不再丢失消息**：修复只能加载最后一段的问题。
+- **流式 delta 不再裁剪边界空白**：修复由此导致的 Markdown 排版错乱。
+- **打开仓库失败不再误报「不是 Git 仓库」**。
+
+🔧 发布渠道
+- updater endpoint 与 minisign 签名密钥更换为本 fork 自有（上游私钥不可获取，旧签名本就无法验证）；Windows / Linux 安装包由本 fork 的 release 工作流构建发布。`,
+      en: `First independent release of this fork (Linxfeng/desktop-cc-gui), based on upstream v1.1.8 (all of its changes included) plus the fixes and features below. The version uses an "upstream base + -fork.N revision" scheme so it never collides with upstream releases; auto-update now points at this fork's own release channel (dedicated signing key and latest.json).
+
+✨ Features
+- **WSL workspace support**: native WSL workspaces where Claude / Codex / Pi CLIs all run inside the WSL scope; CLI management distinguishes native vs WSL scope with read-only states; official config whitelist read/write, Pi provider auth, Git panel and full-text search work within the WSL scope.
+
+🐛 Fixes
+- **Remember window size, position and maximized / fullscreen state**: the previous layout is restored on restart.
+- **Startup splash pinned to the viewport**: fixes the loading indicator sticking to the top before jumping to center once loaded.
+- **History scan cleans up dead sessions**: sessions whose source files vanished no longer resurrect as ghost entries.
+- **History reload no longer loses messages**: fixes only the last segment being loaded.
+- **Streaming deltas no longer trim boundary whitespace**: fixes Markdown layout breakage caused by the trimming.
+- **Failing to open a repository no longer misreports "not a Git repository"**.
+
+🔧 Release channel
+- The updater endpoint and minisign key are replaced with this fork's own (the upstream private key is unobtainable, so old signatures could never verify); Windows / Linux installers are built and published by this fork's release workflow.`,
+    },
+  },
+  {
     version: "1.1.7",
     date: "2026-10-26",
     content: {
