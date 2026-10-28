@@ -29,6 +29,50 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.1.8-fork.2",
+    date: "2026-10-28",
+    content: {
+      zh: `本次 release 完整合并了上游正式版 v1.1.8（fork.1 发布时基线尚未定稿，遗漏了定稿批次，现已补齐），并修复了两处上游新功能在本机 WSL 工作区上的问题。
+
+✨ 新功能（来自上游 v1.1.8 正式版）
+- **插件 SDK 0.3.22：worktree 状态徽标与侧栏导航计数徽标**：宿主新增通用扩展点，插件可为 worktree 行渲染状态徽标、为侧栏导航追加计数。
+- **文件树区分 Git 忽略的条目**：被 .gitignore 等规则忽略的条目默认浅色显示；设置 → 通用 → 行为新增「文件树隐藏 Git 忽略的文件」开关，打开后连同子树一起隐藏。
+- **变更面板可初始化 Git 仓库**：非仓库空状态新增「初始化 Git 仓库」按钮，仅限已登记工作区，不嵌套已有仓库。
+- **文件与聊天链接右键可在浏览器中打开 HTML**（仅桌面端）。
+- **切换 CLI 时保留输入框草稿**。
+
+🐛 修复（来自上游 v1.1.8 正式版）
+- **macOS 窗口状态恢复修正**：坐标改用逻辑点，修复 Retina 内建屏与外接屏混合 DPI 时窗口被恢复到错误显示器、尺寸减半的问题；最小尺寸按目标显示器缩放系数换算。
+- **盘暂时断开时保留会话**：历史扫描只在存储当前 attached 且确认 NotFound 时才清理会话，修复移动硬盘 / 网络盘断开会话被误删。
+- **agy 历史重载兜底收紧**：去掉任意深度的回复兜底，避免工具负载被当成回复展示。
+- **Qoder 启动即进入 bypass 模式**，绕开新版 CLI 的 set_mode 报错。
+- **Git 属主校验按错误码判定**（GIT_EOWNER），libgit2 提示语变化不再误判。
+
+🐛 修复（fork 独有）
+- **WSL 工作区的「初始化 Git 仓库」改在发行版内执行**：与其它 WSL Git 操作同一后端，不再让主机 libgit2 读 UNC 路径；语义与主机一致（目录须存在、已在仓库内不嵌套、非「找不到仓库」的探测失败直接报错）。
+- **WSL 工作区的文件树暂不标记 Git 忽略条目**：「文件树隐藏 Git 忽略的文件」开关对 WSL 工作区暂不生效，条目照常全部列出（避免主机 libgit2 遍历 UNC 的属主校验与慢路径）。`,
+      en: `This release fully merges the finalized upstream v1.1.8 (the fork.1 baseline was cut before upstream finalized that batch, which is now included), and fixes two places where new upstream features misbehaved on native WSL workspaces.
+
+✨ Features (from finalized upstream v1.1.8)
+- **Plugin SDK 0.3.22: worktree status badges and sidebar nav count badges**: the host gains generic extension points so plugins can render status badges on worktree rows and append counts to sidebar navigation.
+- **File tree distinguishes Git-ignored entries**: entries ignored by .gitignore and friends fade by default; a new setting (Settings → General → Behavior, "hide Git-ignored files in the file tree") hides them together with their subtrees.
+- **Changes panel can initialize a Git repository**: the not-a-repository empty state gains an "Initialize Git repository" button, restricted to registered workspaces and never nesting an existing repository.
+- **File and chat link context menus can open HTML in the browser** (desktop only).
+- **Switching CLIs keeps the composer draft**.
+
+🐛 Fixes (from finalized upstream v1.1.8)
+- **macOS window state restore corrected**: coordinates use logical points, fixing windows restored to the wrong display at half size with mixed-DPI Retina + external monitors; the minimum size converts with the target display's scale factor.
+- **Sessions survive a temporarily detached drive**: the history scan only cleans a session when the storage is currently attached and the file is confirmed NotFound, fixing session loss when external / network drives disconnect.
+- **agy history reload fallback tightened**: the any-depth reply fallback is removed so tool payloads are no longer shown as replies.
+- **Qoder enters bypass mode at startup**, working around the new CLI's set_mode error.
+- **Git ownership check keys off the error code** (GIT_EOWNER), so libgit2 message wording changes no longer misclassify.
+
+🐛 Fixes (fork only)
+- **"Initialize Git repository" on WSL workspaces now runs inside the distro**: same backend as the other WSL Git operations, the host libgit2 no longer reads UNC paths; semantics match the host (directory must exist, never nests inside an existing repository, probe failures other than "not found" surface as errors).
+- **WSL workspace file trees skip Git-ignore marking**: the "hide Git-ignored files" setting does not apply to WSL workspaces yet; all entries keep listing normally (avoiding the host libgit2 UNC traversal ownership check and slow path).`,
+    },
+  },
+  {
     version: "1.1.8-fork.1",
     date: "2026-10-27",
     content: {
