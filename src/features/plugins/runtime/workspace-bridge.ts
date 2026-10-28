@@ -1,7 +1,7 @@
 import { ipc, worktreeMetaOf } from "@/lib/ipc";
 import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { useChatStore } from "@/features/chat/store";
-import type { PluginWorkspaceRow } from "@ccgui/plugin-sdk";
+import type { Disposer, PluginWorkspaceRow, WorktreeBadgeTarget } from "@ccgui/plugin-sdk";
 import { withAuthorizedHostInvoke } from "./hardening";
 
 /**
@@ -49,6 +49,53 @@ export function listPluginWorkspaces(): PluginWorkspaceRow[] {
           }
         : {}),
     };
+  });
+}
+
+/** 侧栏 worktree 子行的徽标投影（SDK 0.3.22，ctx.ui.registerWorktreeBadges）。
+ *  只列 kind="worktree" 且带合法 meta.worktree 的行；parentWorkspaceId 取自
+ *  parentId，prNumber 缺失归一为 null（插件不必区分 undefined）。返回新数组，
+ *  插件改它动不到 store。 */
+export function listWorktreeTargets(): WorktreeBadgeTarget[] {
+  const targets: WorktreeBadgeTarget[] = [];
+  for (const workspace of useChatStore.getState().workspaces) {
+    if (workspace.kind !== "worktree" || !workspace.parentId) continue;
+    const meta = worktreeMetaOf(workspace);
+    if (!meta) continue;
+    targets.push({
+      workspaceId: workspace.id,
+      parentWorkspaceId: workspace.parentId,
+      path: workspace.path,
+      branch: meta.branch,
+      prNumber: meta.prNumber ?? null,
+    });
+  }
+  return targets;
+}
+
+/** 只在 worktree 子行增删或 branch / prNumber / path 变化时回调（浅比较）。
+ *  侧栏每次重排、改名、切换会话都会让 store 变化，插件不该被无关变更唤醒。 */
+export function subscribeWorktreeTargets(
+  cb: (targets: WorktreeBadgeTarget[]) => void,
+): Disposer {
+  let last = listWorktreeTargets();
+  return useChatStore.subscribe(() => {
+    const next = listWorktreeTargets();
+    const unchanged =
+      next.length === last.length &&
+      next.every((target, index) => {
+        const prior = last[index]!;
+        return (
+          target.workspaceId === prior.workspaceId &&
+          target.parentWorkspaceId === prior.parentWorkspaceId &&
+          target.path === prior.path &&
+          target.branch === prior.branch &&
+          target.prNumber === prior.prNumber
+        );
+      });
+    if (unchanged) return;
+    last = next;
+    cb(next);
   });
 }
 

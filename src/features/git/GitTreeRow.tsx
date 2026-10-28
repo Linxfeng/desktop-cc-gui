@@ -1,4 +1,4 @@
-import { memo, useMemo, type CSSProperties } from "react";
+import { memo, useMemo, type CSSProperties, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import Plus from "lucide-react/dist/esm/icons/plus";
 import Minus from "lucide-react/dist/esm/icons/minus";
@@ -31,6 +31,8 @@ export interface FileRowProps {
   onDiscard?: (path: string) => void;
   onAction: (path: string) => void;
   onOpen: (path: string) => void;
+  /** Right-click on the row (file actions menu). */
+  onContextMenu?: (event: MouseEvent<HTMLElement>, entry: GitFileEntry) => void;
   actionBusy: boolean;
   displayName?: string;
 }
@@ -214,6 +216,7 @@ export const FileRow = memo(function FileRow({
   onDiscard,
   onAction,
   onOpen,
+  onContextMenu,
   actionBusy,
   displayName,
 }: FileRowProps) {
@@ -231,6 +234,7 @@ export const FileRow = memo(function FileRow({
         paddingLeft: indent !== undefined ? `${indent}px` : undefined,
       }}
       className="group relative flex h-8 items-center gap-1.5 px-3 hover:bg-background-secondary-hover"
+      onContextMenu={onContextMenu ? (event) => onContextMenu(event, entry) : undefined}
     >
       {onToggleSelect !== undefined && (
         <div className="flex shrink-0 items-center justify-center">

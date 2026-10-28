@@ -45,6 +45,7 @@ export function FileTreeOverlays({ ops }: { ops: FileTreeOperations }) {
           onRename={ops.startRename}
           onCopyPath={ops.copyPath}
           onSendPath={ops.sendPath}
+          onOpenInBrowser={ops.openInBrowser}
           onReveal={ops.revealInFileManager}
           onTrash={ops.startTrash}
         />

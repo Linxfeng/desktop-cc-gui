@@ -342,6 +342,13 @@ struct RememberProviderArgs {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListDirArgs {
+    path: String,
+    /// File tree root: opts into per-entry Git ignore flags.
+    git_ignore_root: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PathArgs {
     path: String,
     /// Optional workspace meta passthrough (plugin workspaces.add keeps
@@ -952,8 +959,8 @@ pub(super) async fn dispatch(
         }
         // files
         "list_dir" => {
-            let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::list_dir(app.state(), a.path))
+            let a: ListDirArgs = parse_args(&raw)?;
+            ser(crate::files::list_dir(app.state(), a.path, a.git_ignore_root).await)
         }
         "read_file" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -1228,6 +1235,11 @@ pub(super) async fn dispatch(
             let a: GitCreateBranchArgs = parse_args(&raw)?;
             crate::git::web_guard_wsl_path(&a.path)?;
             ser(crate::git::git_create_branch(a.path, a.name).await)
+        }
+        "git_init" => {
+            let a: PathArgs = parse_args(&raw)?;
+            crate::git::web_guard_wsl_path(&a.path)?;
+            ser(crate::git::git_init(app.state(), a.path).await)
         }
         // open-app
         "open_workspace_in" => {

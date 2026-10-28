@@ -19,6 +19,28 @@ import { installFilesBridge, readRemoteAware } from "./remote-files";
 export const FILES_ROOT_KEY = "ccgui-next.filesRoot";
 let treeGeneration = 0;
 
+/** Newest listing request per directory. list_dir runs off the main thread,
+ *  so two listings of one directory (a refresh and a post-rename
+ *  invalidate) can resolve out of order; only the newest may write.
+ *  Cleared with each tree (root switch), which bounds it. */
+const listingSeq = new Map<string, number>();
+
+/** List `path` for the tree, with Git ignore flags bounded by the tree root.
+ *  Resolves null (errors included) once a newer listing of the same
+ *  directory has started. */
+async function listTreeDir(path: string, root: string): Promise<DirEntry[] | null> {
+  const seq = (listingSeq.get(path) ?? 0) + 1;
+  listingSeq.set(path, seq);
+  const latest = () => listingSeq.get(path) === seq;
+  try {
+    const entries = await ipc.listDir(path, { gitIgnoreRoot: root });
+    return latest() ? entries : null;
+  } catch (error) {
+    if (!latest()) return null;
+    throw error;
+  }
+}
+
 /** Join a directory path and a child name. Backend paths are POSIX-style on
  * macOS/Linux; Rust's fs APIs also accept "/" separators on Windows. */
 export function joinPath(dir: string, name: string): string {
@@ -154,6 +176,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const root = path.trim();
     if (root === get().root) return;
     treeGeneration += 1;
+    listingSeq.clear();
     if (root) {
       writeStored(FILES_ROOT_KEY, root);
     } else {
@@ -185,12 +208,14 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const generation = treeGeneration;
     set((s) => ({ loadingDirs: { ...s.loadingDirs, [path]: true } }));
     try {
-      const entries = await ipc.listDir(path);
+      const entries = await listTreeDir(path, s.root);
       if (generation !== treeGeneration) return;
       set((s) => {
         const loadingDirs = { ...s.loadingDirs };
-        const dirErrors = { ...s.dirErrors };
         delete loadingDirs[path];
+        // Superseded: a newer listing (a refresh) already wrote this level.
+        if (!entries) return { loadingDirs };
+        const dirErrors = { ...s.dirErrors };
         delete dirErrors[path];
         return {
           children: { ...s.children, [path]: entries },
@@ -198,7 +223,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
           dirErrors,
         };
       });
-      await get().loadGitStatus({ [path]: entries });
+      if (entries) await get().loadGitStatus({ [path]: entries });
     } catch (e) {
       if (generation !== treeGeneration) return;
       set((s) => {
@@ -255,8 +280,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     if (!get().children[path]) return;
     const generation = treeGeneration;
     try {
-      const entries = await ipc.listDir(path);
-      if (generation !== treeGeneration) return;
+      const entries = await listTreeDir(path, get().root);
+      if (generation !== treeGeneration || !entries) return;
       set((s) => ({ children: { ...s.children, [path]: entries } }));
       await get().loadGitStatus({ [path]: entries });
     } catch {
@@ -274,8 +299,10 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       await Promise.all(
         [...dirs].map(async (dir) => {
           try {
-            const entries = await ipc.listDir(dir);
-            if (generation !== treeGeneration) return;
+            const entries = await listTreeDir(dir, s.root);
+            // Superseded listings leave this level (and its Git pass) to
+            // the newer one.
+            if (generation !== treeGeneration || !entries) return;
             levels[dir] = entries;
             set((state) => {
               const dirErrors = { ...state.dirErrors };

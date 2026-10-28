@@ -1,5 +1,16 @@
 # @ccgui/plugin-sdk changelog
 
+## 0.3.22 — 2026-10-26
+
+- 新增权限 `ui:worktree-badge` 与 `ctx.ui.registerWorktreeBadges(def)`：把一块标签推到侧栏「WORKTREES」子行上，返回 `WorktreeBadgeHandle`。
+  - `set(workspaceId, badge | null)` / `clear()` 只需 `ui:worktree-badge`；`list()` / `onChange(cb)` 额外需要 `host:workspace`，缺失时抛可读错误（`requires "host:workspace"`）。
+  - `list()` 返回 `WorktreeBadgeTarget[]`（`workspaceId` / `parentWorkspaceId` / `path` / `branch` / `prNumber`）；`onChange` 只在 worktree 子行增删或 `branch` / `prNumber` / `path` 变化时回调，回调与 `onClick` 都在插件上下文中执行。`onClick` 的 target 不受 `host:workspace` 门禁（只有 `list` / `onChange` 需要它）。
+  - 渲染契约：每行最多 2 个徽标（按 `order`，再按注册先后）；`tone` 取 `"neutral" | "blue" | "cyan" | "green" | "lime" | "yellow" | "rose" | "purple"`，其余按 `neutral`；`label` 去空白后按码点截到 6，空 label 视为不显示；`tooltip` 为纯文本、截到 300；可点徽标不触发行展开。插件抛错只影响自己的徽标。
+  - 卸载（或 `handle.dispose()`）清掉该插件的徽标与订阅；宿主快照不可变，插件改返回值动不到宿主。
+- `ctx.ui.registerSidebarNav(def)` 新增可选 `badge?: () => string | number | null`：内建侧栏导航项的尾部计数 pill，每次渲染求值，抛错按「无徽标」处理；同一 `key` 重新注册即刷新（Registry upsert）。
+- `contract-check.ts` 补齐 `WorktreeBadge` / `WorktreeBadgeHandle` / `WorktreeBadgeTarget` / `WorktreeBadgeTone` 的双向断言，以及 `registerWorktreeBadges` 参数元组与 `registerSidebarNav.badge` 的漂移守卫。
+- `ctx.worktrees.create` 的失败分类新增 `repo_open_failed`：仓库存在但打不开（如 libgit2 属主校验拒绝）不再报成 `not_a_repo`，detail 以 `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。按 `not_a_repo` 判断「不是仓库」的插件无需改动，这类失败此前被误归到该类。
+
 ## 0.3.21 — 2026-10-22
 
 - 新增 `ctx.assets.grantFile(options?)`、`AssetFileGrant` 与 `AssetFilePickerOptions`：用户选择一个文件后授权其父目录，返回目录 grant、规范父目录与文件名相对路径；沿用 `assets:directory` 权限及目录去重、上限、撤销和逐次读取复核。

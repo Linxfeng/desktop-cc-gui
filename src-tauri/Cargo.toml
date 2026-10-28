@@ -99,9 +99,10 @@ windows = { version = "0.61", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard file-URL reads in clipboard.rs (Finder copies expose no path to
-# the webview). Already in the lock file via enigo/xcap.
+# the webview). Already in the lock file via enigo/xcap. NSWorkspace resolves
+# the default browser for open_app/browser.rs.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSWorkspace"] }
 objc2-foundation = { version = "0.3", features = ["NSEnumerator", "NSURL", "NSString"] }
 
 [dev-dependencies]

@@ -1,7 +1,9 @@
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import X from "lucide-react/dist/esm/icons/x";
 import { IconButton } from "@/components/base/buttons/icon-button";
+import { errorText } from "@/lib/errors";
 import { cx } from "@/utils/cx";
 import { useWorktreeStore, type PendingCreation } from "./store";
 
@@ -21,6 +23,15 @@ const ERROR_KEY_BY_KIND: Record<string, string> = {
   unknown: "worktree.errorUnknown",
 };
 
+/** 失败原因：仓库存在却打不开（属主校验等）时带着后端分类原话，交给
+ *  errorText 本地化；其余按 errorKind 分类。 */
+function failureReason(t: TFunction, pending: PendingCreation): string {
+  if (pending.stage === "canceled") return t("common.cancel");
+  if (pending.errorKind === "repo_open_failed" && pending.error) return errorText(pending.error);
+  if (pending.errorKind) return t(ERROR_KEY_BY_KIND[pending.errorKind] ?? "worktree.errorUnknown");
+  return pending.error ?? t("worktree.errorUnknown");
+}
+
 const STAGE_KEY: Record<string, string> = {
   validate: "worktree.progressValidate",
   fetch: "worktree.progressFetch",
@@ -38,19 +49,15 @@ export function WorktreeProgressRow({ pending }: { pending: PendingCreation }) {
   const failed = pending.stage === "failed" || pending.stage === "canceled";
 
   if (failed) {
-    const errorText =
-      pending.stage === "canceled"
-        ? t("common.cancel")
-        : pending.errorKind
-          ? t(ERROR_KEY_BY_KIND[pending.errorKind] ?? "worktree.errorUnknown")
-          : (pending.error ?? t("worktree.errorUnknown"));
+    const line = `${t("worktree.createFailed", { branch: pending.branch })} · ${failureReason(t, pending)}`;
     return (
       <div
         role="alert"
         className="flex h-8 items-center gap-1.5 rounded-lg px-2 text-caption-1-regular"
       >
-        <span className="min-w-0 flex-1 truncate text-text-error-primary">
-          {t("worktree.createFailed", { branch: pending.branch })} · {errorText}
+        {/* 单行截断；原因可能很长（含路径与处理建议），悬停读全文。 */}
+        <span className="min-w-0 flex-1 truncate text-text-error-primary" title={line}>
+          {line}
         </span>
         <button
           type="button"

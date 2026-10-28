@@ -14,8 +14,9 @@
  * tests/platform-build.test.ts. */
 #boot-splash {
   /* 固定在视口上，不依赖祖先高度：html/body/#root 的 height:100% 来自
-   * src/index.css，要等 JS bundle 加载后才生效。在那之前 #root 是 auto 高，
-   * 100% 会塌成内容高，启动占位就贴在窗口顶部，直到应用样式到位才跳到中间。 */
+   * src/index.css。打包版里它在 <head> 中阻塞首帧，但开发模式（Vite 由 JS
+   * 注入样式）和 bundle 样式加载失败时没有它，#root 是 auto 高，100% 会塌成
+   * 内容高，启动占位就贴在窗口顶部，开发模式下样式到位后再跳到中间。 */
   position: fixed;
   inset: 0;
   display: flex;

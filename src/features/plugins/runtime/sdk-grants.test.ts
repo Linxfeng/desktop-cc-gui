@@ -29,6 +29,7 @@ describe("isKnownPermission", () => {
       "assets:bundle",
       "assets:directory",
       "ui:conversation-mode",
+      "ui:worktree-badge",
       "host:worktree",
       "host:window",
       "host:models",

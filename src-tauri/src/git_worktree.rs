@@ -121,6 +121,17 @@ fn fail(kind: &'static str, message: impl Into<String>) -> CreateFailure {
     }
 }
 
+/// `open_repo` 失败 → 创建失败。只有确实没有仓库才是 `not_a_repo`；属主校验
+/// 等打不开的情况带着 `open_repo` 的分类原话（`GIT_UNSAFE_REPO:` /
+/// `GIT_OPEN_FAILED:`）给界面，不再误报「不是 Git 仓库」。
+fn open_failure(repo_path: &str, error: String) -> CreateFailure {
+    if error == "NOT_A_REPO" {
+        fail("not_a_repo", format!("{repo_path} is not a git repository"))
+    } else {
+        fail("repo_open_failed", error)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation registry (stored on AppState)
 // ---------------------------------------------------------------------------
@@ -455,7 +466,7 @@ async fn run_create(
     // ---- validate ----------------------------------------------------------
     emit_progress(app, creation_id, "validate", None, None, None);
     let repo = crate::git::open_repo(&args.repo_path)
-        .map_err(|_| fail("not_a_repo", format!("{} is not a git repository", args.repo_path)))?;
+        .map_err(|error| open_failure(&args.repo_path, error))?;
 
     let fmt = run_git(
         &repo_path,
@@ -1106,6 +1117,31 @@ mod tests {
             .expect_err("empty checkout must fail creation");
         assert_eq!(error.kind, "sparse_checkout_empty");
         assert!(!target.exists(), "partial add cleaned up");
+    }
+
+    #[tokio::test]
+    async fn create_reports_a_plain_directory_as_not_a_repo() {
+        let scratch = Scratch::new();
+        let plain = scratch.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let args = create_args(&plain, "feat", &scratch.join("wt"));
+        let err = run_create(None, None, "t-plain", &args, &cancel_handle())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, "not_a_repo");
+    }
+
+    /// 仓库存在但打不开（属主校验等）不能报成「不是 Git 仓库」，原因要带给界面。
+    #[test]
+    fn open_failure_keeps_the_cause_of_a_repository_that_will_not_open() {
+        assert_eq!(
+            open_failure("/r", "NOT_A_REPO".to_string()).kind,
+            "not_a_repo"
+        );
+        let cause = "GIT_UNSAFE_REPO:repository path '/r' is not owned by current user";
+        let unsafe_repo = open_failure("/r", cause.to_string());
+        assert_eq!(unsafe_repo.kind, "repo_open_failed");
+        assert_eq!(unsafe_repo.message, cause);
     }
 
     #[tokio::test]

@@ -191,6 +191,11 @@ export interface SidebarNavEntryDef {
   label: () => string;
   icon?: ComponentType<{ className?: string }>;
   order?: number;
+  /** Optional trailing count pill (0.3.22). Evaluated on every render; the
+   *  host renders it only when the value is neither null nor an empty string.
+   *  A throwing getter is treated as "no badge" so one plugin can't break the
+   *  sidebar. Re-registering the same key refreshes it (registry upsert). */
+  badge?: () => string | number | null;
   onOpen: () => void;
 }
 

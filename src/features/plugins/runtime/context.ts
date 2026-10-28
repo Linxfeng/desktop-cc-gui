@@ -48,6 +48,7 @@ import { assertPluginEmitTopic, pluginBus } from "./events";
 import { setActiveComposerDraft } from "./composer-draft";
 import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { addPluginWorkspace, listPluginWorkspaces, openPluginSession } from "./workspace-bridge";
+import { createWorktreeBadgeHandle } from "./worktree-badges";
 import { createPluginWorktree, removePluginWorktree } from "./worktree-bridge";
 import { interruptPluginChatRun, startPluginChatRun } from "./session-run-bridge";
 import { registerSessionSource } from "./session-source";
@@ -539,15 +540,38 @@ export function createPluginContext(
       },
       registerSidebarNav(def) {
         requirePermission("ui:sidebar-entry");
+        const badge = def.badge;
         return track(
           sidebarNavRegistry.register({
             id: scopedPluginId(id, def.key),
             label: def.label,
             icon: def.icon,
             order: def.order,
+            // 徽标 getter 在每次渲染时求值；插件抛错只让它的计数消失，
+            // 不能连带整条侧栏（同 ui:worktree-badge 的隔离策略）。
+            badge:
+              badge &&
+              (() => {
+                try {
+                  return runAsPlugin(badge);
+                } catch {
+                  return null;
+                }
+              }),
             onOpen: () => runAsPlugin(def.onOpen),
           }),
         );
+      },
+      registerWorktreeBadges(def) {
+        requirePermission("ui:worktree-badge");
+        return createWorktreeBadgeHandle({
+          pluginId: id,
+          sourceKey: scopedPluginId(id, def.key),
+          canReadWorkspaces: manifest.permissions.includes("host:workspace"),
+          order: def.order,
+          onClick: def.onClick,
+          track,
+        });
       },
       registerCenterTab(def) {
         requirePermission("ui:center-tab");

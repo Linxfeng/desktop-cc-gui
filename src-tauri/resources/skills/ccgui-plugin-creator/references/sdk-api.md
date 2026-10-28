@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.21）
+# CC GUI 插件 SDK 参考（SDK 0.3.22）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -78,7 +78,8 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerPage` | `ui:page` | Overlay page at `#/p/<id>` (plan §4.2 #10). |
 | `ctx.ui.registerTimelineRowRenderer` | `ui:timeline-row` | Renderer for a plugin-defined chat timeline row kind (plan §4.2 #5). The row payload is plugin-defined and typed loosely — blob bundles can't share the host's TimelineRow type identity. |
 | `ctx.ui.registerWorkspaceMenuItem` | `ui:workspace-menu` | Sidebar workspace row context-menu entry. |
-| `ctx.ui.registerSidebarNav` | `ui:sidebar-entry` | Home sidebar nav entry under the builtin 自动化 row (permission `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's center tab via openCenterTab. |
+| `ctx.ui.registerSidebarNav` | `ui:sidebar-entry` | Home sidebar nav entry under the builtin 自动化 row (permission `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's center tab via openCenterTab. `badge` (0.3.22) is an optional trailing count pill, re-evaluated every render; re-registering the same key refreshes it. |
+| `ctx.ui.registerWorktreeBadges` | `ui:worktree-badge` | Sidebar worktree-row badges (permission `ui:worktree-badge`, 0.3.22): push labels onto the "WORKTREES" child rows. `set`/`clear` need only `ui:worktree-badge`; `list`/`onChange` also need `host:workspace` and throw a readable error without it. Shapes — target `{ workspaceId, parentWorkspaceId, path, branch, prNumber: number \| null }`, badge `{ label, tone, tooltip? }`. Rendering rules: at most 2 badges per row (sorted by `order`, then registration order); `tone` outside "neutral" \| "blue" \| "cyan" \| "green" \| "lime" \| "yellow" \| "rose" \| "purple" falls back to "neutral"; `label` is trimmed then truncated to 6 code points (empty = no badge); `tooltip` is plain text truncated to 300. `onClick` runs in the plugin context and never expands the sidebar row. Unload (or `dispose()`) clears this plugin's badges and subscriptions. |
 | `ctx.ui.registerCenterTab` | `ui:center-tab` | Center-area tab definition (permission `ui:center-tab`, 0.3.12): renders in the center tab strip like session/file/browser tabs. Opening goes through openCenterTab; multiple keys = multiple tabs. |
 | `ctx.ui.openCenterTab` | `ui:center-tab` | Open (or focus) one of this plugin's registered center tabs (permission `ui:center-tab`, 0.3.12). Throws when the tab was never registered — open failures must be visible, not silent. |
 | `ctx.theme.injectCss` | `theme` | Inject a stylesheet scoped to this plugin; removed on unload. Rejects remote references (`@import`, `url(http…)`): plugins must be self-contained (plan §8 gate rules). |
@@ -259,7 +260,9 @@ ui: {
   /** 权限：ui:workspace-menu */
   registerWorkspaceMenuItem(def: { key?: string; label(ctx: { workspaceId: string; archived: boolean }): WorkspaceMenuLabelValue; icon?: ComponentType<{ className?: string }>; visible?(ctx: { workspaceId: string; archived: boolean }): boolean; onSelect(ctx: { workspaceId: string; archived: boolean }): void; order?: number }): Disposer;
   /** 权限：ui:sidebar-entry */
-  registerSidebarNav(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; order?: number; onOpen(): void }): Disposer;
+  registerSidebarNav(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; order?: number; badge?(): string | number | null; onOpen(): void }): Disposer;
+  /** 权限：ui:worktree-badge */
+  registerWorktreeBadges(def: { key?: string; order?: number; onClick?(target: WorktreeBadgeTarget): void }): WorktreeBadgeHandle;
   /** 权限：ui:center-tab */
   registerCenterTab(def: { key?: string; title(): string; icon?: ComponentType<{ className?: string }>; component: ComponentType; order?: number }): Disposer;
   /** 权限：ui:center-tab */
@@ -336,7 +339,7 @@ workspaces: {
 
 ### ctx.worktrees
 
-Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Worktree」 管线（validate → fetch → add → register）创建，宿主侧栏出现同一份进度 行与取消/重试语义；成功后 worktree 以 `kind="worktree"` 登记进侧栏 （父行是 `parentWorkspaceId` 对应的工作区），resolve 已注册的路径。 `prNumber` 存在时 fetch `pull/<n>/head` 再检出；`existingBranch` 表示 `branch` 是已存在的本地分支（检出而非新建）。路径缺省 = 宿主默认布局 `<仓库同级>/<仓库名>-worktrees/<branch>`。 失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"` （kind 与宿主错误分类一致：not_a_repo / invalid_branch / branch_not_found / branch_exists / branch_checked_out / dir_exists / pr_not_found / fetch_failed / register_failed / sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Worktree」 管线（validate → fetch → add → register）创建，宿主侧栏出现同一份进度 行与取消/重试语义；成功后 worktree 以 `kind="worktree"` 登记进侧栏 （父行是 `parentWorkspaceId` 对应的工作区），resolve 已注册的路径。 `prNumber` 存在时 fetch `pull/<n>/head` 再检出；`existingBranch` 表示 `branch` 是已存在的本地分支（检出而非新建）。路径缺省 = 宿主默认布局 `<仓库同级>/<仓库名>-worktrees/<branch>`。 失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"` （kind 与宿主错误分类一致：not_a_repo / repo_open_failed / invalid_branch / branch_not_found / branch_exists / branch_checked_out / dir_exists / pr_not_found / fetch_failed / register_failed / sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。 `repo_open_failed` = 仓库存在但打不开（如属主校验拒绝），detail 以 `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。
 
 ```ts
 worktrees: {
@@ -464,6 +467,7 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `ui:sidebar-entry` | `ctx.ui.registerSidebarNav` |
 | `ui:center-tab` | `ctx.ui.registerCenterTab`、`ctx.ui.openCenterTab` |
 | `ui:conversation-mode` | `ctx.ui.registerConversationMode` |
+| `ui:worktree-badge` | `ctx.ui.registerWorktreeBadges` |
 | `agent` | `ctx.agent.catalog`、`ctx.agent.start`、`ctx.agent.interrupt` |
 | `theme` | `ctx.theme.injectCss`、`ctx.theme.setTokens` |
 | `i18n` | `ctx.i18n.addBundle` |

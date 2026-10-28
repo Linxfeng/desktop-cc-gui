@@ -144,7 +144,7 @@ function DeleteStatusPanel({
   );
 }
 
-/** Optional 「同时删除分支」 checkbox with its hint. */
+/** Optional 「同时删除分支」 checkbox; the hint line is part of its click target. */
 function DeleteBranchOption({
   branch,
   baseRef,
@@ -160,19 +160,15 @@ function DeleteBranchOption({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="flex flex-col gap-0.5">
-      <Checkbox
-        size="sm"
-        isSelected={deleteBranch}
-        onChange={onDeleteBranchChange}
-        isDisabled={disabled}
-      >
-        {t("worktree.deleteBranchOption", { branch })}
-      </Checkbox>
-      <span className="pl-6 text-caption-1-regular text-text-tertiary">
-        {t("worktree.deleteBranchHint", { base: baseRef })}
-      </span>
-    </div>
+    <Checkbox
+      size="sm"
+      isSelected={deleteBranch}
+      onChange={onDeleteBranchChange}
+      isDisabled={disabled}
+      hint={t("worktree.deleteBranchHint", { base: baseRef })}
+    >
+      {t("worktree.deleteBranchOption", { branch })}
+    </Checkbox>
   );
 }
 

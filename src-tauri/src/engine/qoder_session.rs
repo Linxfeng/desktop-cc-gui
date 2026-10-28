@@ -1,10 +1,13 @@
 //! Qoder ACP turn driver: one send = one `qodercli --acp` child speaking
 //! JSON-RPC over stdio, settled like [`super::dsh_session::run_host_turn`].
 //!
-//! Wire (reference-verified against qodercli 1.1.28):
+//! Wire (reference-verified against qodercli 1.1.28; mode handling against
+//! the 1.1.79 bundle):
+//! - Spawn: `--acp --permission-mode bypass_permissions` (see ACP_LAUNCH_ARGS).
 //! - Handshake: initialize → session/new | session/resume (req.session_id)
 //!   → session/set_model? → session/set_config_option (reasoning_effort)?
-//!   → session/set_mode bypassPermissions → session/prompt.
+//!   → session/set_mode bypassPermissions (only when not already bypass)
+//!   → session/prompt.
 //! - The turn streams as session/update notifications and settles on the
 //!   typed prompt response — which qodercli slips BETWEEN notifications
 //!   (first user chunk → result → thought/tool/final text), so after the
@@ -912,10 +915,28 @@ pub(crate) fn spawn_piped_acp(
     })
 }
 
+/// Start every session in bypass mode via the documented startup flag
+/// (accepted by 1.1.28 through 1.1.79): qodercli 1.1.78/1.1.79 map the ACP
+/// `bypassPermissions` mode to their internal `yolo` id, which their own
+/// set_permission_mode then rejects ("unknown permission_mode: yolo"), so
+/// session/set_mode can no longer switch into bypass after the fact.
+const ACP_LAUNCH_ARGS: [&str; 3] = ["--acp", "--permission-mode", "bypass_permissions"];
+
 async fn spawn_acp(bin: &str, workspace: &Path) -> Result<SpawnedAcp, String> {
     let mut command = super::command_for_binary(bin);
-    command.arg("--acp");
+    command.args(ACP_LAUNCH_ARGS);
     spawn_piped_acp(&mut command, bin, workspace)
+}
+
+/// Whether session/new|resume already reports bypass: older CLIs name it
+/// `bypassPermissions`, 1.1.78/1.1.79 report the internal `yolo` id.
+fn bypass_mode_active(session_result: &Value) -> bool {
+    matches!(
+        session_result
+            .pointer("/modes/currentModeId")
+            .and_then(Value::as_str),
+        Some("bypassPermissions" | "yolo")
+    )
 }
 
 /// The CLI stays resident after the response (ACP is a session protocol);
@@ -1094,15 +1115,20 @@ async fn handshake_and_prompt(
         .await
         .map_err(|error| session_setting_error("reasoning effort", effort, error))?;
     }
-    acp.request(
-        "session/set_mode",
-        json!({ "sessionId": session_id, "modeId": "bypassPermissions" }),
-        RPC_HANDSHAKE_TIMEOUT,
-        killed,
-        None,
-        &mut |_| {},
-    )
-    .await?;
+    // Only switch when the startup flag did not take (folder trust or a
+    // settings policy downgraded to default, or a CLI that ignores it); the
+    // CLI's own error then surfaces instead of a silent non-bypass turn.
+    if !bypass_mode_active(&session_result) {
+        acp.request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": "bypassPermissions" }),
+            RPC_HANDSHAKE_TIMEOUT,
+            killed,
+            None,
+            &mut |_| {},
+        )
+        .await?;
+    }
 
     let prompt_blocks = assemble_prompt_blocks(&req.prompt, &req.images, &req.workspace)?;
     let result = acp
@@ -1504,5 +1530,24 @@ mod tests {
         let result = json!({"models": {"availableModels": [{"modelId": "a"}]}});
         let models = parse_models_from_session_new(&result);
         assert!(models[0].is_default);
+    }
+
+    #[test]
+    fn bypass_started_session_skips_set_mode() {
+        // qodercli 1.1.78/1.1.79 report the internal "yolo" id for a session
+        // started with --permission-mode bypass_permissions; set_mode on
+        // that id fails with "unknown permission_mode: yolo".
+        let started = json!({"sessionId": "s-1", "modes": {"currentModeId": "yolo"}});
+        assert!(bypass_mode_active(&started));
+        let legacy = json!({"modes": {"currentModeId": "bypassPermissions"}});
+        assert!(bypass_mode_active(&legacy));
+        // Trust/policy downgrade or a CLI that ignores the flag: switch.
+        let downgraded = json!({"modes": {"currentModeId": "default"}});
+        assert!(!bypass_mode_active(&downgraded));
+        assert!(!bypass_mode_active(&json!({"sessionId": "s-1"})));
+        assert_eq!(
+            ACP_LAUNCH_ARGS,
+            ["--acp", "--permission-mode", "bypass_permissions"]
+        );
     }
 }

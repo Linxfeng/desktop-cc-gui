@@ -17,6 +17,7 @@
     "ui:sidebar-entry",
     "ui:center-tab",
     "ui:conversation-mode",
+    "ui:worktree-badge",
     "agent",
     "theme",
     "i18n",

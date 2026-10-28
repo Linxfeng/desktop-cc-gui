@@ -19,6 +19,7 @@ pub mod event_sink;
 pub mod files;
 pub mod fonts;
 pub mod git;
+pub mod git_ignore;
 pub mod git_wsl;
 pub mod git_worktree;
 pub mod history;
@@ -608,6 +609,7 @@ pub fn run() {
             git::git_branches,
             git::git_checkout,
             git::git_create_branch,
+            git::git_init,
             git_worktree::git_worktree_list,
             git_worktree::git_worktree_create,
             git_worktree::git_worktree_create_cancel,
@@ -619,6 +621,7 @@ pub fn run() {
             open_app::open_custom_program,
             open_app::get_program_icon,
             open_app::reveal_in_file_manager,
+            open_app::browser::open_in_browser,
             // terminal
             terminal::terminal_host_info,
             terminal::terminal_open,
@@ -678,6 +681,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // macOS 空闲时的 ⌘Q / 程序坞退出不经过窗口的 CloseRequested /
+                // Destroyed（见 quit_guard.rs），只走到这里：兜底落盘最后一次窗口
+                // 变化。其余平台窗口关闭时已 flush，这里重复写同一份快照，无害。
+                window_state::flush();
                 if let Some(metrics) = app.try_state::<metrics::MetricsState>() {
                     metrics.stop();
                 }

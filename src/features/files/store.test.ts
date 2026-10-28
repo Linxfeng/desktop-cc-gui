@@ -105,6 +105,55 @@ describe("file tree Git refresh", () => {
   });
 });
 
+/** list_dir 在后台线程跑，同一目录的两次列举可能乱序返回：只有最新一次能写入。 */
+describe("file tree listings of one directory", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.resetAllMocks();
+    mocks.gitTreeStatus.mockResolvedValue(emptyStatus());
+    useFilesStore.setState({ root: "/repo", children: { "/repo": [entry("old.txt")] }, expanded: {}, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {}, refreshing: false });
+  });
+
+  function deferredListing() {
+    let resolve!: (entries: DirEntry[]) => void;
+    mocks.listDir.mockReturnValueOnce(new Promise<DirEntry[]>((r) => { resolve = r; }));
+    return resolve;
+  }
+
+  it("asks for Git ignore flags bounded by the tree root", async () => {
+    mocks.listDir.mockResolvedValue([entry("a.txt")]);
+    await useFilesStore.getState().invalidateDir("/repo");
+    expect(mocks.listDir).toHaveBeenCalledWith("/repo", { gitIgnoreRoot: "/repo" });
+  });
+
+  it("a refresh listing that resolves after a newer invalidate does not overwrite it", async () => {
+    const finishRefresh = deferredListing();
+    mocks.listDir.mockResolvedValueOnce([entry("renamed.txt")]);
+    const refresh = useFilesStore.getState().refreshTree();
+    await useFilesStore.getState().invalidateDir("/repo");
+    expect(useFilesStore.getState().children["/repo"]).toEqual([entry("renamed.txt")]);
+
+    finishRefresh([entry("before-rename.txt")]);
+    await refresh;
+    expect(useFilesStore.getState().children["/repo"]).toEqual([entry("renamed.txt")]);
+    expect(useFilesStore.getState().refreshing).toBe(false);
+  });
+
+  it("a superseded first load still clears its loading flag", async () => {
+    useFilesStore.setState({ children: { "/repo": [entry("sub", true)] }, expanded: { "/repo/sub": true } });
+    const finishLoad = deferredListing();
+    mocks.listDir.mockResolvedValue([entry("fresh.txt")]);
+    const load = useFilesStore.getState().ensureDir("/repo/sub");
+    await useFilesStore.getState().refreshTree();
+    expect(useFilesStore.getState().children["/repo/sub"]).toEqual([entry("fresh.txt")]);
+
+    finishLoad([entry("stale.txt")]);
+    await load;
+    expect(useFilesStore.getState().children["/repo/sub"]).toEqual([entry("fresh.txt")]);
+    expect(useFilesStore.getState().loadingDirs["/repo/sub"]).toBeUndefined();
+  });
+});
+
 /** 文件抢到中心时，其余中心面（插件中心/插件页/工作台/差异/浏览器）要让位，
  *  否则编辑器页签亮了，画面还停在原来那一面。 */
 describe("文件打开时的中心面互斥", () => {

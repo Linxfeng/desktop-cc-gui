@@ -1,10 +1,13 @@
 import { useTranslation } from "react-i18next";
 import FileText from "lucide-react/dist/esm/icons/file-text";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
+import Globe from "lucide-react/dist/esm/icons/globe";
 import Link2 from "lucide-react/dist/esm/icons/link-2";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { copyText } from "@/lib/clipboard";
 import { ipc } from "@/lib/ipc";
+import { isWeb } from "@/lib/platform";
+import { canOpenInBrowser } from "@/features/files/editor-view-mode";
 import { useFilesStore } from "@/features/files/store";
 import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
 import {
@@ -33,6 +36,8 @@ export interface FileLinkMenuState {
  * file-link entry list:
  *
  * - 打开文件 → center-area editor tab (same as left-click)
+ * - 在浏览器中打开 → default web browser; HTML links on desktop only, the
+ *   same gate the file tree and changes panel menus use
  * - 在 <app> 中打开 → the header's selected "open with" target (VS Code,
  *   Cursor, IDEA); when that target is the file manager this entry *is* the
  *   reveal action, matching the reference app
@@ -64,6 +69,11 @@ export function FileLinkContextMenu({
       : t("files.revealInFileManager");
 
   const resolved = menu.resolvedPath;
+  // Gate on the resolved path when there is one: a message may write
+  // `page.html:12` and resolveFilePath strips the source location before the
+  // extension check. With no resolution the entry stays visible-but-disabled,
+  // like 打开文件 / 在访达中显示.
+  const canBrowse = canOpenInBrowser(resolved ?? menu.path, !isWeb);
   // The sync `resolved` gates an entry (instant feedback); the async resolver
   // upgrades it to the path actually on disk before the action runs — a link
   // whose file sits nested below the workspace root would otherwise open
@@ -95,6 +105,22 @@ export function FileLinkContextMenu({
           void useFilesStore.getState().openFile(path);
         }),
     },
+    // Silent on failure like the other entries here: the backend re-validates
+    // the (canonical) file, and the chat timeline has no per-action error row.
+    ...(canBrowse
+      ? [
+          {
+            id: "open-in-browser",
+            label: t("files.openInBrowser"),
+            icon: <Globe className="size-4" aria-hidden />,
+            disabled: !resolved,
+            onSelect: () =>
+              act((path) => {
+                void ipc.openInBrowser(path).catch(() => {});
+              }),
+          },
+        ]
+      : []),
     target.kind === "finder"
       ? revealEntry
       : {

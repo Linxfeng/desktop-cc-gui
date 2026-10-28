@@ -11,7 +11,20 @@ vi.mock("react-i18next", async (importOriginal) => ({
   ...await importOriginal<typeof import("react-i18next")>(),
   useTranslation: () => ({ t: (key: string) => key }),
 }));
-vi.mock("./ChangesPanelHeader", () => ({ ChangesPanelHeader: ({ error, pending }: { error?: string; pending: Record<string, true> }) => <header>{error}{pending.stage ? "stage pending" : ""}</header> }));
+vi.mock("./ChangesPanelHeader", () => ({
+  ChangesPanelHeader: ({ error, pending, run, onDismissError }: {
+    error?: string;
+    pending: Record<string, true>;
+    run: (key: string, action: () => Promise<unknown>) => void;
+    onDismissError: () => void;
+  }) => (
+    <header>
+      {error}{pending.stage ? "stage pending" : ""}
+      <button onClick={() => run("pull", () => Promise.reject(new Error("pull failed")))}>header pull</button>
+      {error && <button onClick={onDismissError}>dismiss error</button>}
+    </header>
+  ),
+}));
 vi.mock("./CommitFooter", () => ({
   CommitFooter: ({ commitMsg, onCommitMsgChange }: { commitMsg: string; onCommitMsgChange: (value: string) => void }) => (
     <footer><textarea value={commitMsg} onChange={(event) => onCommitMsgChange(event.target.value)} /><button onClick={() => onCommitMsgChange("saved draft")}>write draft</button></footer>
@@ -87,6 +100,7 @@ describe("ChangesPanel virtual rows", () => {
           untracked: [{ path: "new.ts", status: "added" }],
         },
       },
+      errorByWorkspace: {},
       refresh: vi.fn().mockResolvedValue(undefined),
       loadBranches: vi.fn().mockResolvedValue(undefined),
       stage: vi.fn().mockResolvedValue(undefined),
@@ -281,6 +295,23 @@ describe("ChangesPanel virtual rows", () => {
     expect(container.querySelector("header")!.textContent).not.toContain("stage pending");
   });
 
+  it("keeps an open discard confirmation in place when a refresh fails meanwhile", () => {
+    const row = container.querySelectorAll("section")[1].querySelector("li")!;
+    act(() => row.querySelector<HTMLButtonElement>('[aria-label="git.discard"]')!.click());
+    const confirmOpen = () =>
+      [...container.querySelectorAll("button")].some((button) => button.textContent === "confirm");
+    expect(confirmOpen()).toBe(true);
+
+    // A failed refresh clears the status; the dialog must not vanish here and
+    // resurface with stale paths once the status comes back.
+    act(() => useGitStore.setState({
+      statusByWorkspace: { "/repo": undefined },
+      errorByWorkspace: { "/repo": "status read failed" },
+    }));
+    expect(container.querySelector('[role="alert"]')!.textContent).toContain("status read failed");
+    expect(confirmOpen()).toBe(true);
+  });
+
   it("tracks preceding groups that become empty and later reappear", () => {
     const preceding = container.querySelector("section")!;
     act(() => useGitStore.setState((state) => ({ statusByWorkspace: { "/repo": { ...state.statusByWorkspace["/repo"]!, staged: [] } } })));
@@ -293,5 +324,123 @@ describe("ChangesPanel virtual rows", () => {
       scroller.dispatchEvent(new Event("scroll"));
     });
     expect(container.querySelectorAll("section")[1].textContent).toContain("file-0.ts");
+  });
+});
+
+describe("ChangesPanel outside a Git repository", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    useGitStore.setState({
+      statusByWorkspace: { "/plain": undefined },
+      notRepoByWorkspace: { "/plain": true },
+      refresh: vi.fn().mockResolvedValue(undefined),
+      loadBranches: vi.fn().mockResolvedValue(undefined),
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root.render(<ChangesPanel workspacePath="/plain" repoPath="/plain" />));
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    useGitStore.setState({ notRepoByWorkspace: {} });
+    vi.restoreAllMocks();
+  });
+
+  const initButton = () =>
+    [...container.querySelectorAll("button")].find((b) => b.textContent === "git.initRepo")!;
+
+  it("initializes the shown workspace and stays busy until init settles", async () => {
+    let resolve!: () => void;
+    const init = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    useGitStore.setState({ init });
+
+    expect(container.textContent).toContain("git.notARepo");
+    act(() => initButton().click());
+    expect(init).toHaveBeenCalledWith("/plain");
+    expect(initButton().disabled).toBe(true);
+    // A second click while busy must not start another init.
+    act(() => initButton().click());
+    expect(init).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolve());
+    expect(initButton().disabled).toBe(false);
+  });
+
+  it("surfaces an init failure in the header and lets the user retry", async () => {
+    useGitStore.setState({ init: vi.fn().mockRejectedValue(new Error("permission denied")) });
+
+    await act(async () => initButton().click());
+
+    expect(container.querySelector("header")!.textContent).toContain("permission denied");
+    expect(initButton().disabled).toBe(false);
+  });
+});
+
+describe("ChangesPanel when Git status cannot be read", () => {
+  const reason = "Git 仓库所有权不受信任：repository path '/locked' is not owned by current user";
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    useGitStore.setState({
+      statusByWorkspace: { "/locked": undefined },
+      notRepoByWorkspace: { "/locked": false },
+      errorByWorkspace: { "/locked": reason },
+      refresh: vi.fn().mockResolvedValue(undefined),
+      loadBranches: vi.fn().mockResolvedValue(undefined),
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root.render(<ChangesPanel workspacePath="/locked" repoPath="/locked" />));
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    useGitStore.setState({ errorByWorkspace: {}, notRepoByWorkspace: {} });
+    vi.restoreAllMocks();
+  });
+
+  const body = () => container.querySelector('[role="alert"]');
+  const button = (text: string) =>
+    [...container.querySelectorAll("button")].find((b) => b.textContent === text)!;
+
+  it("shows the reason in the body instead of an endless loading state", () => {
+    expect(body()!.textContent).toContain(reason);
+    expect(container.textContent).not.toContain("common.loading");
+    expect(container.textContent).not.toContain("git.notARepo");
+    // Nothing to commit without a status; the header does not repeat the reason.
+    expect(container.querySelector("footer")).toBeNull();
+    expect(container.querySelector("header")!.textContent).not.toContain(reason);
+  });
+
+  it("retries the status read and stays busy until it settles", async () => {
+    let resolve!: () => void;
+    const refresh = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    useGitStore.setState({ refresh });
+
+    act(() => button("git.retryStatus").click());
+    expect(refresh).toHaveBeenCalledWith("/locked", true);
+    expect(button("git.retryStatus").disabled).toBe(true);
+
+    await act(async () => resolve());
+    expect(button("git.retryStatus").disabled).toBe(false);
+  });
+
+  it("keeps the reason when an unrelated action error is dismissed", async () => {
+    await act(async () => button("header pull").click());
+    expect(container.querySelector("header")!.textContent).toContain("pull failed");
+
+    act(() => button("dismiss error").click());
+
+    expect(container.querySelector("header")!.textContent).not.toContain("pull failed");
+    expect(useGitStore.getState().errorByWorkspace["/locked"]).toBe(reason);
+    expect(body()!.textContent).toContain(reason);
   });
 });

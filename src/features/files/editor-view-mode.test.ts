@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isHtmlFile, isMarkdownFile, opensInPreview } from "./editor-view-mode";
+import {
+  canOpenInBrowser,
+  isHtmlFile,
+  isMarkdownFile,
+  opensInPreview,
+} from "./editor-view-mode";
 
 describe("editor view mode", () => {
   it("opens Markdown in preview on every platform", () => {
@@ -32,5 +37,14 @@ describe("editor view mode", () => {
   it("matches extensions case-insensitively", () => {
     expect(opensInPreview("INDEX.HTML", true)).toBe(true);
     expect(opensInPreview("README.MD", true)).toBe(true);
+  });
+
+  it("offers open-in-browser for HTML on desktop only", () => {
+    expect(canOpenInBrowser("docs/pr-flow-design.html", true)).toBe(true);
+    expect(canOpenInBrowser("/abs/INDEX.HTM", true)).toBe(true);
+    expect(canOpenInBrowser("docs/pr-flow-design.html", false)).toBe(false);
+    for (const name of ["README.md", "index.html.bak", "docs"]) {
+      expect(canOpenInBrowser(name, true)).toBe(false);
+    }
   });
 });

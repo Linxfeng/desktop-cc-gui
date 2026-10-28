@@ -339,6 +339,53 @@ export interface PluginWorkspaceRow {
   worktree?: { branch: string; prNumber?: number };
 }
 
+/** Worktree badge accent（0.3.22）。宿主把它映射到 status token；不在
+ *  白名单里的值按 "neutral" 处理，不会透传到 CSS。 */
+export type WorktreeBadgeTone =
+  | "neutral"
+  | "blue"
+  | "cyan"
+  | "green"
+  | "lime"
+  | "yellow"
+  | "rose"
+  | "purple";
+
+/** 侧栏 worktree 子行（`host:workspace` 投影，0.3.22）：徽标接口与列表
+ *  回调收到的目标。`prNumber` 缺失为 null（不是 undefined）。 */
+export interface WorktreeBadgeTarget {
+  workspaceId: string;
+  parentWorkspaceId: string;
+  path: string;
+  branch: string;
+  prNumber: number | null;
+}
+
+/** 一行 worktree 子行上的一块徽标（0.3.22）。`label` 去掉首尾空白后按
+ *  码点截到 6；`tooltip` 截到 300；空 label 视为不显示。 */
+export interface WorktreeBadge {
+  label: string;
+  tone: WorktreeBadgeTone;
+  tooltip?: string;
+}
+
+/** `ctx.ui.registerWorktreeBadges` 的句柄（0.3.22）。`list`/`onChange` 额外
+ *  需要 `host:workspace`；`set`/`clear` 只需要 `ui:worktree-badge`。
+ *  卸载时宿主清掉本插件的全部徽标与订阅，`dispose()` 可提前做同样的事。 */
+export interface WorktreeBadgeHandle {
+  /** 当前侧栏的 worktree 子行快照（需要 `host:workspace`）。 */
+  list(): WorktreeBadgeTarget[];
+  /** 跟随 worktree 子行增删或分支/PR/路径变化（需要 `host:workspace`）；
+   *  回调在插件上下文中执行。 */
+  onChange(cb: (targets: WorktreeBadgeTarget[]) => void): Disposer;
+  /** 给一行设置（替换）徽标；`null` 等于清除该行。 */
+  set(workspaceId: string, badge: WorktreeBadge | null): void;
+  /** 清掉本句柄设置的全部徽标（保留订阅）。 */
+  clear(): void;
+  /** 清掉徽标与订阅；幂等，卸载时宿主也会调用。 */
+  dispose(): void;
+}
+
 export interface PluginWindowBounds {
   /** Physical desktop coordinates; may be negative on left/top monitors. */
   x: number;
@@ -556,14 +603,36 @@ export interface PluginContext {
     }): Disposer;
     /** Home sidebar nav entry under the builtin 自动化 row (permission
      *  `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's
-     *  center tab via openCenterTab. */
+     *  center tab via openCenterTab. `badge` (0.3.22) is an optional trailing
+     *  count pill, re-evaluated every render; re-registering the same key
+     *  refreshes it. */
     registerSidebarNav(def: {
       key?: string;
       label: () => string;
       icon?: ComponentType<{ className?: string }>;
       order?: number;
+      badge?: () => string | number | null;
       onOpen: () => void;
     }): Disposer;
+    /** Sidebar worktree-row badges (permission `ui:worktree-badge`, 0.3.22):
+     *  push labels onto the "WORKTREES" child rows. `set`/`clear` need only
+     *  `ui:worktree-badge`; `list`/`onChange` also need `host:workspace` and
+     *  throw a readable error without it.
+     *
+     *  Shapes — target `{ workspaceId, parentWorkspaceId, path, branch,
+     *  prNumber: number | null }`, badge `{ label, tone, tooltip? }`.
+     *  Rendering rules: at most 2 badges per row (sorted by `order`, then
+     *  registration order); `tone` outside "neutral" | "blue" | "cyan" |
+     *  "green" | "lime" | "yellow" | "rose" | "purple" falls back to
+     *  "neutral"; `label` is trimmed then truncated to 6 code points (empty =
+     *  no badge); `tooltip` is plain text truncated to 300. `onClick` runs in
+     *  the plugin context and never expands the sidebar row. Unload (or
+     *  `dispose()`) clears this plugin's badges and subscriptions. */
+    registerWorktreeBadges(def: {
+      key?: string;
+      order?: number;
+      onClick?: (target: WorktreeBadgeTarget) => void;
+    }): WorktreeBadgeHandle;
     /** Center-area tab definition (permission `ui:center-tab`, 0.3.12):
      *  renders in the center tab strip like session/file/browser tabs.
      *  Opening goes through openCenterTab; multiple keys = multiple tabs. */
@@ -639,10 +708,12 @@ export interface PluginContext {
    *  `<仓库同级>/<仓库名>-worktrees/<branch>`。
    *
    *  失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"`
-   *  （kind 与宿主错误分类一致：not_a_repo / invalid_branch /
-   *  branch_not_found / branch_exists / branch_checked_out / dir_exists /
-   *  pr_not_found / fetch_failed / register_failed / sparse_checkout_empty /
-   *  canceled / unknown），插件据此给用户可读文案。 */
+   *  （kind 与宿主错误分类一致：not_a_repo / repo_open_failed /
+   *  invalid_branch / branch_not_found / branch_exists / branch_checked_out /
+   *  dir_exists / pr_not_found / fetch_failed / register_failed /
+   *  sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+   *  `repo_open_failed` = 仓库存在但打不开（如属主校验拒绝），detail 以
+   *  `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。 */
   worktrees: {
     create(def: {
       /** 本地仓库路径（父工作区目录，必须是 git 仓库）。 */

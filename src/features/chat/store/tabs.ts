@@ -323,10 +323,14 @@ export function createTabActions(
         if (bySession[oldKey] && !bySession[newKey])
           bySession[newKey] = bySession[oldKey];
         delete bySession[oldKey];
-        if (drafts[oldKey] !== undefined && drafts[newKey] === undefined) {
-          drafts[newKey] = drafts[oldKey];
+        // The text the user is looking at belongs to the tab the picker is
+        // retargeting, so it wins over an empty destination draft. A
+        // destination that already holds typed text keeps it (the tab was
+        // folded into, not replaced), but an empty string is not a draft.
+        if (drafts[oldKey] !== undefined) {
+          if (!drafts[newKey]) drafts[newKey] = drafts[oldKey];
+          delete drafts[oldKey];
         }
-        delete drafts[oldKey];
         let openTabs: ActiveSession[];
         let nextActive: ActiveSession;
         if (existing) {
@@ -364,6 +368,7 @@ export function createTabActions(
           openTabs,
           active: nextActive,
           bySession,
+          drafts,
           streamingByKey: moveStreamingFlag(s.streamingByKey, oldKey, newKey),
           pendingRuntimeSwitch: {
             sourceEngine: active.engine,

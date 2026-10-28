@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use std::process::Stdio;
 
+pub(crate) mod browser;
+
 #[cfg(target_os = "macos")]
 use base64::Engine as _;
 #[cfg(target_os = "macos")]

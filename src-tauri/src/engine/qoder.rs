@@ -4,9 +4,9 @@
 //! and stays resident across requests, so the engine drives its own
 //! transport ([`Engine::drives_own_transport`]): each send spawns one child
 //! inside [`super::qoder_session::run_acp_turn`], which owns the handshake
-//! (initialize → session/new|resume → set_model? → set_mode bypassPermissions
-//! → session/prompt) and projects session/update notifications to engine
-//! events.
+//! (spawned in bypass mode → initialize → session/new|resume → set_model?
+//! → set_mode bypassPermissions if not already → session/prompt) and
+//! projects session/update notifications to engine events.
 
 use std::path::Path;
 
@@ -90,9 +90,9 @@ impl Engine for QoderEngine {
 
     fn supported_permissions(&self) -> &'static [&'static str] {
         // A headless ACP turn cannot honor an approval flow: the driver
-        // always sets session/set_mode bypassPermissions (permission
-        // requests, if any still arrive, are auto-allowed). Only "bypass"
-        // is honest.
+        // always runs the session in bypass mode (startup flag, set_mode
+        // fallback; permission requests, if any still arrive, are
+        // auto-allowed). Only "bypass" is honest.
         &["bypass"]
     }
 

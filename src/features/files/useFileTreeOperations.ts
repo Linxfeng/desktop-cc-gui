@@ -36,6 +36,7 @@ export interface FileTreeOperations {
   startRename: () => void;
   copyPath: () => void;
   sendPath: () => void;
+  openInBrowser: () => void;
   revealInFileManager: () => void;
   startTrash: () => void;
   submitPrompt: (name: string) => void;
@@ -191,6 +192,11 @@ export function useFileTreeOperations(): FileTreeOperations {
     useChatStore.getState().requestMention(menu.path);
   }, [menu]);
 
+  const openInBrowser = useCallback(() => {
+    if (!menu) return;
+    void ipc.openInBrowser(menu.path).catch(opFailed);
+  }, [menu, opFailed]);
+
   const revealInFileManager = useCallback(() => {
     if (!menu) return;
     void ipc.revealInFileManager(menu.path).catch(opFailed);
@@ -220,6 +226,7 @@ export function useFileTreeOperations(): FileTreeOperations {
     }, [menu]),
     copyPath,
     sendPath,
+    openInBrowser,
     revealInFileManager,
     startTrash: useCallback(() => {
       if (menu) setTrashTarget({ path: menu.path, isDir: menu.isDir });

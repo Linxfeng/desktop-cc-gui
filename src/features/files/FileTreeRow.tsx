@@ -113,7 +113,13 @@ export const TreeRow = memo(function TreeRow({
       <button
         type="button"
         onClick={handleClick}
-        className="flex min-w-0 flex-1 items-center gap-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+        className={cx(
+          "flex min-w-0 flex-1 items-center gap-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring",
+          // Git-ignored entries (`.git`, `.idea`, build output…) stay usable
+          // but read as secondary: icon, name and badge fade together, while
+          // the row's hover/selected background keeps full strength.
+          node.ignored && "opacity-50",
+        )}
         title={node.path}
       >
         {node.loading ? (

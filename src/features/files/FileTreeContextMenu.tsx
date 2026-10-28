@@ -8,9 +8,12 @@ import Pencil from "lucide-react/dist/esm/icons/pencil";
 import Link2 from "lucide-react/dist/esm/icons/link-2";
 import MessageSquarePlus from "lucide-react/dist/esm/icons/message-square-plus";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
+import Globe from "lucide-react/dist/esm/icons/globe";
 import Search from "lucide-react/dist/esm/icons/search";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
+import { isWeb } from "@/lib/platform";
+import { canOpenInBrowser } from "./editor-view-mode";
 import { parentPath } from "./store";
 
 export interface FileTreeMenuState {
@@ -38,6 +41,7 @@ export function FileTreeContextMenu({
   onRename,
   onCopyPath,
   onSendPath,
+  onOpenInBrowser,
   onReveal,
   onTrash,
 }: {
@@ -54,6 +58,8 @@ export function FileTreeContextMenu({
   onRename: () => void;
   onCopyPath: () => void;
   onSendPath: () => void;
+  /** Offered only for HTML file rows on desktop (see canOpenInBrowser). */
+  onOpenInBrowser: () => void;
   onReveal: () => void;
   onTrash: () => void;
 }) {
@@ -83,6 +89,9 @@ export function FileTreeContextMenu({
     { id: "rename", label: t("files.renameItem"), icon: <Pencil className="size-4" aria-hidden />, onSelect: onRename },
     { id: "copy-path", label: t("files.copyPath"), icon: <Link2 className="size-4" aria-hidden />, onSelect: onCopyPath },
     { id: "send-path", label: t("files.sendPathToComposer"), icon: <MessageSquarePlus className="size-4" aria-hidden />, onSelect: onSendPath },
+    ...(!menu.isDir && canOpenInBrowser(menu.path, !isWeb)
+      ? [{ id: "open-in-browser", label: t("files.openInBrowser"), icon: <Globe className="size-4" aria-hidden />, onSelect: onOpenInBrowser }]
+      : []),
     { id: "reveal", label: revealLabel, icon: <FolderOpen className="size-4" aria-hidden />, onSelect: onReveal },
     "separator",
     { id: "trash", label: t("files.deleteItem"), icon: <Trash2 className="size-4" aria-hidden />, danger: true, onSelect: onTrash },

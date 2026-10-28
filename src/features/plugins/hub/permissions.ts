@@ -44,6 +44,7 @@ const UI_LABELS: Record<string, string> = {
   "ui:sidebar-entry": "uiSidebarEntry",
   "ui:center-tab": "uiCenterTab",
   "ui:conversation-mode": "uiConversationMode",
+  "ui:worktree-badge": "uiWorktreeBadge",
 };
 
 export function describePermission(permission: string): PermissionDescription {

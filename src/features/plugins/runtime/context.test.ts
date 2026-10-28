@@ -32,6 +32,7 @@ import {
   dispatchRuntimeEvent,
 } from "./hooks";
 import { installHardening, runAsPlugin } from "./hardening";
+import { worktreeBadgeStore } from "./worktree-badges";
 // composer.setDraft 的 store 落点由 composer-draft.test.ts 单独覆盖；
 // 这里只验证权限门与委派，不拉入 chat store 依赖链。
 vi.mock("./composer-draft", () => ({ setActiveComposerDraft: vi.fn() }));
@@ -1061,6 +1062,133 @@ describe("createPluginContext", () => {
   });
 });
 
+describe("ctx.ui.registerWorktreeBadges", () => {
+  const worktreeRows = [
+    {
+      id: "w1",
+      path: "/Users/me/proj",
+      name: "proj",
+      lastOpenedAt: 17,
+      sortOrder: null,
+      groupId: null,
+    },
+    {
+      id: "w2",
+      path: "/Users/me/proj-worktrees/pr-1",
+      name: "pr-1",
+      lastOpenedAt: null,
+      sortOrder: null,
+      groupId: null,
+      kind: "worktree" as const,
+      parentId: "w1",
+      meta: { worktree: { branch: "pr-1", prNumber: 12 }, secret: "must-not-leak" },
+    },
+  ];
+
+  beforeEach(() => worktreeBadgeStore.reset());
+
+  it("requires ui:worktree-badge", () => {
+    const { ctx } = createPluginContext(manifest(["host:workspace"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    expect(() => ctx.ui.registerWorktreeBadges({})).toThrow(/ui:worktree-badge/);
+  });
+
+  it("allows set/clear with only ui:worktree-badge but gates list/onChange on host:workspace", () => {
+    const { ctx } = createPluginContext(manifest(["ui:worktree-badge"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    try {
+      expect(() => handle.list()).toThrow(/host:workspace/);
+      expect(() => handle.onChange(() => {})).toThrow(/host:workspace/);
+
+      handle.set("w2", { label: "  TASK  ", tone: "cyan", tooltip: "task #12" });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]?.map((badge) => badge.label)).toEqual([
+        "TASK",
+      ]);
+      handle.clear();
+      expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  it("normalises bad tones and drops empty labels instead of rendering garbage", () => {
+    const { ctx } = createPluginContext(manifest(["ui:worktree-badge"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    const handle = ctx.ui.registerWorktreeBadges({});
+    try {
+      expect(() => handle.set("  ", { label: "x", tone: "blue" })).toThrow(/workspace id/);
+      handle.set("w2", { label: "x", tone: "magenta" as never });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]?.[0]?.tone).toBe("neutral");
+      handle.set("w2", { label: "   ", tone: "blue" });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  it("clears this plugin's badges on dispose and rejects later writes", () => {
+    const { ctx, disposers } = createPluginContext(
+      manifest(["ui:worktree-badge"]),
+      fakeStorage(),
+      { appVersion: "1" },
+    );
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    handle.set("w2", { label: "A", tone: "blue" });
+    expect(disposers.length).toBeGreaterThan(0);
+    handle.dispose();
+    expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    expect(() => handle.set("w2", { label: "B", tone: "blue" })).toThrow(/dispose/);
+  });
+
+  it("lists worktree rows and only notifies onChange on relevant changes", async () => {
+    const { useChatStore } = await import("@/features/chat/store");
+    const previous = useChatStore.getState().workspaces;
+    useChatStore.setState({ workspaces: worktreeRows });
+    const { ctx } = createPluginContext(
+      manifest(["ui:worktree-badge", "host:workspace"]),
+      fakeStorage(),
+      { appVersion: "1" },
+    );
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    try {
+      expect(handle.list()).toEqual([
+        {
+          workspaceId: "w2",
+          parentWorkspaceId: "w1",
+          path: "/Users/me/proj-worktrees/pr-1",
+          branch: "pr-1",
+          prNumber: 12,
+        },
+      ]);
+
+      const onChange = vi.fn();
+      handle.onChange(onChange);
+
+      // 改名 / 排序 / 普通工作区变化都不该唤醒插件。
+      useChatStore.setState({
+        workspaces: [{ ...worktreeRows[0]!, name: "renamed" }, worktreeRows[1]!],
+      });
+      expect(onChange).not.toHaveBeenCalled();
+
+      useChatStore.setState({
+        workspaces: [
+          worktreeRows[0]!,
+          { ...worktreeRows[1]!, meta: { worktree: { branch: "pr-1", prNumber: 13 } } },
+        ],
+      });
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange.mock.calls[0]![0][0].prNumber).toBe(13);
+    } finally {
+      handle.dispose();
+      useChatStore.setState({ workspaces: previous });
+    }
+  });
+});
+
 describe("permissioned SDK calls from guarded plugin callbacks", () => {
   const originalInternals = window.__TAURI_INTERNALS__;
   const nativeInvoke = vi.fn(async (_cmd: string, _args?: unknown): Promise<unknown> => null);
@@ -1133,6 +1261,78 @@ describe("permissioned SDK calls from guarded plugin callbacks", () => {
       await expect(runAsPlugin(() => ctx.storage.get("work"))).resolves.toBeNull();
     } finally {
       dispose();
+    }
+  });
+
+  it("runs worktree badge onClick and onChange as plugin code", async () => {
+    const { useChatStore } = await import("@/features/chat/store");
+    const previous = useChatStore.getState().workspaces;
+    useChatStore.setState({
+      workspaces: [
+        {
+          id: "w2",
+          path: "/repo-wt/pr-1",
+          name: "pr-1",
+          lastOpenedAt: null,
+          sortOrder: null,
+          groupId: null,
+          kind: "worktree",
+          parentId: "w1",
+          meta: { worktree: { branch: "pr-1" } },
+        },
+      ],
+    });
+    worktreeBadgeStore.reset();
+    const { ctx } = createPluginContext(
+      manifest(["ui:worktree-badge", "host:workspace"]),
+      ipcStorage(),
+      { appVersion: "1.0.0" },
+    );
+    const clicks: string[] = [];
+    const changes: number[] = [];
+    const blocked: Promise<unknown>[] = [];
+    const handle = ctx.ui.registerWorktreeBadges({
+      key: "tasks",
+      onClick: (target) => {
+        clicks.push(target.workspaceId);
+        blocked.push(tauriInvoke("plugin_storage_get", { id: ctx.pluginId, key: "x" }));
+      },
+    });
+    try {
+      handle.set("w2", { label: "T", tone: "blue" });
+      handle.onChange((targets) => {
+        changes.push(targets.length);
+        blocked.push(tauriInvoke("plugin_storage_get", { id: ctx.pluginId, key: "y" }));
+      });
+
+      // Clicking is a host render path, not a plugin callback: the badge's
+      // own onClick must raise the plugin flag itself.
+      worktreeBadgeStore.getSnapshot()["w2"]![0]!.onClick!();
+      expect(clicks).toEqual(["w2"]);
+
+      useChatStore.setState({
+        workspaces: [
+          {
+            id: "w2",
+            path: "/repo-wt/pr-1",
+            name: "pr-1",
+            lastOpenedAt: null,
+            sortOrder: null,
+            groupId: null,
+            kind: "worktree",
+            parentId: "w1",
+            meta: { worktree: { branch: "pr-1", prNumber: 5 } },
+          },
+        ],
+      });
+      expect(changes).toEqual([1]);
+
+      for (const request of blocked) await expect(request).rejects.toThrow(/blocked/);
+      expect(blocked).toHaveLength(2);
+    } finally {
+      handle.dispose();
+      useChatStore.setState({ workspaces: previous });
+      worktreeBadgeStore.reset();
     }
   });
 

@@ -724,6 +724,32 @@ pub async fn create_branch(unc: &WslUncPath, name: &str) -> Result<(), String> {
     classify(&raw, &unc.linux_path).map(|_| ())
 }
 
+/// 变更面板「初始化仓库」：与主机 `init_repository` 同语义——目录必须已存在、
+/// 已在某个仓库内（面板的 NOT_A_REPO 可能已过时）则什么都不做，避免嵌套仓库
+/// 遮住外层仓库的改动；初始分支跟随发行版内的 `init.defaultBranch`。
+/// 「找不到仓库」以外的探测失败（如上层仓库属主不受信任）原样报错，不在其下
+/// 新建仓库。
+pub async fn init(unc: &WslUncPath) -> Result<(), String> {
+    let raw = run(unc, &init_script(&unc.linux_path)).await?;
+    classify(&raw, &unc.linux_path).map(|_| ())
+}
+
+fn init_script(linux_path: &str) -> String {
+    format!(
+        "command -v git >/dev/null 2>&1 || {{ printf '{SENT_NO_GIT}\\n'; exit 0; }}\n\
+         cd -- {} 2>/dev/null || {{ printf '{SENT_CWD}\\n'; exit 0; }}\n\
+         if probe=$(LC_ALL=C git rev-parse --show-toplevel 2>&1); then exit 0; fi\n\
+         case \"$probe\" in\n\
+           *'not a git repository'*) ;;\n\
+           *) printf '{SENT_ERR}%s\\n' \"$(printf '%s' \"$probe\" | base64 -w0)\"; exit 0 ;;\n\
+         esac\n\
+         root=.\n\
+         {}exit 0\n",
+        wsl_transport::sh_quote(linux_path),
+        run_or_err("init -q"),
+    )
+}
+
 // ── 文件树装饰 ─────────────────────────────────────────────────────────────
 
 /// 一个 level 的解析结果。
@@ -1165,6 +1191,18 @@ mod tests {
         assert_eq!(levels[0].entries.len(), 1);
         assert!(levels[1].reused);
         assert_eq!(levels[1].entries.len(), 1);
+    }
+
+    #[test]
+    fn init_script_never_nests_and_always_exits_zero() {
+        let script = init_script("/home/me/my repo");
+        assert!(script.contains("cd -- '/home/me/my repo'"));
+        assert!(script.contains("command -v git"));
+        // 已在仓库内直接返回；只有「找不到仓库」才继续 init，其它探测失败上报。
+        assert!(script.contains("LC_ALL=C git rev-parse --show-toplevel 2>&1); then exit 0; fi"));
+        assert!(script.contains("*'not a git repository'*) ;;"));
+        assert!(script.contains("git -C \"$root\" init -q"));
+        assert!(script.ends_with("exit 0\n"));
     }
 
     #[test]

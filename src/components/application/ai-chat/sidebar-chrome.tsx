@@ -39,20 +39,23 @@ const headerButtonClasses = cx(
   "text-foreground-icon-secondary hover:bg-background-secondary-hover hover:text-foreground-icon-primary",
 );
 
-/** Top-level nav row — icon + label, p 8, radius/2lg. */
+/** Top-level nav row — icon + label, p 8, radius/2lg. `badge` (SDK 0.3.22)
+ *  is the plugin's optional trailing count; absent = no extra DOM. */
 function NavItem({
   icon: Icon,
   label,
+  badge,
   onClick,
 }: {
   icon: IconComponent;
   label: string;
+  badge?: string | null;
   onClick?: () => void;
 }) {
   return (
     <button
       type="button"
-      aria-label={label}
+      aria-label={badge != null ? `${label} (${badge})` : label}
       onClick={onClick}
       className={cx(
         "flex w-full cursor-pointer items-center gap-2 rounded-2lg p-2 transition-colors duration-150 ease",
@@ -61,8 +64,35 @@ function NavItem({
     >
       <Icon className="size-4 shrink-0 text-foreground-icon-secondary" aria-hidden />
       <span className="text-body-2-medium whitespace-nowrap text-text-secondary">{label}</span>
+      {badge != null && (
+        <span className="ml-auto shrink-0 rounded-full bg-background-tertiary-default px-1.5 py-px text-caption-2-medium text-text-tertiary">
+          {badge}
+        </span>
+      )}
     </button>
   );
+}
+
+/** 插件导航项末尾的计数：每次渲染求值；抛错或空串按「无徽标」，一个插件的
+ *  坏状态不能连带整条侧栏（context 侧已包 runAsPlugin，这里兜底直连注册表
+ *  的宿主/插件写入）。 */
+function sidebarNavLabel(entry: { id: string; label: () => string }): string {
+  try {
+    return entry.label();
+  } catch {
+    return entry.id;
+  }
+}
+
+function sidebarNavBadge(entry: { badge?: () => string | number | null }): string | null {
+  try {
+    const value = entry.badge?.();
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim();
+    return text === "" ? null : text;
+  } catch {
+    return null;
+  }
 }
 
 /** Grayed-out nav entry for a feature that is not available yet: hover shows
@@ -219,7 +249,8 @@ export function SidebarPrimaryNav({
         <NavItem
           key={entry.id}
           icon={(entry.icon ?? LayoutGrid) as IconComponent}
-          label={entry.label()}
+          label={sidebarNavLabel(entry)}
+          badge={sidebarNavBadge(entry)}
           onClick={entry.onOpen}
         />
       ))}

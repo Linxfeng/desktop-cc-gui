@@ -1,8 +1,9 @@
 //! Antigravity (`agy`) conversations are sqlite + protobuf, not NDJSON.
 //!
 //! User text is taken from `~/.gemini/antigravity-cli/history.jsonl` (the
-//! CLI's own prompt log). Assistant / tool text is pulled out of
-//! length-delimited UTF-8 strings in each `steps.step_payload` blob.
+//! CLI's own prompt log), falling back to the STEP_USER payload when that log
+//! has no entry. Assistant / tool text is pulled out of length-delimited
+//! UTF-8 strings in each `steps.step_payload` blob.
 
 use super::{Message, ParsedSession, ScanSummary};
 use serde::Deserialize;
@@ -256,22 +257,9 @@ fn pick_assistant(texts: &[ProtoText]) -> Option<String> {
         .map(|t| t.text.as_str())
         .filter(|t| looks_like_assistant(t))
         .collect();
-    // Depth is the walker's relative nesting, which agy layout changes can
-    // shift by a level; when no depth-1 candidate survived, retry field 1 at
-    // any depth — prose filters reject uuids, ids and fragments anyway
-    // (upstream #1388: only the last stretch of a reply survived reload).
-    let fallback: Vec<&str> = if primary.is_empty() {
-        texts
-            .iter()
-            .filter(|t| t.field == 1)
-            .map(|t| t.text.as_str())
-            .filter(|t| looks_like_assistant(t))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let candidates = if primary.is_empty() { &fallback } else { &primary };
-    longest_prose(candidates).map(|s| sanitize_assistant(&s))
+    // Deliberately no fallback to deeper field 1: in tool-only steps it holds
+    // tool payloads (file contents, command output), not the reply.
+    longest_prose(&primary).map(|s| sanitize_assistant(&s))
 }
 
 /// User text in a STEP_USER payload lives at depth 1 / field 2. When
@@ -636,14 +624,9 @@ mod tests {
         ));
     }
 
-    /// agy_home() reads the process-global ANTIGRAVITY_HOME; tests that
-    /// override it must not run concurrently with each other (or with the
-    /// live-data test that reads the real home).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn user_turns_strip_the_internal_prompt_tail() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::paths::HOME_ENV_LOCK.lock();
         // agy's history.jsonl records the effective prompt verbatim, internal
         // system/request tail included; user rows must strip it like every
         // other engine's.
@@ -681,7 +664,7 @@ mod tests {
 
     #[test]
     fn parses_live_agy_conversation_if_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::paths::HOME_ENV_LOCK.lock();
         let path = crate::engine::agy::agy_home()
             .join("conversations")
             .join("55541c2b-d633-420a-b1ff-39cbaf07a231.db");
@@ -803,7 +786,7 @@ mod tests {
 
     #[test]
     fn user_turns_fall_back_to_step_payload_without_history_jsonl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::paths::HOME_ENV_LOCK.lock();
         // Newer agy builds do not write history.jsonl; the STEP_USER payload
         // (depth 1 / field 2) is then the only record of the prompt. Without
         // the fallback every user row disappears on reload (upstream #1388).
@@ -850,15 +833,19 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_survives_nesting_depth_drift() {
-        // The visible reply normally sits at depth 1 / field 1; an agy layout
-        // change can nest it one level deeper. Only keeping depth-1 candidates
-        // dropped the whole reply on reload (upstream #1388).
-        let innermost = encode_string_field(1, "这是助手的中文回复内容，必须完整保留。");
+    fn tool_only_step_does_not_surface_nested_field1_as_reply() {
+        // A step that only calls a tool has no depth-1 / field-1 reply. Field 1
+        // nested deeper belongs to the tool payload (here: the content of a
+        // file being written) and must not be shown as an assistant message.
+        let tool = [
+            encode_string_field(1, "# 设计文档\n\n本文件描述登录模块的重构方案，包括会话存储与令牌刷新。"),
+            encode_string_field(2, "/repo/docs/design.md"),
+        ]
+        .concat();
         let mut level1 = Vec::new();
-        write_varint(&mut level1, (20 << 3) | 2);
-        write_varint(&mut level1, innermost.len() as u64);
-        level1.extend(innermost);
+        write_varint(&mut level1, (5 << 3) | 2);
+        write_varint(&mut level1, tool.len() as u64);
+        level1.extend(tool);
         let mut payload = Vec::new();
         write_varint(&mut payload, (20 << 3) | 2);
         write_varint(&mut payload, level1.len() as u64);
@@ -866,12 +853,9 @@ mod tests {
         let texts = proto_strings(&payload);
         assert!(
             texts.iter().all(|t| t.depth != 1 || t.field != 1),
-            "fixture must nest the reply below depth 1"
+            "fixture must keep field 1 below depth 1"
         );
-        assert_eq!(
-            pick_assistant(&texts).as_deref(),
-            Some("这是助手的中文回复内容，必须完整保留。")
-        );
+        assert_eq!(pick_assistant(&texts), None);
     }
 
     #[test]

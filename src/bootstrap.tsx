@@ -6,6 +6,7 @@ import { ipc } from "./lib/ipc";
 import { applyTheme, THEME_STORAGE_KEY } from "./features/settings/theme";
 import { applyFontPreferences, readCachedFontPreferences } from "./features/settings/font";
 import { hydrateBetaFeatures } from "./features/settings/beta-features";
+import { hydrateFileTreePreferences } from "./features/files/tree-preferences";
 import { initializePerformancePreference } from "./lib/performance-preference";
 import { sessionKey, useChatStore } from "./features/chat/store";
 import { getAppVersion } from "./lib/platform";
@@ -90,6 +91,8 @@ export function startApp() {
   // 内测入口（设置 → 其他 → 内测功能）决定侧栏和页签条是否渲染，随启动设置
   // 一起水合（共用同一个缓存的 settings promise）。
   void hydrateBetaFeatures();
+  // 文件树是否隐藏 Git 忽略项（设置 → 通用 → 行为），同一个缓存的 settings promise。
+  void hydrateFileTreePreferences();
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>

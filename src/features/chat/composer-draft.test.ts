@@ -79,7 +79,7 @@ function resetStore() {
   });
 }
 
-describe("composer draft survives engine events", () => {
+describe("composer draft survives session-key changes", () => {
   beforeEach(resetStore);
 
   it("keeps the text typed for the next turn when a running turn re-announces its session id", () => {
@@ -162,5 +162,56 @@ describe("composer draft survives engine events", () => {
     const state = useChatStore.getState();
     expect(state.drafts[NATIVE]).toBe("草稿");
     expect(state.drafts[PENDING]).toBeUndefined();
+  });
+
+  it("carries the typed draft when the picker retargets a pending chat", () => {
+    // The composer chip switched a never-sent tab from Claude to Codex. The
+    // active key changes with the tab, so the draft has to move with it —
+    // otherwise the field reads back as "" and the user's text vanishes.
+    const tab = { engine: "claude", sessionId: null, workspacePath: WS };
+    useChatStore.setState({
+      openTabs: [tab],
+      active: tab,
+      drafts: { [PENDING]: "还没发出的草稿" },
+    });
+
+    useChatStore.getState().setActiveEngine("codex");
+
+    const target = sessionKey("codex", null, WS);
+    const state = useChatStore.getState();
+    expect(state.active).toMatchObject({ engine: "codex", sessionId: null });
+    expect(state.drafts[target]).toBe("还没发出的草稿");
+    expect(state.drafts[PENDING]).toBeUndefined();
+  });
+
+  it("does not let an empty draft on the destination tab wipe the typed text", () => {
+    const tab = { engine: "claude", sessionId: null, workspacePath: WS };
+    const destination = { engine: "codex", sessionId: null, workspacePath: WS };
+    const target = sessionKey("codex", null, WS);
+    useChatStore.setState({
+      openTabs: [tab, destination],
+      active: tab,
+      // An empty string is “nothing typed”, not a draft worth keeping.
+      drafts: { [PENDING]: "正在写的草稿", [target]: "" },
+    });
+
+    useChatStore.getState().setActiveEngine("codex");
+
+    const state = useChatStore.getState();
+    expect(state.active).toBe(destination);
+    expect(state.drafts[target]).toBe("正在写的草稿");
+  });
+
+  it("keeps the draft when a native session's picker changes engine", () => {
+    const tab = { engine: "claude", sessionId: "s-1", workspacePath: WS };
+    useChatStore.setState({
+      openTabs: [tab],
+      active: tab,
+      drafts: { [NATIVE]: "下一条消息" },
+    });
+
+    useChatStore.getState().setActiveEngine("codex");
+
+    expect(useChatStore.getState().drafts[NATIVE]).toBe("下一条消息");
   });
 });

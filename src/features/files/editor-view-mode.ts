@@ -26,3 +26,10 @@ export function isHtmlFile(name: string): boolean {
 export function opensInPreview(name: string, hasFilePreviews: boolean): boolean {
   return isMarkdownFile(name) || (hasFilePreviews && isHtmlFile(name));
 }
+
+/** Whether context menus offer "在浏览器中打开": HTML files on desktop only.
+ *  Over web access the host would launch its own browser, which the remote
+ *  user never sees. */
+export function canOpenInBrowser(name: string, isDesktop: boolean): boolean {
+  return isDesktop && isHtmlFile(name);
+}

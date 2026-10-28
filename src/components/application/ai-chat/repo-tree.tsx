@@ -19,6 +19,7 @@ import { paginateThreads } from "@/components/application/ai-chat/repo-paginatio
 import { ipc } from "@/lib/ipc";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { WorktreeProgressRow } from "@/features/worktree/WorktreeProgressRow";
+import { WorktreeBadgeChips } from "@/components/application/ai-chat/worktree-badge-chips";
 import type { AiChatRepo, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import { useDragSource } from "@/features/chat/split/drag";
 import { sessionFromThreadId } from "@/features/chat/split/store";
@@ -458,20 +459,24 @@ function WorktreeChildRow({
         <span className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary">
           {repo.label}
         </span>
-        {repo.worktree?.prNumber != null && (
-          <span className="shrink-0 rounded-sm bg-status-purple-background px-1 py-px text-caption-2-medium text-status-purple-text">
-            {t("worktree.prBadge", { number: repo.worktree.prNumber })}
-          </span>
-        )}
-        {missing && (
-          <span
-            className="shrink-0 rounded-sm bg-status-rose-background px-1 py-px text-caption-2-medium text-status-rose-text"
-            title={t("worktree.missingDirectoryHint")}
-          >
-            {t("worktree.missingDirectory")}
-          </span>
-        )}
       </button>
+      {/* Chips are siblings of the toggle button, not children: a plugin badge
+          with onClick is a real <button>, and interactive content must not
+          nest inside one. Order stays label → plugin badges → PR# → 目录已丢失. */}
+      <WorktreeBadgeChips workspaceId={repo.id} />
+      {repo.worktree?.prNumber != null && (
+        <span className="shrink-0 rounded-sm bg-status-purple-background px-1 py-px text-caption-2-medium text-status-purple-text">
+          {t("worktree.prBadge", { number: repo.worktree.prNumber })}
+        </span>
+      )}
+      {missing && (
+        <span
+          className="shrink-0 rounded-sm bg-status-rose-background px-1 py-px text-caption-2-medium text-status-rose-text"
+          title={t("worktree.missingDirectoryHint")}
+        >
+          {t("worktree.missingDirectory")}
+        </span>
+      )}
       {repo.id && onNewSession && (
         <button
           type="button"

@@ -178,6 +178,10 @@ pub struct AppSettings {
     /// docks fill their pane (only the 16px gutter stays).
     #[serde(default)]
     pub chat_wide_layout: Option<bool>,
+    /// File tree entries Git ignores (设置 → 通用 → 行为): None/Some(false) =
+    /// listed, drawn faded; Some(true) = hidden from the tree.
+    #[serde(default)]
+    pub file_tree_hide_ignored: Option<bool>,
     /// Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
     /// Empty/missing = the entry stays hidden; every id is off by default.
     #[serde(default)]
@@ -417,6 +421,7 @@ impl Default for AppSettings {
             reset_ui_scale_shortcut: default_reset_ui_scale_shortcut(),
             thinking_auto_collapse: None,
             chat_wide_layout: None,
+            file_tree_hide_ignored: None,
             beta_features: HashMap::new(),
             terminal_shell_path: None,
             dsh_host: None,
@@ -1493,6 +1498,24 @@ mod tests {
         let narrow: AppSettings = serde_json::from_str(r#"{"chatWideLayout":false}"#).unwrap();
         assert_eq!(narrow.chat_wide_layout, Some(false));
     }
+    /// 文件树隐藏 Git 忽略项（设置 → 通用 → 行为）：缺字段 / false 都是照常列出
+    /// （浅色显示），true 才隐藏；camelCase 键名要能往返。
+    #[test]
+    fn file_tree_hide_ignored_defaults_to_shown_and_round_trips() {
+        assert_eq!(AppSettings::default().file_tree_hide_ignored, None);
+        let parsed: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            parsed.file_tree_hide_ignored, None,
+            "旧设置文件没有 fileTreeHideIgnored → 照常显示忽略项，不能崩"
+        );
+        let hide: AppSettings =
+            serde_json::from_str(r#"{"fileTreeHideIgnored":true}"#).unwrap();
+        assert_eq!(hide.file_tree_hide_ignored, Some(true));
+        assert!(serde_json::to_string(&hide)
+            .unwrap()
+            .contains("\"fileTreeHideIgnored\":true"));
+    }
+
     #[test]
     fn font_fields_default_to_bundled_and_round_trip_camel_case() {
         let parsed: AppSettings = serde_json::from_str("{}").unwrap();

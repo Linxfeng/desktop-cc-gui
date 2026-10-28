@@ -7,7 +7,7 @@ use super::discovery::{
 use super::{same_or_child, scan_summary_file, split_opencode_db_path, stat_signature, ScanSummary};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -503,13 +503,78 @@ fn prune_opencode_hidden_sessions(db: &crate::db::Db) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Conservative existence check: only NotFound counts as gone. Permission
-/// errors, device-not-ready, offline SMB roots and similar failures must
-/// never wipe indexed history.
-fn definitely_missing(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .err()
-        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+/// Conservative existence check: only NotFound counts as gone, and only on
+/// storage that is attached right now. Permission errors, device-not-ready,
+/// offline SMB roots and similar failures must never wipe indexed history.
+/// Storage is probed first so a detached drive costs one probe per pass
+/// rather than one per row.
+fn definitely_missing(path: &Path, attached: &mut HashMap<PathBuf, bool>) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    storage_attached(dir, attached)
+        && std::fs::symlink_metadata(path)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A detached volume answers NotFound too: Rust maps Windows
+/// ERROR_INVALID_DRIVE / ERROR_BAD_NETPATH / ERROR_BAD_NET_NAME to NotFound,
+/// and an unmounted macOS volume leaves `/Volumes/<name>` absent. Dropping
+/// those rows would lose their pin, custom title and plan reviews, which a
+/// rescan after re-attaching cannot restore. So a NotFound counts only when
+/// the nearest existing ancestor is a real directory: one must exist at all
+/// (a gone Windows drive has none, not even its root), it must not be a
+/// dangling symlink (an engine home linked onto a detached disk), and it must
+/// not be a bare mount container. Verdicts are memoized per directory for one
+/// GC pass.
+fn storage_attached(dir: &Path, verdicts: &mut HashMap<PathBuf, bool>) -> bool {
+    // Settle the volume root first: a gone drive fails here once per pass.
+    if let Some(root) = dir.ancestors().last().filter(|root| *root != dir) {
+        if !storage_attached(root, verdicts) {
+            return false;
+        }
+    }
+    let mut visited: Vec<&Path> = Vec::new();
+    let mut verdict = false;
+    for ancestor in dir.ancestors() {
+        if let Some(&known) = verdicts.get(ancestor) {
+            verdict = known;
+            break;
+        }
+        visited.push(ancestor);
+        // A relative path's walk ends at "", the working directory.
+        let probe = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match std::fs::symlink_metadata(probe) {
+            Ok(meta) => {
+                let dangling = meta.file_type().is_symlink() && std::fs::metadata(probe).is_err();
+                verdict = !dangling && !is_mount_container(ancestor);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Unreadable ancestor: existence below it is unknowable.
+            Err(_) => break,
+        }
+    }
+    for path in visited {
+        verdicts.insert(path.to_path_buf(), verdict);
+    }
+    verdict
+}
+
+/// Directories that only hold mount points (macOS `/Volumes`, Linux `/mnt`,
+/// `/media`, `/run/media`) and their direct children (the per-volume or
+/// per-user level). As the nearest existing ancestor they mean the volume
+/// beneath unmounted, not that the transcript was deleted.
+fn is_mount_container(dir: &Path) -> bool {
+    ["/Volumes", "/mnt", "/media", "/run/media"]
+        .iter()
+        .map(Path::new)
+        .any(|container| dir == container || dir.parent() == Some(container))
 }
 
 /// UNC roots (`\\server\share`, `\\wsl.localhost\...`) have unreliable
@@ -534,7 +599,8 @@ fn is_remote_path(path: &str) -> bool {
 /// - only rows whose file_path is not in this scan's FULL candidate set
 ///   (reused/unchanged candidates must not be dropped: the reparsed rows are
 ///   only a subset);
-/// - fs::metadata must fail with NotFound, never another error;
+/// - the file must be NotFound, never another error, and its storage must be
+///   attached (see [`storage_attached`]);
 /// - remote UNC paths are skipped, and OpenCode's synthetic
 ///   `opencode.db#session-id` addresses are skipped too — they are not real
 ///   files, so metadata on them is always NotFound (their row-level lifecycle
@@ -565,6 +631,7 @@ fn prune_missing_file_sessions(
         }
         out
     };
+    let mut attached: HashMap<PathBuf, bool> = HashMap::new();
     let mut dead: Vec<(String, String)> = Vec::new();
     for (engine, session_id, file_path) in rows {
         let path = PathBuf::from(&file_path);
@@ -574,7 +641,7 @@ fn prune_missing_file_sessions(
         {
             continue;
         }
-        if definitely_missing(&path) {
+        if definitely_missing(&path, &mut attached) {
             dead.push((engine, session_id));
         }
     }
@@ -677,8 +744,13 @@ fn scan_inner(
     let (accepted, accepted_signature) = db.accepted_internal_frame_index()?;
     let (stats, signature) = stat_all(&workspaces, &candidates, &accepted_signature);
     let Some(tier1) = tier1_gate(db, signature)? else {
+        // An unchanged signature only says no candidate moved. A row whose
+        // file vanished before this build ever indexed it (older versions
+        // never reclaimed one) is invisible to the signature, so the file GC
+        // runs here too; rows still in the candidate set cost no I/O.
+        let missing = prune_missing_file_sessions(db, &candidates)?;
         let pruned = prune_stale_sessions(db)?;
-        if super::codex_titles::sync(db)? || pruned {
+        if super::codex_titles::sync(db)? || pruned || missing {
             on_changed();
         }
         return Ok(ScanReport {
@@ -1934,5 +2006,193 @@ pub(super) mod tests {
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())
+    }
+
+    /// Restores CODEX_HOME on drop (HomeGuard only covers HOME/USERPROFILE).
+    struct CodexHomeEnv(Option<std::ffi::OsString>);
+    impl Drop for CodexHomeEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
+    /// A db with one registered workspace and CODEX_HOME at `codex_home`.
+    fn codex_gc_fixture(
+        home: &Path,
+        codex_home: &Path,
+    ) -> Result<(HomeGuard, CodexHomeEnv, PathBuf, crate::db::Db), String> {
+        let guard = HomeGuard::set(home);
+        let env = CodexHomeEnv(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", codex_home);
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [workspace.to_string_lossy().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((guard, env, workspace, db))
+    }
+
+    fn write_codex_rollout(
+        codex_home: &Path,
+        workspace: &Path,
+        id: &str,
+    ) -> Result<PathBuf, String> {
+        let path = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("26")
+            .join(format!("rollout-2026-10-26T00-00-00-{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        let text = serde_json::json!({"type": "session_meta", "payload": {
+            "id": id, "cwd": workspace.to_string_lossy()
+        }})
+        .to_string()
+            + "\n";
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    #[test]
+    fn file_gc_runs_even_when_disk_is_unchanged() -> Result<(), String> {
+        // A dead row left by an older version: its file vanished before this
+        // build ever scanned, so no stat signature change will announce it.
+        let home = scratch_dir(&format!("gc-unchanged-{}", uuid::Uuid::new_v4()));
+        let codex_home = home.join(".codex");
+        let (_guard, _env, workspace, db) = codex_gc_fixture(&home, &codex_home)?;
+        let keep = write_codex_rollout(&codex_home, &workspace, "keep")?;
+        scan_with(&db, || {})?;
+        let ghost = keep.with_file_name("rollout-2026-10-26T00-00-00-old.jsonl");
+        db.0.lock()
+            .execute(
+                "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title) VALUES('codex', 'old', ?1, ?2, 1, 1, 'ghost')",
+                rusqlite::params![workspace.to_string_lossy(), ghost.to_string_lossy()],
+            )
+            .map_err(|e| e.to_string())?;
+        let changed = std::cell::Cell::new(false);
+        let report = scan_with(&db, || changed.set(true))?;
+        assert_eq!(
+            report.reparsed, 0,
+            "the disk did not change: tier-1 short-circuit"
+        );
+        assert_eq!(session_count(&db, "codex", "old"), 0);
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        assert!(changed.get(), "the sidebar must refresh after the GC");
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_gc_keeps_rows_on_detached_storage() -> Result<(), String> {
+        // The codex home is a symlink onto a disk that later detaches: every
+        // transcript reads NotFound, yet nothing was deleted. The rows, with
+        // the user's pin and title, must outlive the outage.
+        let home = scratch_dir(&format!("gc-detached-{}", uuid::Uuid::new_v4()));
+        let disk = home.join("disk");
+        std::fs::create_dir_all(disk.join("codex")).map_err(|e| e.to_string())?;
+        let codex_home = home.join(".codex");
+        std::os::unix::fs::symlink(disk.join("codex"), &codex_home).map_err(|e| e.to_string())?;
+        let (_guard, _env, workspace, db) = codex_gc_fixture(&home, &codex_home)?;
+        let rollout = write_codex_rollout(&codex_home, &workspace, "pinned")?;
+        scan_with(&db, || {})?;
+        db.0.lock()
+            .execute(
+                "UPDATE sessions SET pinned=1, custom_title='my name' WHERE engine='codex' AND session_id='pinned'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        let user_fields = |db: &crate::db::Db| -> Result<(i64, Option<String>), String> {
+            db.0.lock()
+                .query_row(
+                    "SELECT pinned, custom_title FROM sessions WHERE engine='codex' AND session_id='pinned'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| e.to_string())
+        };
+        let parked = home.join("disk-parked");
+        std::fs::rename(&disk, &parked).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(
+            session_count(&db, "codex", "pinned"),
+            1,
+            "detached is not deleted"
+        );
+        std::fs::rename(&parked, &disk).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(user_fields(&db)?, (1, Some("my name".to_string())));
+        // Re-attached, a real deletion through the same link is reclaimed.
+        std::fs::remove_file(&rollout).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "pinned"), 0);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn storage_probe_separates_deleted_from_detached() {
+        for dir in [
+            "/Volumes",
+            "/Volumes/Backup",
+            "/mnt",
+            "/mnt/nas",
+            "/media/alice",
+            "/run/media",
+            "/run/media/alice",
+        ] {
+            assert!(is_mount_container(Path::new(dir)), "{dir}");
+        }
+        for dir in [
+            "/",
+            "/Users/alice",
+            "/Volumes/Backup/.codex",
+            "/mnt/nas/codex",
+            "/home/alice/.claude",
+        ] {
+            assert!(!is_mount_container(Path::new(dir)), "{dir}");
+        }
+        let home = scratch_dir(&format!("gc-probe-{}", uuid::Uuid::new_v4()));
+        let mut verdicts = HashMap::new();
+        // Missing directories under an existing one: attached storage, so a
+        // NotFound there is a real deletion (a whole kimi/grok session dir).
+        assert!(storage_attached(
+            &home.join("gone").join("deeper"),
+            &mut verdicts
+        ));
+        assert!(storage_attached(&home, &mut verdicts));
+        #[cfg(unix)]
+        {
+            let link = home.join("linked-home");
+            std::os::unix::fs::symlink(home.join("detached-disk"), &link).unwrap();
+            assert!(!storage_attached(&link.join("sessions"), &mut verdicts));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // An unmounted volume leaves only /Volumes behind.
+            let volume = format!("/Volumes/ccgui-missing-{}", uuid::Uuid::new_v4());
+            let sessions = Path::new(&volume).join(".codex").join("sessions");
+            assert!(!storage_attached(&sessions, &mut verdicts));
+        }
+        #[cfg(windows)]
+        {
+            // A drive letter that is not attached fails at its root.
+            if let Some(letter) =
+                ('D'..='Z').find(|c| std::fs::metadata(format!("{c}:\\")).is_err())
+            {
+                let sessions = PathBuf::from(format!("{letter}:\\ccgui\\sessions"));
+                assert!(!storage_attached(&sessions, &mut verdicts));
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.21
+ * @ccgui/plugin-sdk v0.3.22
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -55,6 +55,46 @@ export interface PluginWorkspaceRow {
   /** worktree 子行的只读投影(0.3.17 起):分支名与来源 PR 编号。kind 为
    *  "worktree" 时存在;meta 里的其它私有载荷(如 wsl)仍然不出。 */
   worktree?: { branch: string; prNumber?: number };
+}
+
+/** worktree 徽标色调（0.3.22 起）。宿主映射到 status token；白名单外的值
+ *  按 "neutral" 处理。 */
+export type WorktreeBadgeTone =
+  | "neutral"
+  | "blue"
+  | "cyan"
+  | "green"
+  | "lime"
+  | "yellow"
+  | "rose"
+  | "purple";
+
+/** 侧栏 worktree 子行目标（0.3.22 起，需要 host:workspace）。 */
+export interface WorktreeBadgeTarget {
+  workspaceId: string;
+  parentWorkspaceId: string;
+  path: string;
+  branch: string;
+  prNumber: number | null;
+}
+
+/** 一块 worktree 徽标（0.3.22 起）。label 去空白后按码点截到 6，空 label
+ *  视为不显示；tooltip 为纯文本、截到 300。 */
+export interface WorktreeBadge {
+  label: string;
+  tone: WorktreeBadgeTone;
+  tooltip?: string;
+}
+
+/** ctx.ui.registerWorktreeBadges 的句柄（0.3.22 起）。list/onChange 额外
+ *  需要 host:workspace；set/clear 只需要 ui:worktree-badge。卸载时宿主清掉
+ *  本插件的徽标与订阅。 */
+export interface WorktreeBadgeHandle {
+  list(): WorktreeBadgeTarget[];
+  onChange(cb: (targets: WorktreeBadgeTarget[]) => void): Disposer;
+  set(workspaceId: string, badge: WorktreeBadge | null): void;
+  clear(): void;
+  dispose(): void;
 }
 
 export interface PluginWindowBounds {
@@ -581,14 +621,36 @@ export interface PluginContext {
       order?: number;
     }): Disposer;
     /** 首页侧栏导航入口，位于内建「自动化」之下（权限 ui:sidebar-entry，
-     *  0.3.12 起）。onOpen 通常经 openCenterTab 打开本插件的中心页签。 */
+     *  0.3.12 起）。onOpen 通常经 openCenterTab 打开本插件的中心页签。
+     *  badge（0.3.22 起）是可选的尾部计数 pill，每次渲染求值；同一 key
+     *  重新注册即刷新（Registry upsert），抛错按「无徽标」处理。 */
     registerSidebarNav(def: {
       key?: string;
       label: () => string;
       icon?: ComponentLike<{ className?: string }>;
       order?: number;
+      badge?: () => string | number | null;
       onOpen: () => void;
     }): Disposer;
+    /** 侧栏 worktree 子行徽标（权限 ui:worktree-badge，0.3.22 起）。
+     *  set/clear 只需要 ui:worktree-badge；list/onChange 额外需要
+     *  host:workspace，缺失时抛可读错误（`requires "host:workspace"`）。
+     *
+     *  形状：target = { workspaceId, parentWorkspaceId, path, branch,
+     *  prNumber: number | null }；badge = { label, tone, tooltip? }。
+     *
+     *  渲染规则：每行最多 2 个（按 order，再按注册先后）；tone 取
+     *  "neutral" | "blue" | "cyan" | "green" | "lime" | "yellow" | "rose" |
+     *  "purple"，其余按 neutral；label 去空白后按码点截到 6（空 = 不显示）；
+     *  tooltip 纯文本截到 300。onClick 在插件上下文中执行，且不会展开
+     *  侧栏行；onClick 的 target 与 list/onChange 一致，但**不受**
+     *  host:workspace 门禁（点击目标本来就是宿主交给插件的那一行）。
+     *  卸载（或 dispose()）清掉本插件的徽标与订阅。 */
+    registerWorktreeBadges(def: {
+      key?: string;
+      order?: number;
+      onClick?: (target: WorktreeBadgeTarget) => void;
+    }): WorktreeBadgeHandle;
     /** 中心页签定义（权限 ui:center-tab，0.3.12 起）：与会话/文件/浏览器
      *  页签共享中部页签条；打开经 openCenterTab。 */
     registerCenterTab(def: {
@@ -680,10 +742,12 @@ export interface PluginContext {
    *  <仓库同级>/<仓库名>-worktrees/<branch>。
    *
    *  失败/取消以 Error reject,message 形如 "<errorKind>: <detail>"
-   *  (kind 与宿主错误分类一致:not_a_repo / invalid_branch /
-   *  branch_not_found / branch_exists / branch_checked_out / dir_exists /
-   *  pr_not_found / fetch_failed / register_failed / sparse_checkout_empty /
-   *  canceled / unknown),插件据此给用户可读文案。 */
+   *  (kind 与宿主错误分类一致:not_a_repo / repo_open_failed /
+   *  invalid_branch / branch_not_found / branch_exists / branch_checked_out /
+   *  dir_exists / pr_not_found / fetch_failed / register_failed /
+   *  sparse_checkout_empty / canceled / unknown),插件据此给用户可读文案。
+   *  repo_open_failed = 仓库存在但打不开(如属主校验拒绝),detail 以
+   *  GIT_UNSAFE_REPO: / GIT_OPEN_FAILED: 开头并带原因。 */
   worktrees: {
     create(def: {
       /** 本地仓库路径(父工作区目录,必须是 git 仓库)。 */

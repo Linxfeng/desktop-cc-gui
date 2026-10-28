@@ -17,6 +17,10 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_ms: i64,
+    /// Git ignores this entry (`.gitignore` / info/exclude / global excludes,
+    /// and `.git` itself); see `git_ignore.rs`. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
 }
 
 #[derive(Serialize)]
@@ -208,27 +212,71 @@ pub fn revoke_granted_root(
     db.remove_granted_root(path.trim())
 }
 
-#[tauri::command]
-pub fn list_dir(
-    db: tauri::State<'_, Arc<crate::db::Db>>,
-    path: String,
+/// Sync body of `list_dir`; the command wrapper runs it off the main thread
+/// because the ignore check opens the enclosing Git repository.
+///
+/// `git_ignore_root` opts into the per-entry `ignored` flag: the file tree
+/// passes its root, which bounds how far ignore state is inherited (see
+/// `git_ignore.rs`). Other callers only need names and skip the Git work.
+fn list_dir_blocking(
+    db: &crate::db::Db,
+    path: &str,
+    git_ignore_root: Option<&str>,
 ) -> Result<Vec<DirEntry>, String> {
-    let dir = ensure_allowed(&path, &db)?;
+    let dir = ensure_allowed(path, db)?;
+    let ignore_root = git_ignore_root
+        .map(|root| ensure_allowed(root, db))
+        .transpose()?;
+    // 本机 WSL 工作区的 Git 一律在发行版内执行（见 `git_wsl.rs`）：主机 libgit2
+    // 读 `\\wsl.localhost\…` 每次都要过属主校验、慢两个数量级，展开一层目录就
+    // 卡住。这里不标记忽略条目，文件树照常全部列出。
+    let ignore_root =
+        ignore_root.filter(|_| crate::engine::wsl_path::parse_wsl_unc(path).is_none());
     let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-    let mut out: Vec<DirEntry> = entries
+    let raw: Vec<(String, Option<std::fs::Metadata>)> = entries
         .flatten()
         .map(|entry| {
-            let meta = entry.metadata().ok();
-            DirEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                mtime_ms: meta.as_ref().map(mtime_ms).unwrap_or(0),
-            }
+            (
+                entry.file_name().to_string_lossy().to_string(),
+                entry.metadata().ok(),
+            )
+        })
+        .collect();
+    let is_dir = |meta: &Option<std::fs::Metadata>| meta.as_ref().is_some_and(|m| m.is_dir());
+    let ignored = match &ignore_root {
+        Some(root) => crate::git_ignore::ignored_names(
+            &dir,
+            root,
+            raw.iter().map(|(name, meta)| (name.as_str(), is_dir(meta))),
+        ),
+        None => Default::default(),
+    };
+    let mut out: Vec<DirEntry> = raw
+        .into_iter()
+        .map(|(name, meta)| DirEntry {
+            is_dir: is_dir(&meta),
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            mtime_ms: meta.as_ref().map(mtime_ms).unwrap_or(0),
+            ignored: ignored.contains(&name),
+            name,
         })
         .collect();
     out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
+}
+
+#[tauri::command]
+pub async fn list_dir(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    git_ignore_root: Option<String>,
+) -> Result<Vec<DirEntry>, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        list_dir_blocking(&db, &path, git_ignore_root.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn is_image(path: &Path) -> bool {
@@ -721,6 +769,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn list_dir_flags_git_ignored_entries_and_omits_false() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        let workspace = Scratch::new();
+        git2::Repository::init(&workspace.0).unwrap();
+        std::fs::write(workspace.0.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(workspace.0.join("debug.log"), "").unwrap();
+        std::fs::write(workspace.0.join("main.rs"), "").unwrap();
+        let path = workspace.0.to_string_lossy().to_string();
+        grant_root_in(&db, &path).unwrap();
+
+        // Callers that only need names skip the Git work entirely.
+        let plain = list_dir_blocking(&db, &path, None).unwrap();
+        assert!(plain.iter().all(|e| !e.ignored));
+
+        let entries = list_dir_blocking(&db, &path, Some(&path)).unwrap();
+        let flag = |name: &str| entries.iter().find(|e| e.name == name).unwrap().ignored;
+        assert!(flag(".git"));
+        assert!(flag("debug.log"));
+        assert!(!flag("main.rs"));
+        assert!(!flag(".gitignore"));
+        // Dirs still sort first; the flag does not reorder the listing.
+        assert_eq!(entries[0].name, ".git");
+
+        let json = serde_json::to_value(&entries).unwrap();
+        let by_name = |name: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("debug.log")["ignored"], true);
+        assert!(by_name("main.rs").get("ignored").is_none());
     }
 
     #[test]

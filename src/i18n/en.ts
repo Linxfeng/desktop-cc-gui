@@ -819,6 +819,9 @@ export const en: Messages = {
     thinkingAutoCollapse: "Fold thinking when it finishes",
     thinkingAutoCollapseDesc:
       "Turn off to keep the thinking process expanded during the turn; click the header to fold it manually",
+    fileTreeHideIgnored: "Hide Git-ignored files in the file tree",
+    fileTreeHideIgnoredDesc:
+      "Hide files and folders ignored by .gitignore (including .git); when off they are shown faded",
     promptHistory: "History completion",
     promptHistoryDesc:
       "Tab accepts a history suggestion while typing; ↑↓ recall history when the input is empty",
@@ -1339,6 +1342,7 @@ export const en: Messages = {
     sendPathToComposer: "Send Path to Composer",
     openFile: "Open File",
     openInApp: "Open in {{app}}",
+    openInBrowser: "Open in Browser",
     copyLink: "Copy Link",
     revealInFinder: "Reveal in Finder",
     revealInExplorer: "Reveal in Explorer",
@@ -1385,9 +1389,11 @@ export const en: Messages = {
     remoteBranch: "Remote branch",
     back: "Back",
     notARepo: "Current workspace is not a git repository",
+    initRepo: "Initialize Git repository",
     unsafeRepo:
       "The git repository's ownership is not trusted: {{message}}. Add the directory to safe.directory (git config --global --add safe.directory <path>), or reopen/clone it as the current user.",
     openFailed: "Could not open the git repository: {{message}}",
+    retryStatus: "Try again",
     diffTooLarge: "Diff too large, truncated",
     noChanges: "No changes",
     uncommittedChanges: "uncommitted changes",
@@ -1684,6 +1690,7 @@ export const en: Messages = {
         uiSidebarEntry: "Sidebar entry",
         uiCenterTab: "Center tab",
         uiConversationMode: "Chat-local conversation mode",
+        uiWorktreeBadge: "Worktree status badges",
         ui: "Extend the UI",
         exec: "Run the {{name}} command",
         network: "Access {{host}}",

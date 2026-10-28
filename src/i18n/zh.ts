@@ -786,6 +786,9 @@ export const zh = {
     thinkingAutoCollapse: "思考结束后自动收起",
     thinkingAutoCollapseDesc:
       "关闭后，思考过程在本轮回复中保持展开，可点击标题手动收起",
+    fileTreeHideIgnored: "文件树隐藏 Git 忽略的文件",
+    fileTreeHideIgnoredDesc:
+      "隐藏被 .gitignore 忽略的文件和文件夹（含 .git）；关闭时以浅色显示",
     promptHistory: "历史输入补全",
     promptHistoryDesc:
       "输入时按 Tab 接受历史补全建议；输入框为空时按 ↑↓ 翻阅历史",
@@ -1281,6 +1284,7 @@ export const zh = {
     sendPathToComposer: "发送路径到输入框",
     openFile: "打开文件",
     openInApp: "在 {{app}} 中打开",
+    openInBrowser: "在浏览器中打开",
     copyLink: "复制链接",
     revealInFinder: "在访达中显示",
     revealInExplorer: "在资源管理器中显示",
@@ -1325,9 +1329,11 @@ export const zh = {
     remoteBranch: "远程分支",
     back: "返回",
     notARepo: "当前工作区不是 Git 仓库",
+    initRepo: "初始化 Git 仓库",
     unsafeRepo:
       "Git 仓库所有权不受信任：{{message}}。请将该目录加入 safe.directory（git config --global --add safe.directory <路径>），或以当前用户身份重新打开/克隆。",
     openFailed: "无法打开 Git 仓库：{{message}}",
+    retryStatus: "重试",
     diffTooLarge: "Diff 过大，已截断",
     noChanges: "没有变更",
     uncommittedChanges: "个未提交变更",
@@ -1624,6 +1630,7 @@ export const zh = {
         uiSidebarEntry: "侧栏入口",
         uiCenterTab: "中央页签",
         uiConversationMode: "当前聊天内的会话模式",
+        uiWorktreeBadge: "侧栏 worktree 状态徽标",
         ui: "扩展界面",
         exec: "运行 {{name}} 命令",
         network: "访问 {{host}}",

@@ -92,3 +92,47 @@ describe("TreeRow tree refresh", () => {
     expect(onToggleDir).not.toHaveBeenCalled();
   });
 });
+
+describe("TreeRow git-ignored entries", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  function contentButton(node: VisibleNode): HTMLButtonElement | null {
+    act(() => {
+      root.render(
+        <TreeRow
+          node={node}
+          selected={false}
+          isRoot={false}
+          onToggleDir={() => {}}
+          onOpenFile={() => {}}
+          onSelectDir={() => {}}
+          onContextMenu={() => {}}
+          onMention={() => {}}
+          mentionLabel="添加到聊天"
+        />,
+      );
+    });
+    return container.querySelector<HTMLButtonElement>(`button[title="${node.path}"]`);
+  }
+
+  it("draws an ignored entry faded (icon, name and badge together)", () => {
+    const ignored = contentButton({ ...childNode, name: ".idea", path: "/ws/desktop-cc-gui/.idea", ignored: true });
+    expect(ignored?.className).toContain("opacity-50");
+  });
+
+  it("keeps regular entries at full strength", () => {
+    expect(contentButton(childNode)?.className).not.toContain("opacity-50");
+  });
+});

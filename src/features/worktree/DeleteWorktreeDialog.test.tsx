@@ -67,6 +67,16 @@ function bodyText(): string {
   return document.body.textContent ?? "";
 }
 
+/** 真实鼠标按压：react-aria 的复选框 label 只在鼠标按压时切换，裸 click()
+ *  或 detail=0 的事件会被当成 virtual 点击放行，所以带上 detail=1。 */
+async function press(el: Element) {
+  await act(async () => {
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, detail: 1, button: 0 }));
+    }
+  });
+}
+
 describe("DeleteWorktreeDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -159,6 +169,27 @@ describe("DeleteWorktreeDialog", () => {
       "pr-1842-fix",
       true,
     ));
+  });
+
+  it("点击「删除分支」下方的说明文字也能切换勾选，说明作为描述而非名称", async () => {
+    render();
+    await act(async () => {});
+    const hint = [...document.body.querySelectorAll("span")].find(
+      (el) => el.textContent === "未合入 main 的分支删除后不可恢复；不勾选则分支保留在仓库里",
+    );
+    expect(hint).toBeDefined();
+    const input = document.body.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    expect(input.getAttribute("aria-describedby")).toBe(hint!.id);
+    const name = document.getElementById(input.getAttribute("aria-labelledby") ?? "");
+    expect(name?.textContent).toBe("同时删除本地分支 pr-1842-fix");
+
+    await press(hint!);
+    expect(input.checked).toBe(true);
+    expect(button("删除 Worktree 和分支")).not.toBeNull();
+
+    await press(hint!);
+    expect(input.checked).toBe(false);
+    expect(button("删除 Worktree 和分支")).toBeNull();
   });
 
   it("父工作区缺失时退化为仅移除登记（不碰 git）", async () => {

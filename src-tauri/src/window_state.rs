@@ -5,18 +5,20 @@
 //! `settings.json` 解耦：窗口几何在拖动时每秒变多次，而 settings.json 的写入
 //! 是全局串行化的 read-modify-write，混在一起会放大丢字段的风险。
 //!
-//! 三条关键语义：
+//! 四条关键语义：
 //! - **最大化/全屏不覆盖普通几何**：最大化后 `inner_size()` 返回屏幕尺寸，
 //!   当成普通尺寸保存后用户就再也回不到原窗口大小；
 //! - **越界即丢弃**：保存的矩形必须与某个显示器工作区有足够交集，否则该副屏
 //!   已断开（或分辨率/缩放变了），恢复默认居中的窗口；
+//! - **坐标单位跟随平台**：Windows/Linux 记物理像素，macOS 记逻辑点（见
+//!   [`LOGICAL_UNITS`]），保证窗口与各显示器在同一套坐标里比较、摆放；
 //! - **写盘节流**：Resized/Moved 只更新内存快照，最后一次变化 500 ms 后落盘，
 //!   退出时立即 flush。写文件复用 `settings::atomic_write`，崩溃不留半截 JSON。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 /// 默认窗口尺寸（逻辑像素），与建窗时的初始值一致。
 const DEFAULT_WIDTH: f64 = 1400.0;
@@ -33,7 +35,17 @@ const MIN_INTERSECT_RATIO: f64 = 0.2;
 /// 明显不合理的历史记录（显示器尺寸上限之外）按损坏处理。
 const MAX_DIMENSION: u32 = 20_000;
 
-/// 物理像素矩形，纯数据，便于单测不依赖真实窗口。
+/// 记录、校验与摆放使用的坐标单位：macOS 用逻辑点，其余平台用物理像素。
+///
+/// Windows（按显示器 DPI 感知）与 Linux 的物理像素是一张统一的虚拟屏幕坐标，
+/// 窗口与各显示器可以直接比较。macOS 不是：tao 按「窗口当前所在屏」的倍数把点
+/// 换算成物理像素，各显示器也各按自己的倍数换算。Retina 内建屏（2x）+ 普通外接
+/// 屏（1x）时，同一个物理坐标在两边指的是不同位置——按物理像素恢复，外接屏上的
+/// 窗口会被除以内建屏的倍数，落到内建屏上、尺寸减半。macOS 的全局坐标本来就以
+/// 点为单位，因此那里一律记逻辑点。
+const LOGICAL_UNITS: bool = cfg!(target_os = "macos");
+
+/// 坐标矩形（单位见 [`LOGICAL_UNITS`]），纯数据，便于单测不依赖真实窗口。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rect {
     pub x: i32,
@@ -60,7 +72,55 @@ impl Rect {
     }
 }
 
-/// 落盘内容。宽高是 `inner_size()`（物理像素），位置是 `outer_position()`。
+/// 一块显示器的工作区，以及「逻辑像素 → 坐标单位」的倍数：物理像素坐标下是
+/// 该显示器自己的缩放系数，逻辑点坐标下恒为 1。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Display {
+    pub area: Rect,
+    pub scale: f64,
+}
+
+/// 缩放系数兜底：拿不到或数值异常时按 1 处理，避免除零与 NaN。
+fn valid_scale(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+/// tauri 报告的物理像素矩形 → 记录用的坐标单位。
+///
+/// `logical` 为真时按 `scale_factor` 除回逻辑点：tauri 在 macOS 上就是用同一个
+/// 倍数（窗口取自身所在屏，显示器取自己的）把点乘成物理像素的。
+fn to_record_units(rect: Rect, scale_factor: f64, logical: bool) -> Rect {
+    if !logical {
+        return rect;
+    }
+    let scale = valid_scale(scale_factor);
+    let points = |value: f64| (value / scale).round();
+    Rect {
+        x: points(f64::from(rect.x)) as i32,
+        y: points(f64::from(rect.y)) as i32,
+        width: points(f64::from(rect.width)) as u32,
+        height: points(f64::from(rect.height)) as u32,
+    }
+}
+
+/// 由 tauri 的显示器工作区（物理像素）与该屏缩放系数得到 [`Display`]。
+fn display_from(work_area: Rect, scale_factor: f64, logical: bool) -> Display {
+    Display {
+        area: to_record_units(work_area, scale_factor, logical),
+        scale: if logical {
+            1.0
+        } else {
+            valid_scale(scale_factor)
+        },
+    }
+}
+
+/// 落盘内容。宽高是 `inner_size()`，位置是 `outer_position()`，单位见
+/// [`LOGICAL_UNITS`]（macOS 为逻辑点，其余平台为物理像素）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SavedState {
@@ -104,7 +164,7 @@ pub(crate) enum Placement {
     /// 有可用记录：应用保存的几何。
     Restore(Rect),
     /// 没有记录 / 记录损坏 / 记录落在已不存在的显示器上：默认尺寸，居中放在
-    /// 主显示器（monitors[0]）的工作区里。位置和尺寸都显式算好，不用系统的
+    /// 主显示器（displays[0]）的工作区里。位置和尺寸都显式算好，不用系统的
     /// 「窗口摆在哪」——多显示器混合 DPI 下系统摆放不稳定。
     Default(Rect),
 }
@@ -118,11 +178,11 @@ pub(crate) struct Resolution {
 }
 
 /// 默认摆放：尺寸按主显示器工作区收缩逻辑像素的 1400×900，并居中。
-fn default_placement(monitors: &[Rect], scale_factor: f64) -> Rect {
-    let scale = scale_factor.max(1.0);
+fn default_placement(displays: &[Display]) -> Rect {
+    let scale = displays.first().map_or(1.0, |primary| primary.scale).max(1.0);
     let width = (DEFAULT_WIDTH * scale).round() as u32;
     let height = (DEFAULT_HEIGHT * scale).round() as u32;
-    let Some(primary) = monitors.first() else {
+    let Some(primary) = displays.first().map(|display| display.area) else {
         return Rect { x: 0, y: 0, width, height };
     };
     let width = width.min(primary.width);
@@ -136,9 +196,9 @@ fn default_placement(monitors: &[Rect], scale_factor: f64) -> Rect {
 }
 
 impl Resolution {
-    fn fallback(monitors: &[Rect], scale_factor: f64) -> Self {
+    fn fallback(displays: &[Display]) -> Self {
         Self {
-            placement: Placement::Default(default_placement(monitors, scale_factor)),
+            placement: Placement::Default(default_placement(displays)),
             maximized: false,
             fullscreen: false,
         }
@@ -147,9 +207,9 @@ impl Resolution {
 
 /// 保存的矩形与某个显示器工作区是否有足够交集。交集过小说明该屏幕已不可用，
 /// 恢复过去会得到看不见、也拖不回来的窗口。
-fn visible_enough(rect: &Rect, monitors: &[Rect]) -> bool {
-    monitors.iter().any(|monitor| {
-        let (w, h) = rect.intersection(monitor);
+fn visible_enough(rect: &Rect, displays: &[Display]) -> bool {
+    displays.iter().any(|display| {
+        let (w, h) = rect.intersection(&display.area);
         if w < MIN_INTERSECT_PX || h < MIN_INTERSECT_PX {
             return false;
         }
@@ -160,22 +220,25 @@ fn visible_enough(rect: &Rect, monitors: &[Rect]) -> bool {
 
 /// 把恢复的尺寸钳制到目标显示器工作区与最小尺寸之间。
 ///
-/// `scale_factor` 用于把逻辑的最小尺寸换成物理像素；工作区取与矩形交集最大的
-/// 那一块（`visible_enough` 已保证至少有一块交集足够）。工作区永远优先于最小
-/// 尺寸：高 DPI 屏上 900×600 逻辑可能换算成比屏幕还大的物理尺寸，此时让步给
-/// 屏幕，否则会恢复出一个比显示器还大的窗口。
-fn clamp_size(rect: Rect, monitors: &[Rect], scale_factor: f64) -> Rect {
-    let target = monitors
+/// 目标显示器取与矩形交集最大的那一块（`visible_enough` 已保证至少有一块交集
+/// 足够）。逻辑的最小尺寸按**目标显示器自己**的倍数换算：窗口恢复后就在那块屏
+/// 上，系统也按它的 DPI 约束最小尺寸。按主显示器的倍数换算会在混合 DPI 下把
+/// 副屏上合法的小窗口撑大（主屏 150%、副屏 100% 时，副屏上 1000×700 会被抬成
+/// 1350×900）。工作区永远优先于最小尺寸：高 DPI 屏上 900×600 逻辑可能换算成
+/// 比屏幕还大的物理尺寸，此时让步给屏幕，否则会恢复出一个比显示器还大的窗口。
+fn clamp_size(rect: Rect, displays: &[Display]) -> Rect {
+    let target = displays
         .iter()
-        .max_by_key(|monitor| {
-            let (w, h) = rect.intersection(monitor);
+        .max_by_key(|display| {
+            let (w, h) = rect.intersection(&display.area);
             w.saturating_mul(h)
         })
         .copied();
-    let min_w = (MIN_WIDTH * scale_factor.max(1.0)).round() as u32;
-    let min_h = (MIN_HEIGHT * scale_factor.max(1.0)).round() as u32;
+    let scale = target.map_or(1.0, |display| display.scale).max(1.0);
+    let min_w = (MIN_WIDTH * scale).round() as u32;
+    let min_h = (MIN_HEIGHT * scale).round() as u32;
     let (max_w, max_h) = target
-        .map(|monitor| (monitor.width, monitor.height))
+        .map(|display| (display.area.width, display.area.height))
         .unwrap_or((MAX_DIMENSION, MAX_DIMENSION));
     let clamp_axis = |value: u32, min: u32, max: u32| value.max(min.min(max)).min(max);
     Rect {
@@ -186,20 +249,17 @@ fn clamp_size(rect: Rect, monitors: &[Rect], scale_factor: f64) -> Rect {
 }
 
 /// 解析 + 校验 + 钳制，得到可应用的结论。纯函数，单测直接喂合成显示器。
-pub(crate) fn resolve(
-    saved: Option<&SavedState>,
-    monitors: &[Rect],
-    scale_factor: f64,
-) -> Resolution {
+/// `displays[0]` 是主显示器（默认摆放以它为中心）。
+pub(crate) fn resolve(saved: Option<&SavedState>, displays: &[Display]) -> Resolution {
     let Some(saved) = saved.filter(|state| state.is_plausible()) else {
-        return Resolution::fallback(monitors, scale_factor);
+        return Resolution::fallback(displays);
     };
-    if monitors.is_empty() || !visible_enough(&saved.geometry(), monitors) {
+    if displays.is_empty() || !visible_enough(&saved.geometry(), displays) {
         // 显示器信息拿不到时也不冒险恢复：宁可默认居中，也不把窗口放到未知位置。
-        return Resolution::fallback(monitors, scale_factor);
+        return Resolution::fallback(displays);
     }
     Resolution {
-        placement: Placement::Restore(clamp_size(saved.geometry(), monitors, scale_factor)),
+        placement: Placement::Restore(clamp_size(saved.geometry(), displays)),
         maximized: saved.maximized,
         fullscreen: saved.fullscreen,
     }
@@ -272,6 +332,47 @@ struct Tracker {
 
 static TRACKER: parking_lot::Mutex<Option<Tracker>> = parking_lot::Mutex::new(None);
 
+/// 窗口当前的几何（内容区尺寸 + 外框位置，已换算成记录用的坐标单位）与缩放
+/// 系数。窗口已经销毁时读不到几何，返回 `None`。
+fn measure(window: &WebviewWindow) -> Option<(Rect, f64)> {
+    let (Ok(size), Ok(position)) = (window.inner_size(), window.outer_position()) else {
+        return None;
+    };
+    let scale_factor = window.scale_factor().unwrap_or(1.0);
+    let physical = Rect {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    Some((
+        to_record_units(physical, scale_factor, LOGICAL_UNITS),
+        scale_factor,
+    ))
+}
+
+/// 按记录用的坐标单位摆放窗口：先摆位置再定尺寸。
+///
+/// 先改尺寸时系统会按旧位置/旧显示器的工作区算一次约束，窗口尺寸随后被改小而
+/// 记录不一致。macOS 用逻辑点摆放，与窗口此刻落在哪块屏、倍数多少无关。
+fn place(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
+    if LOGICAL_UNITS {
+        window
+            .set_position(LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)))
+            .map_err(|e| format!("set window position: {e}"))?;
+        window
+            .set_size(LogicalSize::new(f64::from(rect.width), f64::from(rect.height)))
+            .map_err(|e| format!("set window size: {e}"))
+    } else {
+        window
+            .set_position(PhysicalPosition::new(rect.x, rect.y))
+            .map_err(|e| format!("set window position: {e}"))?;
+        window
+            .set_size(PhysicalSize::new(rect.width, rect.height))
+            .map_err(|e| format!("set window size: {e}"))
+    }
+}
+
 /// 按窗口**当前**状态合并快照。
 ///
 /// 读取时机是关键：Windows 上最大化/还原时 `Resized` 事件先于窗口标志更新，
@@ -282,16 +383,14 @@ static TRACKER: parking_lot::Mutex<Option<Tracker>> = parking_lot::Mutex::new(No
 /// （`Destroyed` 之后也走一次 flush，那时 `is_maximized()` 会报错并被当成
 /// false，若照常采样会把「最大化」标志抹掉。）
 fn sample(window: &WebviewWindow, previous: &SavedState) -> Option<SavedState> {
-    let (Ok(size), Ok(position)) = (window.inner_size(), window.outer_position()) else {
-        return None;
-    };
+    let (rect, scale_factor) = measure(window)?;
     Some(state_after_event(
         previous,
-        (size.width, size.height),
-        (position.x, position.y),
+        (rect.width, rect.height),
+        (rect.x, rect.y),
         window.is_maximized().unwrap_or(false),
         window.is_fullscreen().unwrap_or(false),
-        window.scale_factor().unwrap_or(1.0),
+        scale_factor,
     ))
 }
 
@@ -324,23 +423,6 @@ fn commit(job_state: SavedState, next: SavedState) -> Option<(PathBuf, SavedStat
     }
     tracker.state = next.clone();
     Some((tracker.path.clone(), next))
-}
-
-/// 只更新内存快照，不落盘：用于启动后按窗口的实际几何纠正恢复请求。
-/// 系统可能把恢复的尺寸钳制到工作区，记录要跟着实际值走。
-fn adopt_actual_geometry() {
-    let Some((window, previous, _, _, _)) = take_job() else {
-        return;
-    };
-    let Some(next) = sample(&window, &previous) else {
-        return;
-    };
-    let mut guard = TRACKER.lock();
-    if let Some(tracker) = guard.as_mut() {
-        if tracker.state == previous {
-            tracker.state = next;
-        }
-    }
 }
 
 /// 落盘线程只在第一次跟踪时启动；它按 200 ms 粒度检查「最后一次变化是否
@@ -416,26 +498,10 @@ pub(crate) fn apply_and_track(
     saved: Option<SavedState>,
 ) -> Result<(), String> {
     let scale_factor = window.scale_factor().unwrap_or(1.0);
-    match resolution.placement {
-        Placement::Restore(rect) => {
-            // 先摆位置再定尺寸：先改尺寸时系统会按旧位置/旧显示器的工作区
-            // 算一次约束，窗口尺寸随后被改小而记录不一致。
-            window
-                .set_position(PhysicalPosition::new(rect.x, rect.y))
-                .map_err(|e| format!("set window position: {e}"))?;
-            window
-                .set_size(PhysicalSize::new(rect.width, rect.height))
-                .map_err(|e| format!("set window size: {e}"))?;
-        }
-        Placement::Default(rect) => {
-            window
-                .set_position(PhysicalPosition::new(rect.x, rect.y))
-                .map_err(|e| format!("center window: {e}"))?;
-            window
-                .set_size(PhysicalSize::new(rect.width, rect.height))
-                .map_err(|e| format!("set default window size: {e}"))?;
-        }
-    }
+    let rect = match resolution.placement {
+        Placement::Restore(rect) | Placement::Default(rect) => rect,
+    };
+    place(window, rect)?;
     #[cfg(not(target_os = "macos"))]
     {
         window
@@ -467,14 +533,25 @@ pub(crate) fn apply_and_track(
             scale_factor,
             ..state
         })
-        .unwrap_or_else(|| SavedState {
-            width: window.inner_size().map(|size| size.width).unwrap_or(0),
-            height: window.inner_size().map(|size| size.height).unwrap_or(0),
-            x: window.outer_position().map(|p| p.x).unwrap_or(0),
-            y: window.outer_position().map(|p| p.y).unwrap_or(0),
-            scale_factor,
-            maximized: resolution.maximized,
-            fullscreen: resolution.fullscreen,
+        .unwrap_or_else(|| {
+            let (rect, _) = measure(window).unwrap_or((
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                scale_factor,
+            ));
+            SavedState {
+                width: rect.width,
+                height: rect.height,
+                x: rect.x,
+                y: rect.y,
+                scale_factor,
+                maximized: resolution.maximized,
+                fullscreen: resolution.fullscreen,
+            }
         });
     {
         let mut guard = TRACKER.lock();
@@ -487,9 +564,12 @@ pub(crate) fn apply_and_track(
         });
     }
     ensure_writer();
-    // 恢复的尺寸可能被系统按工作区钳制：按实际值纠正内存快照，下次落盘
-    // （下一次变化或退出）写的是真实几何，而不是永远偏大的请求值。
-    adopt_actual_geometry();
+    // 恢复请求不一定原样生效：系统可能按工作区钳制尺寸；macOS 上 tao 的
+    // set_position / set_size / maximize / set_fullscreen 还是派发到主队列异步
+    // 执行的，此刻立即采样读到的是建窗时的默认几何且「未最大化」——它会覆盖
+    // 普通几何，随后窗口被最大化，这份默认几何就一直被当成普通尺寸保留下去。
+    // 所以这里只标记有变化，由写盘线程在几何静默 500 ms 后统一重采样。
+    mark_dirty();
 
     window.on_window_event(|event| match event {
         // 只标记有变化：几何与最大化/全屏标志在落盘前统一重采样，避免事件
@@ -506,29 +586,31 @@ pub(crate) fn apply_and_track(
 /// 启动流程的入口：读记录、按显示器校验，返回恢复结论（建窗前调用）。
 pub(crate) fn restore_plan(app: &tauri::AppHandle) -> (Resolution, Option<SavedState>) {
     let saved = read_at(&state_path());
-    let work_area = |monitor: &tauri::Monitor| {
+    let display = |monitor: &tauri::Monitor| {
         let area = monitor.work_area();
-        Rect {
+        let work_area = Rect {
             x: area.position.x,
             y: area.position.y,
             width: area.size.width,
             height: area.size.height,
-        }
+        };
+        display_from(work_area, monitor.scale_factor(), LOGICAL_UNITS)
     };
-    let primary = app.primary_monitor().ok().flatten();
-    let scale_factor = primary
-        .as_ref()
-        .map(|monitor| monitor.scale_factor())
-        .unwrap_or(1.0);
-    // monitors[0] 必须是主显示器：默认摆放以它为中心。
-    let mut monitors: Vec<Rect> = primary.iter().map(work_area).collect();
+    // displays[0] 必须是主显示器：默认摆放以它为中心。
+    let mut displays: Vec<Display> = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .iter()
+        .map(display)
+        .collect();
     for monitor in app.available_monitors().unwrap_or_default() {
-        let rect = work_area(&monitor);
-        if !monitors.contains(&rect) {
-            monitors.push(rect);
+        let next = display(&monitor);
+        if !displays.iter().any(|known| known.area == next.area) {
+            displays.push(next);
         }
     }
-    let resolution = resolve(saved.as_ref(), &monitors, scale_factor);
+    let resolution = resolve(saved.as_ref(), &displays);
     (resolution, saved)
 }
 
@@ -536,8 +618,11 @@ pub(crate) fn restore_plan(app: &tauri::AppHandle) -> (Resolution, Option<SavedS
 mod tests {
     use super::*;
 
-    fn monitor(x: i32, y: i32, width: u32, height: u32) -> Rect {
-        Rect { x, y, width, height }
+    fn monitor(x: i32, y: i32, width: u32, height: u32) -> Display {
+        Display {
+            area: Rect { x, y, width, height },
+            scale: 1.0,
+        }
     }
 
     fn state(width: u32, height: u32, x: i32, y: i32) -> SavedState {
@@ -556,7 +641,7 @@ mod tests {
     fn restore_keeps_geometry_on_a_visible_monitor() {
         let monitors = [monitor(0, 0, 1920, 1080)];
         let saved = state(1600, 900, 100, 80);
-        let resolution = resolve(Some(&saved), &monitors, 1.0);
+        let resolution = resolve(Some(&saved), &monitors);
         assert_eq!(
             resolution.placement,
             Placement::Restore(Rect { x: 100, y: 80, width: 1600, height: 900 })
@@ -569,7 +654,7 @@ mod tests {
         let monitors = [monitor(0, 0, 1920, 1080)];
         let saved = state(1200, 800, 3000, 200);
         assert!(matches!(
-            resolve(Some(&saved), &monitors, 1.0).placement,
+            resolve(Some(&saved), &monitors).placement,
             Placement::Default { .. }
         ));
     }
@@ -578,7 +663,7 @@ mod tests {
     fn restore_discards_geometry_when_no_monitor_information() {
         let saved = state(1200, 800, 0, 0);
         assert!(matches!(
-            resolve(Some(&saved), &[], 1.0).placement,
+            resolve(Some(&saved), &[]).placement,
             Placement::Default { .. }
         ));
     }
@@ -587,7 +672,7 @@ mod tests {
     fn restore_clamps_oversized_window_to_the_work_area() {
         let monitors = [monitor(0, 0, 1920, 1040)];
         let saved = state(3000, 2000, 0, 0);
-        let Placement::Restore(rect) = resolve(Some(&saved), &monitors, 1.0).placement else {
+        let Placement::Restore(rect) = resolve(Some(&saved), &monitors).placement else {
             panic!("expected restore");
         };
         assert_eq!((rect.width, rect.height), (1920, 1040));
@@ -598,12 +683,12 @@ mod tests {
         // 1440×900 屏幕扣掉任务栏只剩 852 高：默认 900 高会压到任务栏下面。
         let monitors = [monitor(0, 0, 1440, 852)];
         assert_eq!(
-            resolve(None, &monitors, 1.0).placement,
+            resolve(None, &monitors).placement,
             Placement::Default(Rect { x: 20, y: 0, width: 1400, height: 852 })
         );
         // 大屏上保持默认尺寸，不放大，并居中。
         assert_eq!(
-            resolve(None, &[monitor(0, 0, 2560, 1400)], 1.0).placement,
+            resolve(None, &[monitor(0, 0, 2560, 1400)]).placement,
             Placement::Default(Rect { x: 580, y: 250, width: 1400, height: 900 })
         );
     }
@@ -612,7 +697,7 @@ mod tests {
     fn restore_raises_undersized_window_to_the_minimum() {
         let monitors = [monitor(0, 0, 1920, 1080)];
         let saved = state(320, 200, 10, 10);
-        let Placement::Restore(rect) = resolve(Some(&saved), &monitors, 1.0).placement else {
+        let Placement::Restore(rect) = resolve(Some(&saved), &monitors).placement else {
             panic!("expected restore");
         };
         assert_eq!((rect.width, rect.height), (900, 600));
@@ -628,7 +713,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    resolve(Some(&saved), &[monitor(0, 0, 1920, 1080)], 1.0).placement,
+                    resolve(Some(&saved), &[monitor(0, 0, 1920, 1080)]).placement,
                     Placement::Default { .. }
                 ),
                 "{saved:?}"
@@ -664,7 +749,7 @@ mod tests {
         let mut saved = state(1400, 900, 20, 30);
         saved.maximized = true;
         saved.fullscreen = false;
-        let resolution = resolve(Some(&saved), &monitors, 1.0);
+        let resolution = resolve(Some(&saved), &monitors);
         assert!(resolution.maximized);
         assert!(!resolution.fullscreen);
     }
@@ -695,5 +780,77 @@ mod tests {
         write_at(&path, &fallback);
         assert_eq!(read_at(&path), Some(fallback));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn minimum_size_follows_the_target_display_scale() {
+        // 物理像素坐标（Windows）：主屏 150%，右侧副屏 100%。
+        let displays = [
+            display_from(monitor(0, 0, 2880, 1680).area, 1.5, false),
+            display_from(monitor(2880, 0, 1920, 1040).area, 1.0, false),
+        ];
+        // 副屏上 1000×700 物理像素 = 1000×700 逻辑，高于最小值，原样恢复，
+        // 不能按主屏倍数抬成 1350×900。
+        let saved = state(1000, 700, 3000, 100);
+        let Placement::Restore(rect) = resolve(Some(&saved), &displays).placement else {
+            panic!("expected restore");
+        };
+        assert_eq!((rect.width, rect.height), (1000, 700));
+        // 同样的物理尺寸在 150% 主屏上只有约 667×467 逻辑：按主屏倍数抬到最小值。
+        let saved = state(1000, 700, 100, 100);
+        let Placement::Restore(rect) = resolve(Some(&saved), &displays).placement else {
+            panic!("expected restore");
+        };
+        assert_eq!((rect.width, rect.height), (1350, 900));
+    }
+
+    #[test]
+    fn default_size_scales_with_the_primary_display() {
+        let displays = [
+            display_from(monitor(0, 0, 2880, 1680).area, 1.5, false),
+            display_from(monitor(2880, 0, 1920, 1040).area, 1.0, false),
+        ];
+        assert_eq!(
+            resolve(None, &displays).placement,
+            Placement::Default(Rect { x: 390, y: 165, width: 2100, height: 1350 })
+        );
+    }
+
+    #[test]
+    fn mac_mixed_dpi_restores_on_the_saved_display_in_points() {
+        // MacBook 内建屏 2x（1728×1117 点）+ 右侧 1x 外接屏（1920×1080 点）。tauri 给的
+        // 工作区是各屏按自己倍数换算的物理像素：内建屏宽 3456，外接屏从 1728 开始，
+        // 两块屏的物理坐标互相重叠、对不齐。换回点坐标后才是统一的一张坐标纸。
+        let displays = [
+            display_from(Rect { x: 0, y: 0, width: 3456, height: 2234 }, 2.0, true),
+            display_from(Rect { x: 1728, y: 0, width: 1920, height: 1080 }, 1.0, true),
+        ];
+        assert_eq!(displays[0].area, Rect { x: 0, y: 0, width: 1728, height: 1117 });
+        assert_eq!(displays[0].scale, 1.0);
+        // 内建屏（2x）上的窗口：测得的物理像素按窗口自己的倍数除回点。
+        assert_eq!(
+            to_record_units(Rect { x: 400, y: 200, width: 2800, height: 1800 }, 2.0, true),
+            Rect { x: 200, y: 100, width: 1400, height: 900 }
+        );
+        // 外接屏（1x）上的窗口：点坐标原样恢复，仍在外接屏上，尺寸不减半、不被
+        // 抬到最小值。
+        let measured = Rect { x: 1900, y: 100, width: 1600, height: 1000 };
+        let window = to_record_units(measured, 1.0, true);
+        let saved = state(window.width, window.height, window.x, window.y);
+        let Placement::Restore(rect) = resolve(Some(&saved), &displays).placement else {
+            panic!("expected restore");
+        };
+        assert_eq!(rect, Rect { x: 1900, y: 100, width: 1600, height: 1000 });
+        assert_eq!(rect.intersection(&displays[0].area), (0, 1000));
+        assert_eq!(rect.intersection(&displays[1].area), (1600, 980));
+    }
+
+    #[test]
+    fn invalid_scale_factor_does_not_break_unit_conversion() {
+        let rect = Rect { x: 10, y: 20, width: 300, height: 400 };
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(to_record_units(rect, scale, true), rect, "{scale}");
+            assert_eq!(display_from(rect, scale, false).scale, 1.0, "{scale}");
+        }
     }
 }

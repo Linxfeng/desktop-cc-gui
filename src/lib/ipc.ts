@@ -264,6 +264,7 @@ export type WorktreeCreateStage =
 
 export type WorktreeErrorKind =
   | "not_a_repo"
+  | "repo_open_failed"
   | "invalid_branch"
   | "branch_not_found"
   | "branch_exists"
@@ -582,6 +583,9 @@ export interface AppSettings {
   /** 宽幕布 (设置 → 通用 → 外观): true = the chat content column fills its
    *  pane instead of the default centered column (750px / `max-w-3xl`). */
   chatWideLayout?: boolean | null;
+  /** File tree entries Git ignores (设置 → 通用 → 行为): absent/false = listed
+   *  and drawn faded, true = hidden from the tree. */
+  fileTreeHideIgnored?: boolean | null;
   /** Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
    *  Missing/false = the entry stays hidden (default off). */
   betaFeatures?: Record<string, boolean> | null;
@@ -630,6 +634,10 @@ export interface DirEntry {
   isDir: boolean;
   size: number;
   mtimeMs: number;
+  /** Git ignores this entry (`.gitignore` / info/exclude / global excludes,
+   *  and `.git` itself; tracked content never is). Only set when `listDir`
+   *  was asked with `gitIgnoreRoot`; absent = not ignored / not asked. */
+  ignored?: boolean;
 }
 
 export interface FileContent {
@@ -1767,7 +1775,12 @@ export const ipc = {
   terminalClose: (id: string) => invoke<void>("terminal_close", { id }),
   // files — every command goes through withGrantRetry so an outside-roots
   // rejection becomes a one-click grant prompt + retry (see lib/grant.ts).
-  listDir: (path: string) => withGrantRetry(() => invoke<DirEntry[]>("list_dir", { path })),
+  /** `gitIgnoreRoot` (the file tree's root) opts into per-entry `ignored`
+   *  flags; callers that only need names leave it out and skip the Git work. */
+  listDir: (path: string, opts?: { gitIgnoreRoot?: string }) =>
+    withGrantRetry(() =>
+      invoke<DirEntry[]>("list_dir", { path, gitIgnoreRoot: opts?.gitIgnoreRoot }),
+    ),
   readFile: (path: string) => withGrantRetry(() => invoke<FileContent>("read_file", { path })),
   writeFile: (path: string, content: string) =>
     withGrantRetry(() => invoke<void>("write_file", { path, content })),
@@ -1935,6 +1948,7 @@ export const ipc = {
     invoke<void>("git_checkout", { path, branch }),
   gitCreateBranch: (path: string, name: string) =>
     invoke<void>("git_create_branch", { path, name }),
+  gitInit: (path: string) => invoke<void>("git_init", { path }),
   // git worktree (子工作区)
   gitWorktreeList: (repoPath: string) =>
     invoke<WorktreeInfo[]>("git_worktree_list", { repoPath }),
@@ -1983,6 +1997,9 @@ export const ipc = {
     invoke<string | null>("get_program_icon", { executablePath }),
   revealInFileManager: (path: string) =>
     invoke<void>("reveal_in_file_manager", { path }),
+  /** Local .html/.htm/.xhtml in the default web browser (desktop only: the
+   *  remote web bridge would open it on the host, not for the remote user). */
+  openInBrowser: (path: string) => invoke<void>("open_in_browser", { path }),
   // metrics
   appMetrics: () => invoke<AppMetrics>("app_metrics"),
   performanceDiagnostics: () => invoke<NativePerformanceDiagnostics>("performance_diagnostics"),
