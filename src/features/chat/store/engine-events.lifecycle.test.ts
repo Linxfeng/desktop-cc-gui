@@ -18,7 +18,6 @@ vi.mock("@/lib/ipc", () => ({
   ipc: {
     recordAcceptedInternalFrame: vi.fn(async () => undefined),
     rescanSessions: vi.fn(async () => undefined),
-    usageRecord: vi.fn(async () => undefined),
   },
 }));
 
