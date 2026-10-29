@@ -120,10 +120,16 @@ class WebBridge {
     if (this.versionValue === null) {
       for (const w of this.versionWaiters.splice(0)) w(null);
     }
-    // Keep retrying: the desktop may have restarted the bridge.
+    // Keep retrying: the desktop may have restarted the bridge. A timer that
+    // outlives the page (jsdom tears the environment down after a test, or the
+    // webview is being destroyed) must not run: `location` is gone by then and
+    // the retry would throw an unhandled ReferenceError.
     const delay = this.retryMs;
     this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
-    setTimeout(() => void this.ensure(), delay);
+    setTimeout(() => {
+      if (typeof location === "undefined") return;
+      void this.ensure();
+    }, delay);
   }
 
   async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
