@@ -4,8 +4,10 @@
  * the tab shows both when available, ordered by the active UI language.
  */
 
-/** Repo the release-notes tab links to for the Star banner / about page. */
-export const GITHUB_REPO_URL = "https://github.com/zhukunpenglinyutong/desktop-cc-gui";
+/** Repo the release-notes tab links to for the Star banner / about page.
+ *  This fork builds and publishes its own installers, so the link follows the
+ *  fork's release channel instead of upstream. */
+export const GITHUB_REPO_URL = "https://github.com/Linxfeng/desktop-cc-gui";
 
 export interface ChangelogEntry {
   version: string;
