@@ -946,6 +946,9 @@ pub(super) mod tests {
 
     pub fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ccgui-{tag}-{}", std::process::id()));
+        // Windows 会快速复用 PID:上一次测试被中断留下的目录里带着旧库,直接
+        // 建表会撞 "table ... already exists"。每个用例都从干净目录开始。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

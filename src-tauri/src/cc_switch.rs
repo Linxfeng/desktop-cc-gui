@@ -524,6 +524,8 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("ccgui-ccs-test-{}-{}", std::process::id(), name));
+        // 同一 PID 被复用时,上次遗留的 cc-switch.db 会让建表报 already exists。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
