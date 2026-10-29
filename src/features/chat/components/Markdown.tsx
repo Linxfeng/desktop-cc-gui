@@ -1,4 +1,13 @@
-import { isValidElement, memo, useMemo, useState, type ComponentProps, type ReactNode } from "react";
+import {
+  isValidElement,
+  memo,
+  startTransition,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -15,15 +24,22 @@ import { RevealText } from "./reveal-text";
 import { useLiveReveal } from "./use-live-reveal";
 import { createRevealPlan } from "./reveal-plan";
 import { createCachedHighlighter } from "./cached-highlight";
+import { splitMarkdown } from "./markdown-chunks";
 import { openExternal } from "@/lib/platform";
 import { useTranslation } from "react-i18next";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Check from "lucide-react/dist/esm/icons/check";
-import { useFilesStore } from "@/features/files/store";
-import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { useCopied } from "@/hooks/use-copied";
+import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
-import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
+import {
+  imageCacheKey,
+  isDirectImageSource,
+  loadMarkdownImage,
+  markdownImageCache,
+} from "./markdown-image-source";
+import { transformMarkdownUrl } from "./markdown-url";
+import { openChatFilePath } from "@/features/chat/open-chat-file";
 import {
   decodeFileLink,
   isFileLinkUrl,
@@ -39,19 +55,65 @@ type PluginListProp = NonNullable<
   ComponentProps<typeof ReactMarkdown>["remarkPlugins"]
 >;
 
-function openFileFromChat(rawPath: string, workspacePath: string) {
-  // Async on purpose: a path that only exists nested below the workspace
-  // root (outer folder opened as workspace) is found through the index
-  // fallback instead of dead-ending in a not-found tab.
-  void resolveChatFileLink(rawPath, workspacePath).then((path) => {
-    if (!path) return;
-    // Opens as a center-area tab; visible at every window width.
-    void useFilesStore.getState().openFile(path);
-  });
+/** Above this size a single ReactMarkdown tree is split into independent
+ *  ~8k-char chunk trees: live streaming only re-parses the growing tail chunk
+ *  (earlier memoized chunks stay untouched), and settled historical replies
+ *  mount their chunks progressively across frames. */
+const PROGRESSIVE_MARKDOWN_FROM = 16_000;
+
+/** Let the plain snapshot paint before the transition starts parsing. */
+function afterPaint(callback: () => void): () => void {
+  if (typeof requestAnimationFrame === "function") {
+    const id = requestAnimationFrame(callback);
+    return () => cancelAnimationFrame(id);
+  }
+  const id = setTimeout(callback, 0);
+  return () => clearTimeout(id);
 }
 
 function openExternalUrl(url: string) {
   openExternal(url);
+}
+
+function MarkdownImage({
+  src,
+  alt = "",
+  title,
+  workspacePath,
+}: {
+  src?: string;
+  alt?: string;
+  title?: string;
+  workspacePath: string;
+}) {
+  const source = src ?? "";
+  const direct = isDirectImageSource(source);
+  const key = imageCacheKey(source, workspacePath);
+  // Keyed by source so a changed src never shows the previous image.
+  const [loaded, setLoaded] = useState<{ key: string; url: string | null } | null>(null);
+
+  useEffect(() => {
+    if (!source || direct) return;
+    let cancelled = false;
+    void loadMarkdownImage(source, workspacePath).then((image) => {
+      if (!cancelled) setLoaded({ key, url: image?.dataUrl ?? null });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, workspacePath, direct, key]);
+
+  // A remount (virtualizer scroll back) paints the cached copy at once while
+  // the effect checks the file is unchanged.
+  const imageUrl = direct
+    ? source
+    : loaded?.key === key
+      ? loaded.url
+      : markdownImageCache.peek(key)?.dataUrl ?? null;
+  if (!imageUrl) {
+    return alt ? <span className="md-image-fallback">{alt}</span> : null;
+  }
+  return <img src={imageUrl} alt={alt} title={title} className="md-image" loading="lazy" />;
 }
 
 /** Green dotted-underline file link (parity with desktop-cc-gui). */
@@ -77,7 +139,7 @@ function FileLink({
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          openFileFromChat(path, workspacePath);
+          openChatFilePath(path, workspacePath);
         }}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -96,6 +158,33 @@ function FileLink({
     </>
   );
 }
+
+/** One independently parsed slice of a large document. Memoized so the
+ *  transition that mounts later slices never re-parses earlier ones. */
+const MarkdownChunk = memo(function MarkdownChunk({
+  text,
+  remarkPlugins,
+  rehypePlugins,
+  components,
+}: {
+  text: string;
+  remarkPlugins: PluginListProp;
+  rehypePlugins: PluginListProp;
+  components: Components;
+}) {
+  return (
+    <div className="md-chunk">
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        components={components}
+        urlTransform={transformMarkdownUrl}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+});
 
 /** Pull the raw text out of a rendered <code> node (hljs wraps tokens in
  * spans, so children is a tree, not a string). */
@@ -174,10 +263,73 @@ export default memo(function Markdown({
   // not end remark-math's span early; the prepared text feeds both the plan
   // and the renderer so reveal offsets stay aligned with the DOM.
   const mathText = useMemo(() => prepareMathText(text), [text]);
+  const large = text.length > PROGRESSIVE_MARKDOWN_FROM;
+  // Above 16k chars, split into independent ~8k-char chunks. During live
+  // streaming all chunks stay mounted as rich Markdown so the user never sees
+  // formatted text collapse into raw plain text, while `MarkdownChunk` memo
+  // keeps settled prefix chunks from re-parsing on each tail flush. For
+  // settled historical mounts, paint plain-text placeholders first and mount
+  // chunks a couple per frame so opening a huge session never blocks input.
+  const chunks = useMemo(
+    () => (large ? splitMarkdown(mathText) : []),
+    [large, mathText],
+  );
+  const [markdownReadyFor, setMarkdownReadyFor] = useState<string | null>(null);
+  const [visibleChunks, setVisibleChunks] = useState(0);
+  useEffect(() => {
+    if (!large || streaming || revealEnabled) return;
+    let cancelled = false;
+    const cancel = afterPaint(() => {
+      if (cancelled) return;
+      startTransition(() => {
+        setVisibleChunks(1);
+        setMarkdownReadyFor(mathText);
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancel();
+    };
+  }, [large, streaming, revealEnabled, mathText]);
+  const showMarkdown = !large || streaming || revealEnabled || markdownReadyFor === mathText;
+  const mountedChunks = streaming || revealEnabled ? chunks.length : visibleChunks;
+  useEffect(() => {
+    if (streaming || revealEnabled || !showMarkdown || !large || visibleChunks === 0 || visibleChunks >= chunks.length) {
+      return;
+    }
+    let cancelled = false;
+    let frame = 0;
+    const schedule = (callback: () => void) => {
+      if (typeof requestAnimationFrame === "function") {
+        frame = requestAnimationFrame(callback);
+      } else {
+        frame = window.setTimeout(callback, 16);
+      }
+    };
+    const cancel = () => {
+      if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+      else window.clearTimeout(frame);
+    };
+    const step = () => {
+      schedule(() => {
+        if (cancelled) return;
+        setVisibleChunks((count) => Math.min(count + 2, chunks.length));
+        step();
+      });
+    };
+    step();
+    return () => {
+      cancelled = true;
+      cancel();
+    };
+  }, [streaming, revealEnabled, showMarkdown, large, visibleChunks, chunks.length]);
+  // Reveal spans animate a growing document in place. Splitting would lose
+  // the character offsets, so large documents publish complete text instead.
+  const reveal = revealEnabled && !large;
   const plan = useMemo(createRevealPlan, [mathText, contributions]);
   // Show already-received text on mount (including virtualizer remounts);
   // smooth only subsequent arrivals, never replay a paragraph from empty.
-  const controller = useLiveReveal(plan, streaming);
+  const controller = useLiveReveal(plan, streaming && reveal);
   // Stable components map: a new reference makes ReactMarkdown discard its
   // HAST tree and re-parse the whole document.
   const hostComponents = useMemo<Components>(
@@ -192,6 +344,9 @@ export default memo(function Markdown({
           ? <RevealText controller={controller} start={start}>{children}</RevealText>
           : <span className={className} {...rest}>{children}</span>;
       },
+      img: ({ src, alt, title }) => (
+        <MarkdownImage src={src} alt={alt} title={title} workspacePath={workspacePath} />
+      ),
       a: ({ href, children }) => {
         const url = href ?? "";
         if (isFileLinkUrl(url)) {
@@ -270,6 +425,16 @@ export default memo(function Markdown({
       ] as PluginListProp,
     [contributions],
   );
+  const chunkRehypePlugins = useMemo(
+    () =>
+      [
+        restoreMathDollars,
+        rehypeKatex,
+        [cachedHighlight, { streaming: false }],
+        ...contributions.flatMap((c) => c.rehypePlugins ?? []),
+      ] as PluginListProp,
+    [contributions, cachedHighlight],
+  );
   const rehypePlugins = useMemo(
     () =>
       [
@@ -281,9 +446,9 @@ export default memo(function Markdown({
         rehypeKatex,
         [cachedHighlight, { streaming }],
         ...contributions.flatMap((c) => c.rehypePlugins ?? []),
-        ...(revealEnabled ? [plan.plugin] : []),
+        ...(reveal ? [plan.plugin] : []),
       ] as PluginListProp,
-    [contributions, cachedHighlight, streaming, revealEnabled, plan],
+    [contributions, cachedHighlight, streaming, reveal, plan],
   );
   // Later wins: plugin component overrides may intentionally shadow host
   // keys, and later registrations shadow earlier ones.
@@ -297,26 +462,35 @@ export default memo(function Markdown({
 
   return (
     <div className="prose-chat text-body-regular text-text-primary">
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
-        rehypePlugins={rehypePlugins}
-        components={components}
-        urlTransform={(url) =>
-          // file: is deliberately excluded: model output must not smuggle in
-          // local-file URLs. Real file paths are handled via FileLink above.
-          isFileLinkUrl(url) ||
-          /^(https?|mailto):/i.test(url) ||
-          url.startsWith("#") ||
-          url.startsWith("/") ||
-          url.startsWith("./") ||
-          url.startsWith("../") ||
-          /^[A-Za-z]:[\\/]/.test(url)
-            ? url
-            : ""
-        }
-      >
-        {mathText}
-      </ReactMarkdown>
+      {!showMarkdown ? (
+        <div className="whitespace-pre-wrap [overflow-wrap:anywhere]">{text}</div>
+      ) : large ? (
+        chunks.map((chunk, index) => {
+          const isGrowingTail = streaming && index === chunks.length - 1;
+          return index < mountedChunks ? (
+            <MarkdownChunk
+              key={chunk.start}
+              text={chunk.text}
+              remarkPlugins={remarkPlugins}
+              rehypePlugins={isGrowingTail ? rehypePlugins : chunkRehypePlugins}
+              components={components}
+            />
+          ) : (
+            <div className="md-chunk" key={chunk.start} aria-busy="true">
+              <div className="whitespace-pre-wrap [overflow-wrap:anywhere]">{chunk.text}</div>
+            </div>
+          );
+        })
+      ) : (
+        <ReactMarkdown
+          remarkPlugins={remarkPlugins}
+          rehypePlugins={rehypePlugins}
+          components={components}
+          urlTransform={transformMarkdownUrl}
+        >
+          {mathText}
+        </ReactMarkdown>
+      )}
     </div>
   );
 });

@@ -70,7 +70,7 @@ pub fn ledger_limit(target: Target, bot_id: &str) -> usize {
 
 pub fn list(db: &Db, target: Target, bot_id: &str) -> Result<Vec<MemoryEntry>, MemoryError> {
     let (db_target, db_bot) = scope(target, Some(bot_id))?;
-    let conn = db.0.lock();
+    let conn = db.read();
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {SELECT_COLUMNS} FROM memory_entries
@@ -108,7 +108,7 @@ pub fn view(db: &Db, bot_id: Option<&str>) -> Result<MemoryView, MemoryError> {
 }
 
 fn find_by_id(db: &Db, id: &str) -> Result<MemoryEntry, MemoryError> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         &format!("SELECT {SELECT_COLUMNS} FROM memory_entries WHERE id=?1"),
         [id],
@@ -128,7 +128,7 @@ fn entry_by_content(
     bot_id: &str,
     content: &str,
 ) -> Result<Option<MemoryEntry>, MemoryError> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         &format!(
             "SELECT {SELECT_COLUMNS} FROM memory_entries

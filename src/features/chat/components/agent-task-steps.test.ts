@@ -371,3 +371,47 @@ describe("subagent counting", () => {
     expect(items).toEqual([{ content: "实现功能", status: "complete", phase: "impl", reason: undefined, detail: undefined }]);
   });
 });
+
+describe("deriveTodoList id-keyed patches", () => {
+  const todoRow = (seq: number, text: string, todos: unknown): Message =>
+    ({ seq, role: "tool", text, ts: null, todos } as Message);
+  const patch = (items: unknown[]) => ({ replace: false, items });
+
+  it("keeps the status when a patch does not carry one (a rename)", () => {
+    const items = deriveTodoList([
+      todoRow(1, "TaskCreate", patch([{ id: "12", content: "旧标题", status: "pending" }])),
+      todoRow(2, "TaskUpdate", patch([{ id: "12", content: "", status: "complete" }])),
+      // The backend leaves `status` off when the update did not set one.
+      todoRow(3, "TaskUpdate", patch([{ id: "12", content: "新标题" }])),
+    ]);
+    expect(items.map(({ id, content, status }) => ({ id, content, status }))).toEqual([
+      { id: "12", content: "新标题", status: "complete" },
+    ]);
+  });
+
+  it("reads a status-less new item as pending", () => {
+    const items = deriveTodoList([todoRow(1, "TaskUpdate", patch([{ id: "7", content: "外部任务" }]))]);
+    expect(items.map(({ id, status }) => ({ id, status }))).toEqual([{ id: "7", status: "pending" }]);
+  });
+
+  it("keeps two tasks that share a subject apart by id", () => {
+    const items = deriveTodoList([
+      todoRow(1, "TaskCreate", patch([{ id: "1", content: "跑测试", status: "pending" }])),
+      todoRow(2, "TaskCreate", patch([{ id: "2", content: "跑测试", status: "pending" }])),
+      todoRow(3, "TaskUpdate", patch([{ id: "1", content: "", status: "complete" }])),
+    ]);
+    expect(items.map(({ id, status }) => ({ id, status }))).toEqual([
+      { id: "1", status: "complete" },
+      { id: "2", status: "pending" },
+    ]);
+  });
+
+  it("still matches an id-less item by content", () => {
+    // omp patches and unpaired creations carry no id; content stays the key.
+    const items = deriveTodoList([
+      todoRow(1, "TaskCreate", patch([{ content: "A", status: "pending" }])),
+      todoRow(2, "TaskCreate", patch([{ id: "1", content: "A", status: "pending" }])),
+    ]);
+    expect(items.map(({ id, content }) => ({ id, content }))).toEqual([{ id: "1", content: "A" }]);
+  });
+});

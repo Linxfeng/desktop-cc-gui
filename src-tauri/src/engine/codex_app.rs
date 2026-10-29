@@ -1707,6 +1707,9 @@ async fn handshake_and_start(
                 comparison_model: None,
                 model: req.model.clone(),
                 effort: req.effort.clone(),
+                // The thread's effective settings follow right below as the
+                // served side.
+                reports_served: true,
             },
         );
     }

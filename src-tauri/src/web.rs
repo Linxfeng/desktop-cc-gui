@@ -210,17 +210,25 @@ pub fn rotate_web_pair_key(app: tauri::AppHandle) -> Result<String, String> {
 
 /// Give a paired device a name the user will recognise in the list.
 #[tauri::command]
-pub fn web_device_rename(app: tauri::AppHandle, id: String, name: String) -> Result<bool, String> {
-    let state = app.state::<crate::AppState>();
-    let ok = state.db.web_device_set_name(&id, &name)?;
+pub async fn web_device_rename(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+) -> Result<bool, String> {
+    let db = Arc::clone(&app.state::<crate::AppState>().db);
+    let ok = tauri::async_runtime::spawn_blocking(move || db.web_device_set_name(&id, &name))
+        .await
+        .map_err(|e| e.to_string())??;
     notify_devices(&app);
     Ok(ok)
 }
 
 #[tauri::command]
-pub fn web_device_revoke(app: tauri::AppHandle, id: String) -> Result<bool, String> {
-    let state = app.state::<crate::AppState>();
-    let ok = state.db.web_device_revoke(&id)?;
+pub async fn web_device_revoke(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    let db = Arc::clone(&app.state::<crate::AppState>().db);
+    let ok = tauri::async_runtime::spawn_blocking(move || db.web_device_revoke(&id))
+        .await
+        .map_err(|e| e.to_string())??;
     notify_devices(&app);
     Ok(ok)
 }
@@ -229,9 +237,11 @@ pub fn web_device_revoke(app: tauri::AppHandle, id: String) -> Result<bool, Stri
 /// only thing that flips it to approved, so a key without a human on the
 /// desktop never grants access.
 #[tauri::command]
-pub fn web_device_approve(app: tauri::AppHandle, id: String) -> Result<bool, String> {
-    let state = app.state::<crate::AppState>();
-    let ok = state.db.web_device_approve(&id, now_ms())?;
+pub async fn web_device_approve(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    let db = Arc::clone(&app.state::<crate::AppState>().db);
+    let ok = tauri::async_runtime::spawn_blocking(move || db.web_device_approve(&id, now_ms()))
+        .await
+        .map_err(|e| e.to_string())??;
     notify_devices(&app);
     Ok(ok)
 }

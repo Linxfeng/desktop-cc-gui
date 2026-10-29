@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import "@/lib/i18n";
 import i18n from "@/lib/i18n";
 import { EngineModelPanel } from "./engine-model-panel";
+import type { ModelOption } from "./cli-menu";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -189,5 +190,84 @@ describe("EngineModelPanel channel picker", () => {
       );
     });
     expect(container.querySelector("[aria-label='推理强度']")).toBeTruthy();
+  });
+});
+
+describe("EngineModelPanel model sections", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  const CODEBUDDY: ModelOption[] = [
+    { id: "custom:glm-5.3", label: "GLM 5.3", provider: "enterprise" },
+    { id: "hy4-preview", label: "Hunyuan 4 Preview", provider: "hunyuan" },
+    { id: "glm-5.3", label: "GLM 5.3", provider: "chatglm" },
+  ];
+
+  const render = (engineId: string, models: ModelOption[], selectedModelId: string, query = "") =>
+    act(() => {
+      root.render(
+        <EngineModelPanel
+          option={{ id: engineId, label: engineId }}
+          models={models}
+          selectedModelId={selectedModelId}
+          query={query}
+          onQueryChange={() => {}}
+          effort="medium"
+          onPickModel={() => {}}
+          onEffortChange={() => {}}
+          channels={[]}
+          selectedChannelId=""
+          ompServiceTier={null}
+          onOmpServiceTierChange={async () => {}}
+          codexServiceTier={null}
+          onCodexServiceTierChange={async () => {}}
+        />,
+      );
+    });
+
+  /** Section headers in display order (the sticky labels above each group). */
+  const headers = () =>
+    [...container.querySelectorAll('[role="radiogroup"] > div > span')].map(
+      (el) => el.textContent,
+    );
+
+  it("titles CodeBuddy's enterprise section and files it last", () => {
+    render("codebuddy", CODEBUDDY, "glm-5.3");
+    expect(headers()).toEqual(["chatglm", "hunyuan", i18n.t("chat.modelGroupEnterprise")]);
+  });
+
+  it("keeps a picked enterprise model in view by leading with its section", () => {
+    render("codebuddy", CODEBUDDY, "custom:glm-5.3");
+    expect(headers()[0]).toBe(i18n.t("chat.modelGroupEnterprise"));
+  });
+
+  it("finds the enterprise rows by the title on screen", () => {
+    // The first two characters of the header (企业 in the default zh UI).
+    render("codebuddy", CODEBUDDY, "", i18n.t("chat.modelGroupEnterprise").slice(0, 2));
+    expect(headers()).toEqual([i18n.t("chat.modelGroupEnterprise")]);
+  });
+
+  it("shows another engine's relay named enterprise under its own name", () => {
+    render(
+      "omp",
+      [
+        { id: "enterprise/gpt-5.4", label: "gpt-5.4", provider: "enterprise" },
+        { id: "openai/gpt-5.4", label: "gpt-5.4", provider: "openai" },
+      ],
+      "",
+    );
+    // No pick to lead with: catalog order stands, nothing sinks or renames.
+    expect(headers()).toEqual(["enterprise", "openai"]);
   });
 });

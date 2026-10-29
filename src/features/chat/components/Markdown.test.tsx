@@ -6,6 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Markdown from "./Markdown";
 import { markdownRegistry } from "@ccgui/plugin-sdk";
 import type { Disposer } from "@ccgui/plugin-sdk";
+import { resetMarkdownImageCaches } from "./markdown-image-source";
+const imageIpc = vi.hoisted(() => ({
+  listDir: vi.fn(),
+  listFileIndex: vi.fn(),
+  readFile: vi.fn(),
+}));
+
+vi.mock("@/lib/ipc", () => ({ ipc: imageIpc }));
+
 
 // React's act() environment flag — a well-known global the runtime can't
 // validate, so a named cast with no narrowing is the right boundary.
@@ -20,6 +29,9 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  imageIpc.listDir.mockReset();
+  imageIpc.listFileIndex.mockReset();
+  imageIpc.readFile.mockReset();
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -99,6 +111,57 @@ describe("Markdown markdownRegistry merge (plan §4.2 #5)", () => {
     });
     expect(container.querySelector("[data-testid='plugin-code']")).toBeNull();
     expect(container.querySelector(".md-codeblock")).not.toBeNull();
+  });
+});
+
+describe("large document rendering", () => {
+  const largeText = Array.from(
+    { length: 320 },
+    (_, i) => `## 段${i}\n\n内容 ${"字".repeat(40)} **粗体${i}**`,
+  ).join("\n\n");
+  async function settleLargeRender() {
+    // The plain snapshot paints first, then a transition mounts the chunks.
+    for (let i = 0; i < 5; i += 1) {
+      await act(async () => {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 30);
+        await promise;
+      });
+    }
+  }
+
+  it("mounts a settled historical large reply (>16k chars) progressively after a plain-text first paint", async () => {
+    expect(largeText.length).toBeGreaterThan(16_000);
+    expect(largeText.length).toBeLessThan(24_000);
+    await renderMarkdown(largeText);
+    // First paint stays plain text so opening a historical session never blocks input.
+    expect(container.querySelectorAll(".md-chunk")).toHaveLength(0);
+    expect(container.querySelectorAll("strong")).toHaveLength(0);
+
+    await settleLargeRender();
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).toContain("粗体319");
+    expect(container.textContent).not.toContain("**粗体319**");
+  });
+
+  it("keeps a large live reply formatted as memoized Markdown chunks during streaming and on settle", async () => {
+    await act(async () => {
+      root.render(<Markdown text={largeText} workspacePath="/ws" streaming />);
+    });
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).toContain("粗体319");
+    expect(container.textContent).not.toContain("**粗体319**");
+
+    // Settling a live stream must keep all formatted chunks mounted immediately
+    // without flashing back to plain text on the settle commit.
+    await act(async () => {
+      root.render(<Markdown text={largeText} workspacePath="/ws" />);
+    });
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).not.toContain("**粗体319**");
   });
 });
 
@@ -234,5 +297,290 @@ describe("GFM email autolinks (WKWebView lookbehind compatibility)", () => {
     const autolinkEntry = requireFromGfm.resolve("mdast-util-gfm-autolink-literal");
     const source = readFileSync(autolinkEntry, "utf8");
     expect(source).not.toMatch(/\(\?<[=!]/);
+  });
+});
+
+describe("Markdown images", () => {
+  const imagePath = "1live2d/references/claude-gpt-20261019/claude-candidates.jpg";
+  const candidateUrl = "data:image/jpeg;base64,Y2FuZGlkYXRl";
+
+  function imageFile(dataUrl: string) {
+    return { kind: "image", text: null, dataUrl, truncated: false };
+  }
+
+  function dirEntry(name: string, mtimeMs = 1) {
+    return { name, isDir: false, size: 12, mtimeMs };
+  }
+
+  async function renderIn(text: string, workspacePath: string) {
+    await act(async () => {
+      root.render(<Markdown text={text} workspacePath={workspacePath} />);
+    });
+  }
+
+  async function remount(text: string) {
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await renderMarkdown(text);
+  }
+
+  /** Every file IPC the image path triggered, in call order per command. */
+  function fileCalls() {
+    return [
+      ...imageIpc.listDir.mock.calls.map(([path]) => `listDir ${path}`),
+      ...imageIpc.listFileIndex.mock.calls.map(([path]) => `listFileIndex ${path}`),
+      ...imageIpc.readFile.mock.calls.map(([path]) => `readFile ${path}`),
+    ];
+  }
+
+  beforeEach(() => {
+    resetMarkdownImageCaches();
+  });
+
+  it("loads a workspace-relative image file through the file reader", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg")]);
+    imageIpc.readFile.mockResolvedValueOnce(imageFile(candidateUrl));
+
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(imageIpc.readFile).toHaveBeenCalledWith(`/ws/${imagePath}`),
+      );
+    });
+
+    const image = container.querySelector<HTMLImageElement>("img");
+    expect(image?.getAttribute("src")).toBe(candidateUrl);
+    expect(image?.alt).toBe("Claude 候选");
+    expect(imageIpc.readFile).toHaveBeenCalledWith(`/ws/${imagePath}`);
+  });
+
+  it("keeps remote images on their original URL without reading local files", async () => {
+    const url = "https://example.com/candidate.png";
+    await renderMarkdown(`![Remote candidate](${url})`);
+
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(url);
+    expect(imageIpc.readFile).not.toHaveBeenCalled();
+  });
+
+  it("renders a raster data URL directly", async () => {
+    const url = "data:image/png;base64,cG5n";
+    await renderMarkdown(`![Generated image](${url})`);
+
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(url);
+    expect(imageIpc.readFile).not.toHaveBeenCalled();
+  });
+
+  it.each(["D:/private/secret.png", "/Users/me/secret.png"])(
+    "does not touch the file system for %s outside the workspace and shows its alt text",
+    async (src) => {
+      await renderMarkdown(`![Private image](${src})`);
+      await act(async () => {});
+
+      expect(container.querySelector("img")).toBeNull();
+      expect(container.textContent).toContain("Private image");
+      expect(fileCalls()).toEqual([]);
+    },
+  );
+
+  // `isPathUnder` compares strings, and the backend answers a `..` path that
+  // resolves outside every root with the error that opens the grant dialog.
+  it.each([
+    "./../outside/secret.png",
+    "assets/../../outside/secret.png",
+    "/ws/../outside/secret.png",
+    "assets/%2E%2E/%2E%2E/outside/secret.png",
+    // Markdown needs `\\` for one literal backslash (`\.` is an escape).
+    "assets\\\\..\\\\..\\\\outside\\\\secret.png",
+  ])("never sends the dot-dot path %s to any file IPC", async (src) => {
+    await renderMarkdown(`![Escaped image](${src})`);
+    await act(async () => {});
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toBe("Escaped image");
+    expect(fileCalls()).toEqual([]);
+  });
+
+  // A nested root matters: the parent of `/ws` is "" and would short-circuit.
+  it.each([
+    ["the workspace root itself", "/home/u/ws"],
+    ["the root with a line suffix", "/home/u/ws:3"],
+    ["another case on a case-sensitive file system", "/home/u/WS/x.png"],
+    ["a Kelvin sign that lower-cases to k", "/home/u/\u212Aws/x.png"],
+  ])("never sends %s to any file IPC", async (_label, src) => {
+    const workspace = src.includes("\u212A") ? "/home/u/kws" : "/home/u/ws";
+    await renderIn(`![Escaped image](${src})`, workspace);
+    await act(async () => {});
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(fileCalls()).toEqual([]);
+  });
+
+  it("matches a Windows workspace regardless of ASCII case", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("a.png")]);
+    imageIpc.readFile.mockResolvedValue(imageFile("data:image/png;base64,d2lu"));
+
+    await renderIn("![win](c:/Users/Me/ws/img/a.png)", "C:\\Users\\me\\WS");
+    await act(async () => {});
+
+    expect(imageIpc.readFile).toHaveBeenCalledWith("c:/Users/Me/ws/img/a.png");
+  });
+
+  it("keeps Windows drive-letter link targets clickable", async () => {
+    await renderIn("[a.ts](C:/ws/src/a.ts)", "C:\\ws");
+
+    const link = container.querySelector("a.md-file-link");
+    expect(link?.getAttribute("href")).toBe("C:/ws/src/a.ts");
+  });
+
+  it("reads a Windows drive-letter image inside the workspace", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("a.png")]);
+    imageIpc.readFile.mockResolvedValue(imageFile("data:image/png;base64,d2lu"));
+
+    await renderIn("![win](C:/ws/img/a.png)", "C:\\ws");
+    await act(async () => {});
+
+    expect(imageIpc.readFile).toHaveBeenCalledWith("C:/ws/img/a.png");
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,d2lu");
+  });
+
+  it("turns a bare relative link target into a file link", async () => {
+    await renderMarkdown("[main](src/main.ts)");
+
+    expect(container.querySelector("a.md-file-link")?.getAttribute("href")).toBe("src/main.ts");
+  });
+
+  it("still blanks scheme-bearing link and image targets", async () => {
+    await renderMarkdown("[a](javascript:alert(1)) [b](file:///etc/passwd) ![c](file:///etc/c.png)");
+    await act(async () => {});
+
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+    expect(fileCalls()).toEqual([]);
+  });
+
+  it("paints the cached image on remount and skips the read while the file is unchanged", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg")]);
+    imageIpc.readFile.mockResolvedValue(imageFile(candidateUrl));
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+    await act(async () => {});
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(1);
+
+    // The parent listing stays pending: whatever shows now came from the cache.
+    let releaseListing: (entries: unknown[]) => void = () => {};
+    imageIpc.listDir.mockImplementation(
+      () => new Promise((resolve) => { releaseListing = resolve; }),
+    );
+    await remount(`![Claude 候选](${imagePath})`);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(candidateUrl);
+
+    await act(async () => {
+      releaseListing([dirEntry("claude-candidates.jpg")]);
+    });
+    expect(imageIpc.listDir).toHaveBeenCalledTimes(2);
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(1);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(candidateUrl);
+  });
+
+  it("keeps a read that finished after its row unmounted", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg")]);
+    let releaseRead: (file: unknown) => void = () => {};
+    imageIpc.readFile.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseRead = resolve; }),
+    );
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+    await act(async () => root.unmount());
+    await act(async () => releaseRead(imageFile(candidateUrl)));
+
+    root = createRoot(container);
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(candidateUrl);
+    await act(async () => {});
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares one listing and one read between copies of the same image", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg")]);
+    imageIpc.readFile.mockResolvedValue(imageFile(candidateUrl));
+
+    await renderMarkdown(`![a](${imagePath})\n\n![b](${imagePath})`);
+    await act(async () => {});
+
+    expect(container.querySelectorAll("img")).toHaveLength(2);
+    expect(imageIpc.listDir).toHaveBeenCalledTimes(1);
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads again on every mount when the parent listing fails", async () => {
+    imageIpc.listDir.mockRejectedValue("cannot list");
+    imageIpc.listFileIndex.mockResolvedValue([]);
+    imageIpc.readFile.mockResolvedValue(imageFile(candidateUrl));
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+    await act(async () => {});
+    await remount(`![Claude 候选](${imagePath})`);
+    await act(async () => {});
+
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(2);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(candidateUrl);
+  });
+
+  it("skips the index scan for a recent miss but still finds a file that appears", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      imageIpc.listDir.mockResolvedValue([]);
+      imageIpc.listFileIndex.mockResolvedValue([]);
+      imageIpc.readFile.mockRejectedValue("not found");
+      await renderMarkdown(`![Claude 候选](${imagePath})`);
+      await act(async () => {});
+      expect(imageIpc.listFileIndex).toHaveBeenCalledTimes(1);
+
+      await remount(`![Claude 候选](${imagePath})`);
+      await act(async () => {});
+      expect(imageIpc.listFileIndex).toHaveBeenCalledTimes(1);
+      expect(container.textContent).toBe("Claude 候选");
+
+      now.mockReturnValue(1_000_000 + 16_000);
+      await remount(`![Claude 候选](${imagePath})`);
+      await act(async () => {});
+      expect(imageIpc.listFileIndex).toHaveBeenCalledTimes(2);
+
+      imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg")]);
+      imageIpc.readFile.mockResolvedValue(imageFile(candidateUrl));
+      await remount(`![Claude 候选](${imagePath})`);
+      await act(async () => {});
+      expect(container.querySelector("img")?.getAttribute("src")).toBe(candidateUrl);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("reads again when the agent regenerated the image under the same name", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg", 1)]);
+    imageIpc.readFile.mockResolvedValueOnce(imageFile(candidateUrl));
+    await renderMarkdown(`![Claude 候选](${imagePath})`);
+    await act(async () => {});
+
+    const regenerated = "data:image/jpeg;base64,bmV3";
+    imageIpc.listDir.mockResolvedValue([dirEntry("claude-candidates.jpg", 2)]);
+    imageIpc.readFile.mockResolvedValueOnce(imageFile(regenerated));
+    await remount(`![Claude 候选](${imagePath})`);
+    await act(async () => {});
+
+    expect(imageIpc.readFile).toHaveBeenCalledTimes(2);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(regenerated);
+  });
+
+  it("falls back to the alt text when the file is not an image or cannot be read", async () => {
+    imageIpc.listDir.mockResolvedValue([dirEntry("main.ts"), dirEntry("big.png")]);
+    imageIpc.readFile.mockImplementation(async (path: string) => {
+      if (path.endsWith("main.ts")) return { kind: "text", text: "x", dataUrl: null, truncated: false };
+      throw "image exceeds 5MB preview limit";
+    });
+
+    await renderMarkdown("![code](src/main.ts) ![big](img/big.png)");
+    await act(async () => {});
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toBe("code big");
   });
 });

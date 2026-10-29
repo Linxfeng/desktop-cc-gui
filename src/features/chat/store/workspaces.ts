@@ -1,5 +1,6 @@
 import { ipc, type WorkspaceGroup } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import i18n from "@/lib/i18n";
 import { newId } from "@/lib/id";
 import { pruneMentionIndex } from "@/components/application/ai-chat/mention-files";
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
@@ -28,6 +29,7 @@ export function createWorkspaceActions(
   | "refreshWorkspaces"
   | "addWorkspaces"
   | "reorderWorkspaces"
+  | "setWorkspacePinned"
   | "removeWorkspace"
   | "createWorkspaceGroup"
   | "renameWorkspaceGroup"
@@ -86,6 +88,23 @@ export function createWorkspaceActions(
         await ipc.reorderWorkspaces(ids);
       } catch {
         await get().refreshWorkspaces();
+      }
+    },
+
+    setWorkspacePinned: async (id, pinned) => {
+      const previous = get().workspaces.find((w) => w.id === id)?.pinned ?? false;
+      set((s) => ({
+        workspaces: s.workspaces.map((w) => w.id === id ? { ...w, pinned } : w),
+      }));
+      try {
+        await ipc.setWorkspacePinned(id, pinned);
+        set({ actionError: null });
+      } catch (error) {
+        set((s) => ({
+          workspaces: s.workspaces.map((w) => w.id === id ? { ...w, pinned: previous } : w),
+        }));
+        await get().refreshWorkspaces();
+        set({ actionError: i18n.t("chat.pinWorkspaceFailed", { message: errorText(error) }) });
       }
     },
 

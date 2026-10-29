@@ -15,13 +15,38 @@ describe("compareModel", () => {
     );
   });
 
-  it("reads a dated snapshot as a variant of the requested family", () => {
+  it("reads a date or build suffix as a snapshot of the same family", () => {
     expect(compareModel("claude-opus-4-5", "claude-opus-4-5-20251101")).toBe(
-      "variant",
+      "snapshot",
     );
     expect(compareModel("claude-opus-4-5-latest", "claude-opus-4-5")).toBe(
-      "variant",
+      "snapshot",
     );
+    // The provider prefix is ignored; a dated resolution of the same id is
+    // a snapshot, not a substitution.
+    expect(
+      compareModel("ds/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-1017"),
+    ).toBe("snapshot");
+    expect(compareModel("ds4.1", "ds4.1-1017")).toBe("snapshot");
+    // Cohere stamps monthly snapshots as `-MM-YYYY`.
+    expect(compareModel("command-r-plus", "command-r-plus-08-2024")).toBe(
+      "snapshot",
+    );
+    expect(compareModel("command-r7b", "command-r7b-12-2024")).toBe("snapshot");
+  });
+
+  it("does not read a size/length pair as a monthly snapshot", () => {
+    // `-14-2048` is no month and no year: these are different models.
+    expect(compareModel("qwen-14-2048", "qwen-72-2048")).toBe("mismatch");
+    expect(compareModel("qwen-12", "qwen-12-2048")).toBe("mismatch");
+  });
+
+  it("does not eat a context-length suffix as a date", () => {
+    // `-\d{4}` that is not a plausible MMDD date is part of the id: 8192 is
+    // a real substitution, not a snapshot of 4096.
+    expect(
+      compareModel("qwen2.5-7b-instruct-4096", "qwen2.5-7b-instruct-8192"),
+    ).toBe("mismatch");
   });
 
   it("flags a different model", () => {
@@ -101,8 +126,9 @@ describe("checkResponseSelection", () => {
       checkResponseSelection({
         requested,
         served: { model: null, effort: null },
+        reportsServed: true,
       }).visible,
-    ).toBe(false);
+    ).toBe(true);
     expect(
       checkResponseSelection({
         requested,
@@ -135,14 +161,67 @@ describe("checkResponseSelection", () => {
     expect(view.visible).toBe(true);
   });
 
-  it("stays hidden when nothing was reported to compare", () => {
+  it("reads a dated id of the same family as a neutral snapshot", () => {
+    const view = checkResponseSelection({
+      requested: { model: "claude-sonnet-4-5", effort: "high" },
+      served: { model: "claude-sonnet-4-5-20250929", effort: "high" },
+    });
+    expect(view).toEqual({
+      model: "snapshot",
+      effort: "match",
+      verdict: "snapshot",
+      visible: true,
+    });
+    // A snapshot never outranks a real disagreement on the other axis.
     expect(
       checkResponseSelection({
-        requested: { model: "claude-opus-5-5", effort: "xhigh" },
+        requested: { model: "claude-sonnet-4-5", effort: "high" },
+        served: { model: "claude-sonnet-4-5-20250929", effort: "low" },
+      }).verdict,
+    ).toBe("mismatch");
+  });
+
+  it("still shows the card when a reporting engine's response never reported", () => {
+    const view = checkResponseSelection({
+      requested: { model: "claude-opus-5-5", effort: "xhigh" },
+      served: { model: null, effort: null },
+      reportsServed: true,
+    });
+    expect(view.visible).toBe(true);
+    expect(view.verdict).toBe("unknown");
+    expect(checkResponseSelection(null).visible).toBe(false);
+    expect(
+      checkResponseSelection({
+        requested: { model: null, effort: null },
         served: { model: null, effort: null },
+        reportsServed: true,
       }).visible,
     ).toBe(false);
-    expect(checkResponseSelection(null).visible).toBe(false);
+  });
+
+  it("stays hidden for an engine that never reports a served side", () => {
+    // kimi/grok/opencode/… only report the launch: a permanent "unreported"
+    // badge on every turn would be noise, not a finding.
+    const requestOnly = {
+      requested: { model: "kimi-k2", effort: "high" },
+      served: { model: null, effort: null },
+    };
+    expect(checkResponseSelection(requestOnly).visible).toBe(false);
+    expect(
+      checkResponseSelection({ ...requestOnly, reportsServed: false }).visible,
+    ).toBe(false);
+    // Any response evidence still opens the card, flag or not.
+    expect(
+      checkResponseSelection({
+        ...requestOnly,
+        served: { model: null, effort: "high" },
+      }),
+    ).toEqual({
+      model: "unknown",
+      effort: "match",
+      verdict: "unknown",
+      visible: true,
+    });
   });
 
   it("never reads an unreported side as a match", () => {
@@ -154,5 +233,28 @@ describe("checkResponseSelection", () => {
     });
     expect(view.effort).toBe("unknown");
     expect(view.verdict).toBe("match");
+  });
+
+  it("stays unknown when the response never reported its model", () => {
+    // omp/pi emit Served{model: None, effort: Some(..)} when only the
+    // thinking level came back: a matching level alone is not a confirmed
+    // model.
+    const view = checkResponseSelection({
+      requested: { model: "deepseek-v4.1-flash", effort: "high" },
+      served: { model: null, effort: "high" },
+    });
+    expect(view).toEqual({
+      model: "unknown",
+      effort: "match",
+      verdict: "unknown",
+      visible: true,
+    });
+    // Same for an unresolved alias whose served model never arrived.
+    expect(
+      checkResponseSelection({
+        requested: { model: "opus", comparisonModel: null, effort: "high" },
+        served: { model: null, effort: "high" },
+      }).verdict,
+    ).toBe("unknown");
   });
 });

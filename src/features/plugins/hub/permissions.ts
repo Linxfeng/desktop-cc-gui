@@ -26,6 +26,8 @@ const BASE_LABELS: Record<string, string> = {
   "host:worktree": "hostWorktree",
   "host:window": "hostWindow",
   "host:models": "hostModels",
+  "usage.read": "usageRead",
+  "limits.read": "limitsRead",
   "network:none": "networkNone",
 };
 
@@ -41,6 +43,7 @@ const UI_LABELS: Record<string, string> = {
   "ui:page": "uiPage",
   "ui:timeline-row": "uiTimelineRow",
   "ui:session-menu": "uiSessionMenu",
+  "ui:file-link-menu": "uiFileLinkMenu",
   "ui:sidebar-entry": "uiSidebarEntry",
   "ui:center-tab": "uiCenterTab",
   "ui:conversation-mode": "uiConversationMode",

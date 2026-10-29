@@ -28,7 +28,7 @@ fn require_permission(
     }
 }
 
-fn require_grant(plugin_id: &str, permission: &str) -> Result<(), String> {
+pub(crate) fn require_grant(plugin_id: &str, permission: &str) -> Result<(), String> {
     let (enabled, permissions) = crate::plugins::plugin_enabled_permissions(plugin_id)?;
     require_permission(plugin_id, permission, enabled, &permissions)
 }

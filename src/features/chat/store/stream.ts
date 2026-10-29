@@ -374,6 +374,10 @@ export interface ToolMessageInput {
   args?: unknown;
   patch?: boolean;
   result?: unknown;
+  /** The engine's id for the call. A result patch pairs to its call on this
+   *  rather than on the tool name, which collides across parallel calls of
+   *  the same tool (four `TaskCreate` in one batch all share a name). */
+  toolCallId?: string | null;
 }
 
 function sameToolValue(left: unknown, right: unknown): boolean {
@@ -425,12 +429,17 @@ export function appendToolMessages<T extends BySessionSlice>(
     const indicesBySeq = new Map<number, number[]>();
     const toolIndices: number[] = [];
     const resultTargets = new Map<string, { scanned: number; index: number }>();
+    /** tool call id -> row index. An engine that reports ids lets a result
+     *  patch land on its own call; the name+watermark scan below is the
+     *  fallback for engines that do not. */
+    const callRows = new Map<string, number>();
     const indexMessage = (message: Message, index: number) => {
       const indices = indicesBySeq.get(message.seq);
       if (indices) indices.push(index);
       else indicesBySeq.set(message.seq, [index]);
       if (message.role !== "tool") return;
       toolIndices.push(index);
+      if (message.toolCallId) callRows.set(message.toolCallId, index);
       if (message.args == null) {
         const queue = emptyTools.get(message.text);
         if (queue) queue.indices.push(index);
@@ -442,7 +451,7 @@ export function appendToolMessages<T extends BySessionSlice>(
       if (messages === prev.messages) messages = messages.slice();
     };
     for (const tool of tools) {
-      const { text, path, todos, args, patch, result } = tool;
+      const { text, path, todos, args, patch, result, toolCallId } = tool;
       if (!patch) {
         const message: Message = {
           role: "tool",
@@ -450,6 +459,7 @@ export function appendToolMessages<T extends BySessionSlice>(
           path: path ?? null,
           ts: new Date().toISOString(),
           seq: messages.length ? messages[messages.length - 1].seq + 1 : 1,
+          ...(toolCallId ? { toolCallId } : {}),
           ...(todos ? { todos } : {}),
           ...(args !== undefined ? { args } : {}),
           ...(result !== undefined ? { result } : {}),
@@ -460,7 +470,8 @@ export function appendToolMessages<T extends BySessionSlice>(
         continue;
       }
       let target = -1;
-      if (result !== undefined) {
+      if (toolCallId) target = callRows.get(toolCallId) ?? -1;
+      if (target < 0 && result !== undefined) {
         const cached = resultTargets.get(text);
         target = cached?.index ?? -1;
         for (let offset = toolIndices.length - 1; offset >= (cached?.scanned ?? 0); offset--) {
@@ -471,7 +482,7 @@ export function appendToolMessages<T extends BySessionSlice>(
           }
         }
         resultTargets.set(text, { scanned: toolIndices.length, index: target });
-      } else {
+      } else if (target < 0) {
         const queue = emptyTools.get(text);
         if (queue) {
           while (queue.cursor < queue.indices.length && messages[queue.indices[queue.cursor]].args != null) {

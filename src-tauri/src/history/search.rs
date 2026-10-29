@@ -18,6 +18,7 @@
 
 use rusqlite::OptionalExtension;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -113,7 +114,7 @@ struct PendingSession {
 
 /// All sessions awaiting (re)indexing, in one snapshot.
 fn pending_batch(db: &crate::db::Db) -> Result<Vec<PendingSession>, String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     let mut stmt = conn
         .prepare(&format!(
             "SELECT s.engine, s.session_id, s.file_path, s.file_size, s.file_mtime_ms, s.message_count
@@ -138,7 +139,7 @@ fn pending_batch(db: &crate::db::Db) -> Result<Vec<PendingSession>, String> {
 }
 
 fn pending_count(db: &crate::db::Db) -> Result<i64, String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         &format!("SELECT COUNT(*) {PENDING_FROM}"),
         rusqlite::params![INDEX_VERSION, failed_version()],
@@ -150,7 +151,7 @@ fn pending_count(db: &crate::db::Db) -> Result<i64, String> {
 /// Messages currently in the content index: the corpus a query runs
 /// against, reported next to the search duration.
 fn message_count(db: &crate::db::Db) -> Result<i64, String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
         .map_err(|e| e.to_string())
 }
@@ -271,22 +272,42 @@ fn write_index(
     if current_signature != accepted_signature {
         return Ok(false);
     }
-    tx.execute(
-        "DELETE FROM session_messages WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![row.engine, row.session_id],
-    )
-    .map_err(|e| e.to_string())?;
+    // Replace-then-insert made every turn rebuild the whole session's FTS
+    // index (41 s for a 10k-message transcript). Transcripts are append-mostly,
+    // so update only rows whose text/role/timestamp actually changed: the
+    // upsert's WHERE suppresses the UPDATE trigger (and its FTS re-tokenize)
+    // for identical rows. Deletes are limited to seqs that disappeared.
+    let existing: Vec<i64> = {
+        let mut stmt = tx
+            .prepare("SELECT seq FROM session_messages WHERE engine=?1 AND session_id=?2")
+            .map_err(|e| e.to_string())?;
+        let seqs = stmt
+            .query_map(rusqlite::params![row.engine, row.session_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        seqs
+    };
+    let mut incoming = HashSet::with_capacity(parsed.messages.len());
     {
         let mut stmt = tx
             .prepare(
                 "INSERT INTO session_messages(engine, session_id, seq, role, text, ts_ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(engine, session_id, seq) DO UPDATE SET
+                    role=excluded.role,
+                    text=excluded.text,
+                    ts_ms=excluded.ts_ms
+                 WHERE session_messages.role IS NOT excluded.role
+                    OR session_messages.text IS NOT excluded.text
+                    OR session_messages.ts_ms IS NOT excluded.ts_ms",
             )
             .map_err(|e| e.to_string())?;
         for message in &parsed.messages {
             if message.text.trim().is_empty() {
                 continue;
             }
+            incoming.insert(message.seq);
             let ts_ms = message.ts.as_deref().and_then(parse_ts_ms_str);
             stmt.execute(rusqlite::params![
                 row.engine,
@@ -297,6 +318,20 @@ fn write_index(
                 ts_ms,
             ])
             .map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare(
+                "DELETE FROM session_messages
+                 WHERE engine=?1 AND session_id=?2 AND seq=?3",
+            )
+            .map_err(|e| e.to_string())?;
+        for seq in existing {
+            if !incoming.contains(&seq) {
+                stmt.execute(rusqlite::params![row.engine, row.session_id, seq])
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
     upsert_stamp(&tx, row, INDEX_VERSION)?;
@@ -369,6 +404,9 @@ pub fn spawn_index(db: Arc<crate::db::Db>) {
             // own pass drains the work.
             INDEX_RUNNING.store(false, Ordering::SeqCst);
             if !INDEX_RERUN.swap(false, Ordering::SeqCst) {
+                if matches!(pending_count(&db), Ok(0)) {
+                    let _ = db.wal_checkpoint_passive();
+                }
                 break;
             }
             if INDEX_RUNNING
@@ -577,7 +615,7 @@ fn fts_search(
          ORDER BY b.rank ASC, s.updated_at DESC, b.engine, b.session_id
          LIMIT ?2 OFFSET ?3"
     );
-    let conn = db.0.lock();
+    let conn = db.read();
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(
@@ -635,7 +673,7 @@ fn like_search(
         tokens.iter().map(|t| like_pattern(t).into()).collect();
     params.push((limit as i64 + 1).into());
     params.push((offset as i64).into());
-    let conn = db.0.lock();
+    let conn = db.read();
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |r| {
@@ -942,6 +980,97 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn reindexing_unchanged_messages_keeps_their_rows_and_ids() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = write_session_file(
+            &scratch,
+            "stable.jsonl",
+            &[claude_user_line("保持不变的内容"), claude_assistant_line("回复不变")],
+        );
+        register_file_session(&db, "stable", &path);
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        let ids_before: Vec<i64> = {
+            let conn = db.0.lock();
+            let mut stmt = conn
+                .prepare("SELECT id FROM session_messages ORDER BY seq")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+
+        // Force a pass over the same content: a replace-then-insert would
+        // allocate new ids (and retokenize every message in the FTS index).
+        db.0.lock()
+            .execute("DELETE FROM fts_state", [])
+            .unwrap();
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        let ids_after: Vec<i64> = {
+            let conn = db.0.lock();
+            let mut stmt = conn
+                .prepare("SELECT id FROM session_messages ORDER BY seq")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(ids_after, ids_before, "unchanged rows must not be rewritten");
+    }
+
+    #[test]
+    fn incremental_reindex_updates_changed_text_and_drops_removed_seqs() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = write_session_file(
+            &scratch,
+            "edit.jsonl",
+            &[
+                claude_user_line("第一段保持"),
+                claude_assistant_line("旧内容要消失"),
+                claude_user_line("最后一段保持"),
+            ],
+        );
+        register_file_session(&db, "edit", &path);
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        assert_eq!(search(&db, "旧内容", None, None).unwrap().hits.len(), 1);
+
+        // Edit the middle message in place (same seq) and remove nothing yet.
+        std::fs::write(
+            &path,
+            [
+                claude_user_line("第一段保持"),
+                claude_assistant_line("新内容可以搜到"),
+                claude_user_line("最后一段保持"),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        register_file_session(&db, "edit", &path);
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        assert!(search(&db, "旧内容", None, None).unwrap().hits.is_empty());
+        assert_eq!(search(&db, "新内容", None, None).unwrap().hits.len(), 1);
+        assert_eq!(search(&db, "第一段保持", None, None).unwrap().hits.len(), 1);
+        assert_eq!(search(&db, "最后一段保持", None, None).unwrap().hits.len(), 1);
+
+        // Drop the middle message: its index row must not survive a pass.
+        std::fs::write(
+            &path,
+            [claude_user_line("第一段保持"), claude_user_line("最后一段保持")].join("\n") + "\n",
+        )
+        .unwrap();
+        register_file_session(&db, "edit", &path);
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        assert!(search(&db, "新内容", None, None).unwrap().hits.is_empty());
+        assert_eq!(search(&db, "第一段保持", None, None).unwrap().hits.len(), 1);
+        assert_eq!(search(&db, "最后一段保持", None, None).unwrap().hits.len(), 1);
+        let count: i64 = db
+            .read()
+            .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "only the two remaining user rows");
     }
 
     #[test]

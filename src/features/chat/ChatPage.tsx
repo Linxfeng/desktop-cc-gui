@@ -170,6 +170,7 @@ export default function ChatPage() {
     handleRemoveWorkspace,
     handleWorkspaceAlias,
     handleSetWorkspaceArchived,
+    handleSetWorkspacePinned,
     handleNewSession,
     handleNewSessionInWorkspace,
     handleNewBrowser,
@@ -243,6 +244,7 @@ export default function ChatPage() {
         onRemoveWorkspace={handleRemoveWorkspace}
         onWorkspaceAlias={handleWorkspaceAlias}
         onSetWorkspaceArchived={handleSetWorkspaceArchived}
+        onSetWorkspacePinned={handleSetWorkspacePinned}
         archivedRepos={archivedRepos}
         onNewSessionInWorkspace={handleNewSessionInWorkspace}
         onNewSession={handleNewSession}

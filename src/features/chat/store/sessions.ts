@@ -35,6 +35,7 @@ import {
 import { listWslSessionMetas, forgetWslWorkspace, takeWslNotices } from "../wsl-sessions";
 import { isWslUncWorkspace } from "@/lib/wsl-path";
 import { emitSessionActivated } from "@/features/plugins/runtime/events";
+import { sessionSelection } from "./selection";
 import {
   dispatchSessionClosed,
   dispatchSessionRestored,
@@ -264,36 +265,44 @@ export function createSessionActions(
         )
           ? persistedActive
           : (restoredTabs[0] ?? null);
+      // Hydrate the selection inputs (default models / current providers)
+      // BEFORE the first activation: the retained session://activated payload
+      // reads them via sessionSelection, and nothing re-emits after they
+      // land — a plugin loading later would replay null provider/model
+      // forever (until the user switches tabs or changes a pick).
+      await Promise.all([
+        ipc
+          .getAppSettings()
+          .then((settings) =>
+            set({
+              efforts: (settings.defaultEfforts ?? {}) as Record<
+                string,
+                EffortLevel
+              >,
+              ompServiceTier: normalizeOmpServiceTier(
+                settings.ompOpenaiServiceTier,
+              ),
+              codexServiceTier: normalizeOmpServiceTier(
+                settings.codexServiceTier,
+              ),
+              models: settings.defaultModels ?? {},
+              threadLimit: settings.sidebarThreadLimit ?? 5,
+              workspaceGroups: settings.workspaceGroups ?? [],
+              workspaceAliases: settings.workspaceAliases ?? {},
+              archivedWorkspaces: settings.archivedWorkspaces ?? [],
+              sendShortcut: settings.composerSendShortcut ?? "enter",
+              thinkingAutoCollapse: settings.thinkingAutoCollapse ?? true,
+              wideLayout: settings.chatWideLayout ?? false,
+            }),
+          )
+          .catch(() => {}),
+        Promise.resolve(ipc.getCliConfig?.())
+          .then((config) => {
+            if (config) set({ providers: engineCurrents(config) });
+          })
+          .catch(() => {}),
+      ]);
       if (activeTab) activateTab(activeTab);
-      ipc
-        .getAppSettings()
-        .then((settings) =>
-          set({
-            efforts: (settings.defaultEfforts ?? {}) as Record<
-              string,
-              EffortLevel
-            >,
-            ompServiceTier: normalizeOmpServiceTier(
-              settings.ompOpenaiServiceTier,
-            ),
-            codexServiceTier: normalizeOmpServiceTier(
-              settings.codexServiceTier,
-            ),
-            models: settings.defaultModels ?? {},
-            threadLimit: settings.sidebarThreadLimit ?? 5,
-            workspaceGroups: settings.workspaceGroups ?? [],
-            workspaceAliases: settings.workspaceAliases ?? {},
-            archivedWorkspaces: settings.archivedWorkspaces ?? [],
-            sendShortcut: settings.composerSendShortcut ?? "enter",
-            thinkingAutoCollapse: settings.thinkingAutoCollapse ?? true,
-            wideLayout: settings.chatWideLayout ?? false,
-          }),
-        )
-        .catch(() => {});
-      ipc
-        .getCliConfig?.()
-        ?.then((config) => set({ providers: engineCurrents(config) }))
-        .catch(() => {});
     },
 
     refreshSessions: async () => {
@@ -482,7 +491,11 @@ export function createSessionActions(
         set((s) => ({ restoredSessionKeys: { ...s.restoredSessionKeys, [key]: true } }));
         dispatchSessionRestored({ ...sessionLifecycleBase(get, { engine, sessionId, workspacePath }), sessionId });
       }
-      emitSessionActivated(engine, sessionId);
+      emitSessionActivated(
+        engine,
+        sessionId,
+        sessionSelection(get(), engine, sessionId, workspacePath),
+      );
       const existing = get().bySession[key];
       if (existing && existing.messages.length > 0) return;
       patchSession(set, key, { loading: true });

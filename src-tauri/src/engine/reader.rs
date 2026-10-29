@@ -747,10 +747,14 @@ impl TurnCore {
                 model,
                 effort,
                 comparison_model,
+                reports_served,
             } => {
                 let mut payload = selection_payload(model, effort);
                 if let Some(model) = comparison_model {
                     payload["comparisonModel"] = model.map(Value::String).unwrap_or(Value::Null);
+                }
+                if reports_served {
+                    payload["reportsServed"] = Value::Bool(true);
                 }
                 state.push(&self.sink, &self.run_id, &self.engine_id, "launch", payload);
             }
@@ -1021,6 +1025,7 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
                 comparison_model: ctx.comparison_model.clone(),
                 model: ctx.initial_model.clone(),
                 effort: ctx.initial_effort.clone(),
+                reports_served: ctx.engine_impl.reports_served(),
             },
         );
     }
@@ -1181,6 +1186,10 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     if state.awaiting_followup {
         crate::mcp::mark_run_ended(&ctx.core.run_id);
     }
+    // The provider-model sidecar belongs to this run only.
+    let _ = std::fs::remove_file(crate::engine::pi_family::served_models_path(
+        &ctx.core.run_id,
+    ));
     // Pending questions die with the run: settle their cards so the UI never
     // leaves an answerable question pointing at a dead process.
     for key in [
@@ -1392,13 +1401,15 @@ mod staging_tests {
             followup: None,
         };
         let mut state = TurnState::new(None);
-        for model in [Some("claude-opus-5-5".to_string()), None] {
+        for (model, reports_served) in [(Some("claude-opus-5-5".to_string()), true), (None, false)]
+        {
             core.dispatch_event(
                 &mut state,
                 EngineEvent::Launch {
                     model: Some("opus".into()),
                     effort: Some("high".into()),
                     comparison_model: Some(model),
+                    reports_served,
                 },
             );
         }
@@ -1410,7 +1421,7 @@ mod staging_tests {
             .collect();
         assert_eq!(
             events[0]["data"],
-            serde_json::json!({"model":"opus", "effort":"high", "comparisonModel":"claude-opus-5-5"})
+            serde_json::json!({"model":"opus", "effort":"high", "comparisonModel":"claude-opus-5-5", "reportsServed":true})
         );
         assert_eq!(
             events[1]["data"],

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/lib/ipc";
-import { appendToolMessage, applyStreamParts, settleLiveRows, EMPTY_SESSION, type BySessionSlice } from "./stream";
+import { appendToolMessage, appendToolMessages, applyStreamParts, settleLiveRows, EMPTY_SESSION, type BySessionSlice } from "./stream";
 
 function harness() {
   let state: BySessionSlice = { bySession: { k: { ...EMPTY_SESSION, messages: [] } } };
@@ -43,6 +43,42 @@ describe("appendToolMessage", () => {
     appendToolMessage(h.set, "k", "Read", null, "src/b.ts", null, { file_path: "src/b.ts" }, true);
     expect(h.messages()).toHaveLength(1);
     expect(h.messages()[0].path).toBe("src/a.ts");
+  });
+
+  it("settles parallel same-name calls on their own ids, not the first row", () => {
+    // Four TaskCreate in one batch share a name, so a name-keyed result patch
+    // can only ever land on one of them; every later id then goes missing and
+    // the task list keeps reading "pending".
+    const h = harness();
+    const created = (id: string, subject: string) => ({
+      text: "TaskCreate",
+      args: { subject },
+      todos: { replace: false, items: [{ content: subject, status: "pending" as const }] },
+      toolCallId: id,
+    });
+    appendToolMessages(
+      h.set,
+      "k",
+      [created("c1", "A"), created("c2", "B"), created("c3", "C"), created("c4", "D")],
+      null,
+    );
+    appendToolMessages(
+      h.set,
+      "k",
+      [
+        { text: "TaskCreate", patch: true, toolCallId: "c1", result: "Task #1 created successfully: A" },
+        { text: "TaskCreate", patch: true, toolCallId: "c2", result: "Task #2 created successfully: B" },
+        { text: "TaskCreate", patch: true, toolCallId: "c3", result: "Task #3 created successfully: C" },
+        { text: "TaskCreate", patch: true, toolCallId: "c4", result: "Task #4 created successfully: D" },
+      ],
+      null,
+    );
+    expect(h.messages().map((m) => m.result)).toEqual([
+      "Task #1 created successfully: A",
+      "Task #2 created successfully: B",
+      "Task #3 created successfully: C",
+      "Task #4 created successfully: D",
+    ]);
   });
 
   it("stamps model and effort on assistant stream messages", () => {

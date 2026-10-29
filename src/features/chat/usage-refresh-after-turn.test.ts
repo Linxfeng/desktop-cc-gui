@@ -7,7 +7,6 @@ vi.mock("@/lib/ipc", () => ({
   ipc: {
     loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
     rescanSessions: vi.fn(async () => {}),
-    usageRecord: vi.fn(async () => {}),
   },
 }));
 vi.mock("@/lib/events", () => ({

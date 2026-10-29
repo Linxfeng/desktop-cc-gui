@@ -22,6 +22,7 @@ import { createSessionActions } from "./store/sessions";
 import { createWorkspaceActions } from "./store/workspaces";
 import { createPreferenceActions } from "./store/preferences";
 import { createComposerActions } from "./store/composer";
+import { watchSessionSelection } from "./store/selection";
 import type { ChatStore } from "./store/types";
 
 // Facade re-exports: callers keep importing everything from "../store".
@@ -214,6 +215,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
     ...messagingActions,
   };
 });
+
+// Plugins follow the active session's provider/model through every path that
+// moves it, not only the composer pickers (session://selection-changed).
+eventTeardowns.push(
+  watchSessionSelection((listener) => useChatStore.subscribe(listener)),
+);
 
 // Dev-only handle for poking the store from the webview console; stripped
 // from production builds by the env guard.

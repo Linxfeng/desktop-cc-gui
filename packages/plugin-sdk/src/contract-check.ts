@@ -17,6 +17,7 @@ import type {
   DocumentWriteResult,
   ExternalSessionRow,
   FileChangedEvent,
+  FileLinkMenuTarget,
   InternalMessageCapture,
   InternalMessageEvent,
   isValidPluginId,
@@ -39,6 +40,20 @@ import type {
   PluginWindowSnapshot,
   PluginWechatWindow,
   PluginWorkspaceRow,
+  UsageStatsBucket,
+  UsageStatsQuery,
+  UsageStatRow,
+  UsageStatsResult,
+  UsageSourceState,
+  UsageSourceStatus,
+  UsageScanSummary,
+  UsageScanProgress,
+  UsagePriceInfo,
+  UsageLimitProviderId,
+  UsageLimitStatus,
+  UsageLimitWindow,
+  UsageLimitProvider,
+  UsageLimitsResult,
   PluginManifest,
   PluginTier,
   PromptContribution,
@@ -97,6 +112,7 @@ export type _JsonSchemaObject = Assert<Mutual<JsonSchemaObject, Pub.JsonSchemaOb
 export type _JsonSchemaProperty = Assert<Mutual<JsonSchemaProperty, Pub.JsonSchemaProperty>>;
 export type _ComposerSlotId = Assert<Mutual<ComposerSlotId, Pub.ComposerSlotId>>;
 export type _SessionMenuTarget = Assert<Mutual<SessionMenuTarget, Pub.SessionMenuTarget>>;
+export type _FileLinkMenuTarget = Assert<Mutual<FileLinkMenuTarget, Pub.FileLinkMenuTarget>>;
 export type _PluginTier = Assert<Mutual<PluginTier, Pub.PluginTier>>;
 export type _Disposer = Assert<Mutual<Disposer, Pub.Disposer>>;
 export type _PluginIdValidator = Assert<Mutual<typeof isValidPluginId, typeof Pub.isValidPluginId>>;
@@ -116,6 +132,20 @@ export type _ModelCatalogEngine = Assert<Mutual<PluginModelCatalogEngine, Pub.Pl
 export type _ModelSource = Assert<Mutual<PluginModelSource, Pub.PluginModelSource>>;
 export type _ModelCatalogError = Assert<Mutual<PluginModelCatalogError, Pub.PluginModelCatalogError>>;
 export type _ModelCatalogResult = Assert<Mutual<PluginModelCatalogResult, Pub.PluginModelCatalogResult>>;
+export type _UsageStatsBucket = Assert<Mutual<UsageStatsBucket, Pub.UsageStatsBucket>>;
+export type _UsageStatsQuery = Assert<Mutual<UsageStatsQuery, Pub.UsageStatsQuery>>;
+export type _UsageStatRow = Assert<Mutual<UsageStatRow, Pub.UsageStatRow>>;
+export type _UsageStatsResult = Assert<Mutual<UsageStatsResult, Pub.UsageStatsResult>>;
+export type _UsageSourceState = Assert<Mutual<UsageSourceState, Pub.UsageSourceState>>;
+export type _UsageSourceStatus = Assert<Mutual<UsageSourceStatus, Pub.UsageSourceStatus>>;
+export type _UsageScanSummary = Assert<Mutual<UsageScanSummary, Pub.UsageScanSummary>>;
+export type _UsageScanProgress = Assert<Mutual<UsageScanProgress, Pub.UsageScanProgress>>;
+export type _UsagePriceInfo = Assert<Mutual<UsagePriceInfo, Pub.UsagePriceInfo>>;
+export type _UsageLimitProviderId = Assert<Mutual<UsageLimitProviderId, Pub.UsageLimitProviderId>>;
+export type _UsageLimitStatus = Assert<Mutual<UsageLimitStatus, Pub.UsageLimitStatus>>;
+export type _UsageLimitWindow = Assert<Mutual<UsageLimitWindow, Pub.UsageLimitWindow>>;
+export type _UsageLimitProvider = Assert<Mutual<UsageLimitProvider, Pub.UsageLimitProvider>>;
+export type _UsageLimitsResult = Assert<Mutual<UsageLimitsResult, Pub.UsageLimitsResult>>;
 
 export type _PromptContribution = Assert<Mutual<PromptContribution, Pub.PromptContribution>>;
 export type _InternalMessageCapture = Assert<Mutual<InternalMessageCapture, Pub.InternalMessageCapture>>;
@@ -217,6 +247,8 @@ export type _WorktreesKeys = Assert<KeyParity<PluginContext["worktrees"], Pub.Pl
 export type _SessionsKeys = Assert<KeyParity<PluginContext["sessions"], Pub.PluginContext["sessions"]>>;
 export type _WindowKeys = Assert<KeyParity<PluginContext["window"], Pub.PluginContext["window"]>>;
 export type _ModelsKeys = Assert<KeyParity<PluginContext["models"], Pub.PluginContext["models"]>>;
+export type _UsageKeys = Assert<KeyParity<PluginContext["usage"], Pub.PluginContext["usage"]>>;
+export type _LimitsKeys = Assert<KeyParity<PluginContext["limits"], Pub.PluginContext["limits"]>>;
 export type _BridgeKeys = Assert<KeyParity<PluginContext["bridge"], Pub.PluginContext["bridge"]>>;
 export type _HostKeys = Assert<KeyParity<PluginContext["host"], Pub.PluginContext["host"]>>;
 export type _HooksKeys = Assert<KeyParity<PluginContext["hooks"], Pub.PluginContext["hooks"]>>;
@@ -240,6 +272,8 @@ export type _WorktreesShape = Assert<Mutual<PluginContext["worktrees"], Pub.Plug
 export type _SessionsShape = Assert<Mutual<PluginContext["sessions"], Pub.PluginContext["sessions"]>>;
 export type _WindowShape = Assert<Mutual<PluginContext["window"], Pub.PluginContext["window"]>>;
 export type _ModelsShape = Assert<Mutual<PluginContext["models"], Pub.PluginContext["models"]>>;
+export type _UsageShape = Assert<Mutual<PluginContext["usage"], Pub.PluginContext["usage"]>>;
+export type _LimitsShape = Assert<Mutual<PluginContext["limits"], Pub.PluginContext["limits"]>>;
 export type _BridgeShape = Assert<Mutual<PluginContext["bridge"], Pub.PluginContext["bridge"]>>;
 export type _HostShape = Assert<Mutual<PluginContext["host"], Pub.PluginContext["host"]>>;
 export type _HooksShape = Assert<Mutual<PluginContext["hooks"], Pub.PluginContext["hooks"]>>;

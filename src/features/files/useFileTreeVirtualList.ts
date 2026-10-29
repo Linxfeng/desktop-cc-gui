@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { measureElement as defaultMeasureElement, useVirtualizer } from "@tanstack/react-virtual";
-import { useFilesStore } from "./store";
+import { joinPath, useFilesStore } from "./store";
 import type { VisibleNode } from "./FileTreeRow";
 import { useFileTreePreferencesStore } from "./tree-preferences";
 import { buildVisibleNodes } from "./visible-nodes";
@@ -16,6 +16,7 @@ export function useFileTreeVirtualList() {
   const children = useFilesStore((s) => s.children);
   const expanded = useFilesStore((s) => s.expanded);
   const loadingDirs = useFilesStore((s) => s.loadingDirs);
+  const dirErrors = useFilesStore((s) => s.dirErrors);
   const repositories = useFilesStore((s) => s.repositories);
   const fileColors = useFilesStore((s) => s.fileColors);
   const hideIgnored = useFileTreePreferencesStore((s) => s.hideIgnored);
@@ -31,6 +32,20 @@ export function useFileTreeVirtualList() {
     }
   }, [root, ensureDir, toggleDir]);
 
+  useEffect(() => {
+    if (!root || !expanded[root]) return;
+    const visit = (dir: string) => {
+      for (const entry of children[dir] ?? []) {
+        if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+        const path = joinPath(dir, entry.name);
+        if (!expanded[path]) continue;
+        if (children[path]) visit(path);
+        else if (!loadingDirs[path] && !dirErrors[path]) void ensureDir(path);
+      }
+    };
+    visit(root);
+  }, [root, expanded, children, loadingDirs, dirErrors, hideIgnored, ensureDir]);
+
   const visible = useMemo<VisibleNode[]>(
     () =>
       buildVisibleNodes({
@@ -38,11 +53,12 @@ export function useFileTreeVirtualList() {
         children,
         expanded,
         loadingDirs,
+        dirErrors,
         repositories,
         fileColors,
         hideIgnored,
       }),
-    [children, expanded, loadingDirs, repositories, fileColors, root, hideIgnored],
+    [children, expanded, loadingDirs, dirErrors, repositories, fileColors, root, hideIgnored],
   );
 
   const parentRef = useRef<HTMLDivElement>(null);

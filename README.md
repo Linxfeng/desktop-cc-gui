@@ -116,7 +116,7 @@ MiniMax Code (command `mcode`) runs through its native ACP transport (`mcode acp
 - **LAN web access**: serve the UI to other devices on your network over a token-authenticated WebSocket bridge, with a QR-code entry in Settings.
 - **Workspace management**: group projects and switch between them.
 - In-app **auto-update** (Tauri updater against GitHub Releases), a changelog dialog, and signed macOS builds.
-- Bilingual UI: **Chinese and English**.
+- Multilingual UI: **Chinese, English and Korean**.
 
 ---
 
@@ -151,7 +151,7 @@ Want to build it yourself or contribute? Three steps.
 
 | Tool | Version | What for |
 | --- | --- | --- |
-| [Node.js](https://nodejs.org/) | 20 or newer | Runs the frontend toolchain |
+| [Node.js](https://nodejs.org/) | 22.13 or newer | Runs the frontend toolchain (building alone works on 20+; `pnpm test` needs 22.13+) |
 | [pnpm](https://pnpm.io/) | 10 (pinned via `packageManager`) | Installs dependencies |
 | [Rust](https://rustup.rs/) | stable (install via rustup) | Compiles the backend |
 
@@ -202,7 +202,7 @@ Windows and Linux installers are produced by the CI workflows under `.github/wor
 | UI | React 18 + TypeScript + Tailwind CSS 4 + zustand |
 | Build | Vite 6 |
 | Desktop shell | Tauri 2 (Rust backend: git2, rusqlite, portable-pty, axum) |
-| Tests | Vitest (frontend) + cargo test (Rust) |
+| Tests | Vitest + node:test (frontend) + cargo test (Rust) |
 
 ### Directory layout
 
@@ -212,14 +212,14 @@ desktop-cc-gui/
 │   ├── features/           # ★ Feature modules: chat / files / git / terminal /
 │   │                       #   settings / plugins / commands / update / open-app
 │   ├── components/         # Shared UI components (incl. engine brand icons)
-│   ├── i18n/               # zh + en locale bundles
+│   ├── i18n/               # zh + en + ko locale bundles
 │   ├── styles/             # Global styles
 │   └── lib/ utils/         # Utility functions
 ├── src-tauri/              # Rust backend
 │   └── src/                # engine/ (one module per CLI), history/, plugins/,
 │                           # git.rs, terminal.rs, web.rs (LAN bridge), ...
 ├── packages/plugin-sdk/    # @ccgui/plugin-sdk — plugin authoring kit
-├── tests/                  # Frontend integration-style tests (Vitest)
+├── tests/                  # node:test regression suites + browser/ verification pages
 ├── scripts/                # Build and packaging scripts
 └── docs/                   # Plugin development guide, engine mode notes
 ```
@@ -228,7 +228,7 @@ desktop-cc-gui/
 
 1. **UI-only change**: find the matching module under `src/features/` and edit there. New components live inside that feature's own folder.
 2. **Needs backend support**: add a `#[tauri::command]` in the matching `src-tauri/src/` module and call it from the frontend via the Tauri API.
-3. **Changed any UI text**: route it through i18n and keep both bundles (`src/i18n/zh.ts`, `src/i18n/en.ts`) synchronized — hardcoded UI text is not allowed.
+3. **Changed any UI text**: route it through i18n and keep all three bundles (`src/i18n/zh.ts`, `src/i18n/en.ts`, `src/i18n/ko.ts`) synchronized — hardcoded UI text is not allowed.
 
 ### Everyday commands
 
@@ -236,13 +236,14 @@ desktop-cc-gui/
 | --- | --- |
 | `pnpm dev` | Start the full app (Tauri dev mode) |
 | `pnpm build` | TypeScript check + frontend production build |
-| `pnpm test` | Run the Vitest suite |
+| `pnpm test` | Run the `node:test` suites under `tests/`, then the Vitest suite |
+| `pnpm test:node` | Run only the `node:test` suites under `tests/` |
 | `pnpm preview` | Preview the production frontend build |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Run Rust tests |
 
 ### Writing tests
 
-- Frontend tests use [Vitest](https://vitest.dev/) — colocated `xxx.test.ts(x)` files next to the source, plus heavier suites under `tests/`.
+- Frontend unit tests use [Vitest](https://vitest.dev/) — colocated `xxx.test.ts(x)` files next to the source. Heavier suites live in `tests/*.test.ts` and use Node's built-in `node:test` (`pnpm test:node`; `pnpm test` runs them first).
 - Rust tests live in their modules as usual and run with `cargo test --manifest-path src-tauri/Cargo.toml`.
 
 ---
@@ -252,7 +253,7 @@ desktop-cc-gui/
 Not many rules, but each exists for a reason:
 
 1. **Run the big three before opening a PR**: `pnpm build` (typecheck) and `pnpm test` green locally, plus `cargo test` if you touched Rust.
-2. **UI text must go through i18n**: every user-visible string comes from `src/i18n/`, and both shipped locale bundles must stay synchronized.
+2. **UI text must go through i18n**: every user-visible string comes from `src/i18n/`, and all three shipped locale bundles (zh, en, ko) must stay synchronized.
 3. **Keep components close to home**: new components start inside their own feature folder; promote to `src/components/` only once they're genuinely reused across features.
 4. **TypeScript strict**: don't paper over things with `any`; write real types.
 5. **Extend through the plugin SDK where possible**: new settings sections and surfaces should register through the same extension points the builtin ones use.
@@ -287,9 +288,11 @@ No emoji in commit messages, and no AI-generated signatures.
 ## Submitting your code (contribution flow)
 
 1. **Fork** the repo and clone it locally.
-2. Branch off `main`, named like `feat/xxx` or `fix/xxx`.
+2. Branch off the **`vX.Y.Z` development branch** with the highest version number, named like `feat/xxx` or `fix/xxx`.
 3. Make your changes and get `pnpm build` + `pnpm test` green locally.
-4. Open a PR against this repo's **`main` branch**. Title in commit format; in the description, explain what changed, why, and how you verified it.
+4. Open a PR against that **`vX.Y.Z` branch** (not `main`, which only receives release merges). Title in commit format; in the description, explain what changed, why, and how you verified it.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full branch rules, checks and PR expectations, and [SECURITY.md](SECURITY.md) for reporting security issues privately.
 
 Not sure where to start? Browse the [Issues](https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues) and pick one that interests you. Found a bug or have an idea? Open an issue and let's talk.
 
@@ -330,6 +333,8 @@ Thanks to all the contributors who help make ccgui better.
 ## Acknowledgements
 
 This project originally started from [CodexMonitor](https://github.com/Dimillian/CodexMonitor). Since v1.0.0 the codebase has been rewritten from scratch — no CodexMonitor code remains, but the original inspiration is gratefully acknowledged.
+
+The local usage statistics and subscription limit lookup (used by the Usage & Limits plugin) reference [TokenTracker](https://github.com/xiufengsun/tokentracker) (MIT), and the bundled model price table is derived from [LiteLLM](https://github.com/BerriAI/litellm) (MIT). See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
 ---
 

@@ -52,6 +52,11 @@ impl Engine for ClaudeEngine {
         "claude"
     }
 
+    /// Every assistant snapshot names the model that produced it.
+    fn reports_served(&self) -> bool {
+        true
+    }
+
     fn supports_images(&self) -> bool {
         true
     }
@@ -1311,6 +1316,72 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Live wire: TaskCreate and TaskGet both answer with a `toolUseResult`
+    /// of `{task:{id,subject,...}}`. Only the creation names a new todo id;
+    /// reading a task must not patch the list (it used to reset it to pending).
+    #[test]
+    fn task_create_result_carries_the_id_and_task_get_patches_nothing() {
+        let engine = ClaudeEngine::new();
+        let start = |id: &str, name: &str| {
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                }
+            })
+            .to_string()
+        };
+        let answer = |id: &str, envelope: Value, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": id, "content": text }
+                ]},
+                "toolUseResult": envelope
+            })
+            .to_string()
+        };
+        let result_todos = |out: &[EngineEvent]| {
+            out.iter()
+                .find_map(|e| match e {
+                    EngineEvent::Message { patch: true, result: Some(_), todos, .. } => Some(todos.clone()),
+                    _ => None,
+                })
+                .expect("expected a tool result patch")
+        };
+
+        let mut out = Vec::new();
+        engine.parse_line(&start("toolu_c", "TaskCreate"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_c",
+                serde_json::json!({"task": {"id": "1", "subject": "A"}}),
+                "Task #1 created successfully: A",
+            ),
+            &mut out,
+        );
+        let created = result_todos(&out).expect("TaskCreate result is a todo fact");
+        assert_eq!(created.items[0].id.as_deref(), Some("1"));
+        assert_eq!(created.items[0].content, "A");
+
+        out.clear();
+        engine.parse_line(&start("toolu_g", "TaskGet"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_g",
+                serde_json::json!({"task": {"id": "1", "subject": "A", "description": "",
+                    "status": "completed", "blocks": [], "blockedBy": []}}),
+                "Task #1: A\nStatus: completed\nDescription: ",
+            ),
+            &mut out,
+        );
+        assert!(result_todos(&out).is_none(), "TaskGet must not patch the todo list");
     }
 
     #[test]

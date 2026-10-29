@@ -6,6 +6,14 @@ import { ProcessDisclosure } from "./ProcessDisclosure";
 import type { ProcessItem } from "./timeline-rows";
 import { StepRow } from "@/components/application/task-list/task-list";
 import { findTimelineMatches } from "./timeline-search";
+import { useFilesStore } from "@/features/files/store";
+
+// The on-disk fallbacks behind the resolver probe through IPC, which has no
+// backend under jsdom. The resolver's own nesting/ambiguity rules live in
+// file-link-resolution.test.ts; here we only assert the chip wiring, so the
+// resolver is a passthrough that records its arguments.
+const resolveMock = vi.hoisted(() => vi.fn(async (path: string, _workspace: string) => path));
+vi.mock("@/features/chat/file-link-resolution", () => ({ resolveChatFileLink: resolveMock }));
 
 vi.mock("@/components/application/task-list/task-list", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/components/application/task-list/task-list")>();
@@ -59,6 +67,7 @@ async function render(
     turnLive?: boolean;
     thinkingAutoCollapse?: boolean;
     answered?: boolean;
+    workspacePath?: string;
   } = {},
 ) {
   await act(async () => {
@@ -71,6 +80,7 @@ async function render(
         thinkingAutoCollapse={props.thinkingAutoCollapse}
         processId={1}
         seenTools={seenTools}
+        workspacePath={props.workspacePath}
       />,
     );
   });
@@ -474,5 +484,149 @@ describe("ProcessDisclosure thinking expansion", () => {
       header!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(headerExpanded()).toBe(false);
+  });
+});
+
+describe("ProcessDisclosure file chips", () => {
+  const IMAGE: ProcessItem = {
+    type: "tool",
+    text: "Read",
+    path: "/ws/.tmp-parent-review-snapshot-2024.png",
+  };
+
+  it("renders the tool call's file name", async () => {
+    await render([IMAGE]);
+    expect(container.textContent).toContain(".tmp-parent-review-snapshot-2024.png");
+  });
+
+  it("keeps the chip inert without a workspace root", async () => {
+    await render([IMAGE]);
+    const chips = [...container.querySelectorAll("button")].filter((el) =>
+      el.textContent?.includes(".tmp-parent-review-snapshot-2024.png"),
+    );
+    expect(chips).toHaveLength(0);
+  });
+
+  it("opens the target file when the chip is clicked", async () => {
+    const openFile = vi.fn(async (_path: string) => {});
+    const original = useFilesStore.getState().openFile;
+    useFilesStore.setState({ openFile });
+    resolveMock.mockClear();
+    try {
+      await render([IMAGE], { workspacePath: "/ws" });
+      const chip = [...container.querySelectorAll<HTMLButtonElement>("button")].find((el) =>
+        el.textContent?.includes(".tmp-parent-review-snapshot-2024.png"),
+      );
+      expect(chip, "file chip as a button").toBeTruthy();
+      expect(chip!.getAttribute("title")).toBe("/ws/.tmp-parent-review-snapshot-2024.png");
+      await act(async () => chip!.click());
+      await vi.waitFor(() => expect(openFile).toHaveBeenCalled());
+      // Relative tool paths anchor at the session workspace, and the chip
+      // hands the resolver the full path (not the truncated label).
+      expect(resolveMock).toHaveBeenCalledWith(
+        "/ws/.tmp-parent-review-snapshot-2024.png",
+        "/ws",
+      );
+      expect(openFile.mock.calls[0][0]).toBe("/ws/.tmp-parent-review-snapshot-2024.png");
+    } finally {
+      useFilesStore.setState({ openFile: original });
+    }
+  });
+
+  it("resolves a relative tool path against the workspace", async () => {
+    const openFile = vi.fn(async (_path: string) => {});
+    const original = useFilesStore.getState().openFile;
+    useFilesStore.setState({ openFile });
+    resolveMock.mockClear();
+    resolveMock.mockImplementation(async () => "/ws/shots/a.png");
+    try {
+      await render([{ type: "tool", text: "Read", path: "shots/a.png" }], {
+        workspacePath: "/ws",
+      });
+      const chip = [...container.querySelectorAll<HTMLButtonElement>("button")].find((el) =>
+        el.textContent?.includes("a.png"),
+      );
+      await act(async () => chip!.click());
+      await vi.waitFor(() => expect(openFile).toHaveBeenCalled());
+      expect(resolveMock).toHaveBeenCalledWith("shots/a.png", "/ws");
+      expect(openFile.mock.calls[0][0]).toBe("/ws/shots/a.png");
+    } finally {
+      resolveMock.mockReset();
+      resolveMock.mockImplementation(async (path: string) => path);
+      useFilesStore.setState({ openFile: original });
+    }
+  });
+
+  it("does not offer a chip for a folder target", async () => {
+    await render(
+      [{ type: "tool", text: "Grep", path: "/ws/drafts" }],
+      { workspacePath: "/ws" },
+    );
+    expect(container.textContent).toContain("drafts");
+    const chips = [...container.querySelectorAll("button")].filter(
+      (el) => el.getAttribute("title") === "/ws/drafts",
+    );
+    expect(chips).toHaveLength(0);
+  });
+
+  function chipButton(title: string) {
+    return [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (el) => el.getAttribute("title") === title,
+    );
+  }
+
+  it("names the chip button as an open action", async () => {
+    await render([IMAGE], { workspacePath: "/ws" });
+    expect(chipButton(IMAGE.path!)?.getAttribute("aria-label")).toBe(
+      "打开 .tmp-parent-review-snapshot-2024.png",
+    );
+  });
+
+  it.each(["~/notes/todo.md", "../other/a.png"])(
+    "offers no button for %s, which the resolver rejects",
+    async (path) => {
+      await render([{ type: "tool", text: "Read", path }], { workspacePath: "/ws" });
+      expect(container.textContent).toContain(path.split("/").pop());
+      expect(chipButton(path)).toBeUndefined();
+    },
+  );
+
+  it("treats a read/edit target as a file even without an extension", async () => {
+    await render(
+      [
+        { type: "tool", text: "Read", path: "/ws/Makefile" },
+        { type: "tool", text: "Edit", path: "/ws/Dockerfile" },
+      ],
+      { workspacePath: "/ws" },
+    );
+    expect(chipButton("/ws/Makefile")).toBeTruthy();
+    expect(chipButton("/ws/Dockerfile")).toBeTruthy();
+  });
+
+  it("treats a listing target as a folder even with a dot in its name", async () => {
+    await render(
+      [
+        { type: "tool", text: "LS", path: "/ws/release/v1.2" },
+        { type: "tool", text: "Glob", path: "/ws/pkg.old" },
+      ],
+      { workspacePath: "/ws" },
+    );
+    expect(container.textContent).toContain("v1.2");
+    expect(chipButton("/ws/release/v1.2")).toBeUndefined();
+    expect(chipButton("/ws/pkg.old")).toBeUndefined();
+  });
+
+  it("keeps settled tool rows memoized across a live thinking flush", async () => {
+    const settled: ProcessItem[] = Array.from({ length: 8 }, (_, i) => ({
+      type: "tool",
+      text: "Read",
+      path: `/ws/src/f${i}.ts`,
+    }));
+    const props = { workspacePath: "/ws", turnLive: true };
+    await render([...settled, { type: "thinking", text: "思考", live: true }], props);
+    const before = vi.mocked(StepRow).mock.calls.length;
+    // The next stream flush: same tool item references, a new thinking item.
+    await render([...settled, { type: "thinking", text: "思考中，继续", live: true }], props);
+    expect(vi.mocked(StepRow).mock.calls.length - before).toBe(0);
   });
 });

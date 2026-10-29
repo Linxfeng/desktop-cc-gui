@@ -85,7 +85,7 @@ fn find_same(
     content: Option<&str>,
     old_text: Option<&str>,
 ) -> Result<Option<PendingWrite>, MemoryError> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         &format!(
             "SELECT {SELECT_COLUMNS} FROM pending_memory_writes
@@ -203,7 +203,7 @@ pub fn stage(
 /// 面板看到的待审批列表：这个 Bot 的 MEMORY 写入 + 全局 USER 写入（USER 没有
 /// 主人，任何 Bot 的面板都能批准它）。`bot_id` 为空时只有 USER。
 pub fn list(db: &Db, bot_id: Option<&str>) -> Result<Vec<PendingWrite>, MemoryError> {
-    let conn = db.0.lock();
+    let conn = db.read();
     let rows = match bot_id.map(str::trim).filter(|id| !id.is_empty()) {
         Some(id) => {
             let mut stmt = conn
@@ -235,7 +235,7 @@ pub fn list(db: &Db, bot_id: Option<&str>) -> Result<Vec<PendingWrite>, MemoryEr
 }
 
 fn find_by_id(db: &Db, id: &str) -> Result<PendingWrite, MemoryError> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         &format!("SELECT {SELECT_COLUMNS} FROM pending_memory_writes WHERE id=?1"),
         [id],
@@ -272,7 +272,7 @@ fn ensure_unchanged(db: &Db, pending: &PendingWrite) -> Result<(), MemoryError> 
     let Some(entry_id) = pending.target_entry_id.as_deref() else {
         return Ok(());
     };
-    let conn = db.0.lock();
+    let conn = db.read();
     let current: Option<String> = conn
         .query_row(
             "SELECT content FROM memory_entries WHERE id=?1",

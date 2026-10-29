@@ -1147,7 +1147,7 @@ pub fn transport_from_meta_json(meta_json: Option<&str>) -> Option<WslTransport>
 
 /// 供调用方在 workspace meta 表里查询(路径 → meta 文本)。
 pub fn workspace_meta_json(db: &crate::db::Db, workspace_path: &str) -> Option<String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         "SELECT meta FROM workspaces WHERE path = ?1",
         [workspace_path],
@@ -2204,5 +2204,25 @@ mod tests {
         // 别的 stderr 不能误判成会话不可读。
         assert_eq!(classify_script_marker("bash: no such file"), None);
         assert_eq!(classify_script_marker(""), None);
+    }
+
+    #[test]
+    fn workspace_meta_json_reads_without_waiting_for_writer_mutex() {
+        let dir = std::env::temp_dir().join(format!("ccgui-wsl-meta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open_at(&dir.join("app.db")).unwrap();
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name, sort_order, meta)
+                 VALUES('w1', '/ws/proj', 'proj', 0, '{\"wsl\":{\"host\":\"10.0.0.2\"}}')",
+                [],
+            )
+            .unwrap();
+        let _writer_guard = db.0.lock();
+        let meta = workspace_meta_json(&db, "/ws/proj");
+        assert_eq!(meta.as_deref(), Some("{\"wsl\":{\"host\":\"10.0.0.2\"}}"));
+        drop(_writer_guard);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

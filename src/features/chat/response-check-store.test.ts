@@ -10,7 +10,6 @@ import { EMPTY_SESSION, runRouting } from "./store/stream";
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     rescanSessions: vi.fn(async () => {}),
-    usageRecord: vi.fn(async () => {}),
   },
 }));
 vi.mock("@/lib/events", () => ({
@@ -108,6 +107,45 @@ describe("the response check's engine wiring", () => {
         session().messages.at(-1)?.responseCheck?.requested.comparisonModel,
       ).toBe(comparisonModel);
       runId = `response-check-run-${++runCounter}`;
+    }
+  });
+
+  it("carries the engine's reportsServed flag through served reports and settlement", () => {
+    useChatStore.setState({
+      bySession: {
+        [KEY]: {
+          ...EMPTY_SESSION,
+          streaming: true,
+          messages: [{ seq: 1, role: "assistant", text: "ok", ts: null, live: true }],
+        },
+      },
+    });
+    handleEngineEvents(
+      [ev("launch", 1, { model: "deepseek-v4.1-flash", reportsServed: true })],
+      deps(),
+    );
+    expect(session().responseCheck?.reportsServed).toBe(true);
+    handleEngineEvents(
+      [ev("served", 2, { model: "deepseek/deepseek-v4.1-flash-1017" })],
+      deps(),
+    );
+    expect(session().responseCheck).toEqual({
+      requested: { model: "deepseek-v4.1-flash", effort: null },
+      served: { model: "deepseek/deepseek-v4.1-flash-1017", effort: null },
+      reportsServed: true,
+    });
+    handleEngineEvents([ev("done", 3, {})], deps());
+    const assistant = session().messages.find((m) => m.role === "assistant");
+    expect(assistant?.responseCheck?.reportsServed).toBe(true);
+  });
+
+  it("only an explicit true marks a launch as able to report", () => {
+    for (const reportsServed of [undefined, false, "true", 1]) {
+      handleEngineEvents(
+        [ev("launch", 1, { model: "kimi-k2", reportsServed })],
+        deps(),
+      );
+      expect(session().responseCheck?.reportsServed).toBeUndefined();
     }
   });
 

@@ -17,7 +17,7 @@ import type { SessionTabItem } from "./SessionTab";
 
 /**
  * Tab right-click context menu offering:
- * - Batch close actions: Close Inactive, Close Left, Close Right, Close All
+ * - Batch close actions: Close Others, Close Left, Close Right, Close All
  * - Conversation split actions (for session tabs): Split Right, Split Down, Unsplit
  * - File actions (for file tabs): Copy Path, Send Path to Composer, Reveal in Explorer/Finder
  */
@@ -64,7 +64,9 @@ export function TabStripContextMenu({
       id: "close-inactive",
       label: t("chat.closeInactiveTabs"),
       icon: <CircleX className="size-4" aria-hidden />,
-      disabled: tabs.length <= 1,
+      // A target missing from `tabs` would leave nothing to keep, so the
+      // entry greys out like Close Left / Close Right do.
+      disabled: targetIndex < 0 || tabs.length <= 1,
       onSelect: () => onCloseInactive(targetTab.key),
     });
   }

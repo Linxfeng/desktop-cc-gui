@@ -1,6 +1,7 @@
 import type { DirEntry, FileTreeColor, RepositorySummary } from "@/lib/ipc";
 import type { VisibleNode } from "./FileTreeRow";
 import { fileName, joinPath } from "./store";
+import { nextChainDir } from "./tree-chain";
 
 /** The store slices the visible row list is derived from. */
 export interface TreeSnapshot {
@@ -8,6 +9,7 @@ export interface TreeSnapshot {
   children: Record<string, DirEntry[]>;
   expanded: Record<string, true>;
   loadingDirs: Record<string, true>;
+  dirErrors: Record<string, string>;
   repositories: Record<string, RepositorySummary>;
   fileColors: Record<string, Record<string, FileTreeColor>>;
   /** Drop entries Git ignores (and, with them, everything beneath). */
@@ -20,6 +22,7 @@ export function buildVisibleNodes({
   children,
   expanded,
   loadingDirs,
+  dirErrors,
   repositories,
   fileColors,
   hideIgnored,
@@ -43,27 +46,45 @@ export function buildVisibleNodes({
     // repo dirs get theirs from the backend color pass).
     color: repositories[root] ? "repository" : undefined,
   });
+  const chain = { children, loadingDirs, dirErrors, repositories, hideIgnored };
   const walk = (dirPath: string, depth: number) => {
     const entries = children[dirPath];
     if (!entries) return;
     for (const e of entries) {
       if (hideIgnored && e.ignored) continue;
-      const path = joinPath(dirPath, e.name);
+      let parent = dirPath;
+      let leaf = e.name;
+      let path = joinPath(dirPath, e.name);
+      let name = e.name;
+      const compactPaths = [path];
+      let next = e.isDir ? nextChainDir(path, !!e.ignored, chain) : null;
+      while (next) {
+        parent = path;
+        leaf = next.name;
+        name += `/${next.name}`;
+        path = joinPath(path, next.name);
+        compactPaths.push(path);
+        next = nextChainDir(path, !!e.ignored, chain);
+      }
+      const isExpanded = compactPaths.every((part) => !!expanded[part]);
       out.push({
         ...e,
+        name,
         path,
+        compactPaths: compactPaths.length > 1 ? compactPaths : undefined,
         depth,
-        expanded: e.isDir && !!expanded[path],
+        expanded: e.isDir && isExpanded,
         loading: e.isDir && !!loadingDirs[path],
         repository: e.isDir ? repositories[path] : undefined,
         // Plain folders never carry color; files take their git state;
         // nested repo dirs take their own repo's status color from the
-        // backend. Blue stays exclusive to the workspace root row.
-        color: fileColors[dirPath]?.[e.name],
+        // backend. Blue stays exclusive to the workspace root row. A merged
+        // row takes its last folder's color (a nested repo ends a chain).
+        color: fileColors[parent]?.[leaf],
       });
-      // Only already-expanded levels are walked — the tree never loads
-      // recursively; each expansion triggers exactly one listDir call.
-      if (e.isDir && expanded[path]) walk(path, depth + 1);
+      // Only already-expanded levels are walked. Listing requests belong to
+      // the click handler, which follows a single chain when needed.
+      if (e.isDir && isExpanded) walk(path, depth + 1);
     }
   };
   if (expanded[root]) walk(root, 1);

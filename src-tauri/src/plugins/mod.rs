@@ -250,25 +250,35 @@ pub fn plugin_storage_get(
     db.plugin_kv_get(&id, &key)
 }
 
+static PLUGIN_KV_WRITE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tauri::command]
-pub fn plugin_storage_set(
+pub async fn plugin_storage_set(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     id: String,
     key: String,
     value: serde_json::Value,
 ) -> Result<(), String> {
+    let _write_order = PLUGIN_KV_WRITE_GATE.lock().await;
     storage_write_guard(&state::state_path(), &id)?;
-    db.plugin_kv_set(&id, &key, &value)
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || db.plugin_kv_set(&id, &key, &value))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn plugin_storage_delete(
+pub async fn plugin_storage_delete(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     id: String,
     key: String,
 ) -> Result<(), String> {
+    let _write_order = PLUGIN_KV_WRITE_GATE.lock().await;
     storage_write_guard(&state::state_path(), &id)?;
-    db.plugin_kv_delete(&id, &key)
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || db.plugin_kv_delete(&id, &key))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

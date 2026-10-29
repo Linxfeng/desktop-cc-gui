@@ -6,7 +6,8 @@
   "packageManager": "pnpm@10.29.3",
   "scripts": {
     "build": "tsc --noEmit && vite build",
-    "test": "vitest run",
+    "test": "pnpm run test:node && vitest run",
+    "test:node": "node --experimental-strip-types --test \"tests/*.test.ts\"",
     "plugin-skill:docs": "node --experimental-strip-types scripts/build-plugin-skill-docs.ts",
     "build:mac": "./scripts/build-signed-macos.sh",
     "build:mac:skip-notarize": "SKIP_NOTARIZE=1 ./scripts/build-signed-macos.sh",

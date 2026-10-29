@@ -72,3 +72,65 @@ describe("git tree batch", () => {
     expect(invoke).toHaveBeenCalledExactlyOnceWith("git_tree_status", { levels });
   });
 });
+
+describe("ordered persistence commands", () => {
+  async function expectCommittedInCallOrder(
+    operations: { invoke: () => Promise<unknown>; command: string }[],
+  ) {
+    const releaseFirst = Promise.withResolvers<void>();
+    const committed: string[] = [];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === operations[0].command) await releaseFirst.promise;
+      committed.push(command);
+    });
+
+    const pending = operations.map((operation) => operation.invoke());
+    try {
+      // The first command is in flight. A later write must not enter native
+      // dispatch and commit while that older command is still blocked.
+      await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      expect(invoke).toHaveBeenCalledTimes(1);
+      releaseFirst.resolve();
+      await Promise.all(pending);
+      expect(committed).toEqual(operations.map((operation) => operation.command));
+    } finally {
+      releaseFirst.resolve();
+    }
+  }
+
+  it("keeps same-key plugin writes behind an older in-flight write", async () => {
+    await expectCommittedInCallOrder([
+      { invoke: () => ipc.pluginStorageSet("plugin", "key", "old"), command: "plugin_storage_set" },
+      { invoke: () => ipc.pluginStorageDelete("plugin", "key"), command: "plugin_storage_delete" },
+      { invoke: () => ipc.pluginStorageSet("plugin", "key", "new"), command: "plugin_storage_set" },
+    ]);
+  });
+
+  it("persists consecutive effort choices in selection order", async () => {
+    await expectCommittedInCallOrder([
+      { invoke: () => ipc.rememberSessionEffort("omp", "s1", "low"), command: "remember_session_effort" },
+      { invoke: () => ipc.rememberSessionEffort("omp", "s1", "high"), command: "remember_session_effort" },
+    ]);
+  });
+
+  it("isolates independent keys and recovers after a rejected write", async () => {
+    const releaseKeyA = Promise.withResolvers<void>();
+    invoke.mockImplementation(async (command: string, args?: { key?: string; value?: unknown }) => {
+      if (command === "plugin_storage_set" && args?.key === "a" && args?.value === "first") {
+        await releaseKeyA.promise;
+        throw new Error("disk busy");
+      }
+    });
+
+    const firstA = ipc.pluginStorageSet("plugin", "a", "first");
+    const secondA = ipc.pluginStorageSet("plugin", "a", "second");
+    await expect(ipc.pluginStorageSet("plugin", "b", "parallel")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledTimes(2);
+
+    releaseKeyA.resolve();
+    await expect(firstA).rejects.toThrow("disk busy");
+    await expect(secondA).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+});

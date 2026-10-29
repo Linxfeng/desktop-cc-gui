@@ -15,7 +15,6 @@ vi.mock("@/lib/ipc", () => ({
     listSessions: vi.fn(async () => []),
     listArchivedSessions: vi.fn(async () => []),
     rescanSessions: vi.fn(async () => {}),
-    usageRecord: vi.fn(async () => {}),
   },
 }));
 vi.mock("@/lib/events", () => ({

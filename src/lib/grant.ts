@@ -83,8 +83,10 @@ export function withGrantRetry<T>(op: () => Promise<T>): Promise<T> {
   return op().catch(async (e) => {
     const text = errorText(e);
     if (isWeb || !text.startsWith(OUTSIDE_PREFIX)) throw e;
-    const path = text.slice(OUTSIDE_PREFIX.length).trim();
-    if (!path) throw e;
+    // Verbatim like the backend's own check: a trailing space is part of a
+    // real filename, and trimming it would resolve the grant for a sibling.
+    const path = text.slice(OUTSIDE_PREFIX.length);
+    if (!path.trim()) throw e;
     const granted = await (chain = chain.then(async () => {
       let dir: string;
       try {

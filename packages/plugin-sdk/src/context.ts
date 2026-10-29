@@ -1,7 +1,7 @@
 import type { ComponentType } from "react";
 import type * as React from "react";
 import type { Disposer } from "./manifest";
-import type { ComposerSlotId, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
+import type { ComposerSlotId, FileLinkMenuTarget, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
 export interface WorkspaceMetadata {
   id: string;
   path: string;
@@ -440,6 +440,121 @@ export interface PluginModelCatalogResult {
   errors: PluginModelCatalogError[];
   refreshedAt: number;
 }
+/** 用量统计（权限 `usage.read`，0.3.25 起）：宿主从本机各 CLI 自己的会话日志
+ *  增量计算，只读、不联网（`updatePrices` 除外，它只下载公开价格表）。
+ *  日期均为宿主本地日期 `YYYY-MM-DD`，时区由宿主运行时代填。 */
+export type UsageStatsBucket = "day" | "hour";
+export interface UsageStatsQuery {
+  /** 起始本地日期（含）。 */
+  from: string;
+  /** 结束本地日期（含）。 */
+  to: string;
+  /** 缺省 "day"；"hour" 的 bucket 形如 `2026-10-27T14`。 */
+  bucket?: UsageStatsBucket;
+}
+export interface UsageStatRow {
+  /** `2026-10-27`（day）或 `2026-10-27T14`（hour），本地时间。 */
+  bucket: string;
+  /** 引擎 id：claude / codex / pi / omp …（随宿主支持的日志格式增加）。 */
+  engine: string;
+  model: string;
+  /** 会话的工作目录（cwd）；日志里没有时为 null。 */
+  project: string | null;
+  /** 该分组里出现的不同会话数（跨分组相加会重复计）。 */
+  sessions: number;
+  /** 模型响应次数。 */
+  requests: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** 推理 tokens，已包含在 output 里，单列仅供参考。 */
+  reasoning: number;
+  /** 按价格表估算的美元费用；价格表里查不到该模型时为 null。 */
+  cost: number | null;
+}
+export interface UsageStatsResult {
+  rows: UsageStatRow[];
+  /** 全部数据里最早有用量的本地日期。 */
+  firstDay: string | null;
+  /** 最近一次扫描完成时间（epoch ms）。 */
+  scannedAt: number | null;
+  /** 正在扫描时为 true，此时 rows 是扫描前的数据。 */
+  scanning: boolean;
+  /** rows 中没有价格的模型。 */
+  unknownModels: string[];
+}
+export type UsageSourceState = "ok" | "missing" | "denied" | "error";
+export interface UsageSourceStatus {
+  engine: string;
+  label: string;
+  /** 扫描的根目录（已展开环境变量覆盖）。 */
+  roots: string[];
+  /** 可覆盖根目录的环境变量名。 */
+  env: string | null;
+  files: number;
+  status: UsageSourceState;
+  error: string | null;
+  lastScanAt: number | null;
+}
+export interface UsageScanSummary {
+  filesScanned: number;
+  eventsAdded: number;
+  durationMs: number;
+  scannedAt: number;
+}
+export interface UsageScanProgress {
+  done: number;
+  total: number;
+  engine: string | null;
+  finished: boolean;
+}
+export interface UsagePriceInfo {
+  source: "bundled" | "online";
+  /** 内置快照日期 `YYYY-MM-DD`。 */
+  snapshotDate: string;
+  /** 在线价格表的下载时间（epoch ms）；从未更新为 null。 */
+  updatedAt: number | null;
+  models: number;
+}
+
+/** 订阅限额（权限 `limits.read`，0.3.25 起）：宿主只读本机 CLI 的登录状态，
+ *  只请求厂商官方接口，不刷新、不改写任何凭据；插件拿不到凭据。 */
+export type UsageLimitProviderId = "claude" | "codex";
+export type UsageLimitStatus = "ok" | "signedOut" | "expired" | "rateLimited" | "offline" | "error";
+export interface UsageLimitWindow {
+  /** five_hour / seven_day / seven_day_opus / seven_day_sonnet / scoped:<model> / session / weekly */
+  id: string;
+  kind: "session" | "weekly" | "other";
+  /** 模型级窗口的模型显示名；其他为 null。 */
+  label: string | null;
+  /** 已用百分比 0–100。 */
+  usedPercent: number;
+  windowSeconds: number | null;
+  /** 重置时间（epoch ms）。 */
+  resetsAt: number | null;
+}
+export interface UsageLimitProvider {
+  id: UsageLimitProviderId;
+  status: UsageLimitStatus;
+  plan: string | null;
+  /** rateLimited / offline 时保留上一次成功的数据。 */
+  windows: UsageLimitWindow[];
+  /** 额外用量（Extra usage），账号未开启时为 null。 */
+  extra: { usedUsd: number; limitUsd: number } | null;
+  /** 所示数据的获取时间（epoch ms）。 */
+  fetchedAt: number | null;
+  /** rateLimited 时下一次自动重试的时间（epoch ms）。 */
+  retryAt: number | null;
+  /** 简短原因，不含凭据。 */
+  error: string | null;
+  /** 查询的官方接口主机名，用于提示文案。 */
+  host: string;
+}
+export interface UsageLimitsResult {
+  providers: UsageLimitProvider[];
+}
+
 export interface PluginModelCatalogEngine {
   engine: PluginEngineInfo;
   sources: PluginModelSource[];
@@ -557,6 +672,18 @@ export interface PluginContext {
       title: () => string;
       keywords?: () => string[];
       run: () => void;
+    }): Disposer;
+    /** Chat file-link actions before the external editor (0.3.23).
+     * Permission: ui:file-link-menu. run receives a non-null resolvedPath
+     * for the clicked link, never the currently active editor's file.
+     * label/visible run on every menu open and see the clicked path. */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentType<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
     }): Disposer;
     /** Sidebar session right-click menu row (permission `ui:session-menu`,
      *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 */
@@ -818,6 +945,31 @@ export interface PluginContext {
       workspace?: string;
       refreshProviders?: boolean;
     }): Promise<PluginModelCatalogResult>;
+  };
+  /** 本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话
+   *  日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志
+   *  （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢，
+   *  60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在
+   *  用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。
+   *  宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。 */
+  usage: {
+    query(query: UsageStatsQuery): Promise<UsageStatsResult>;
+    sources(): Promise<UsageSourceStatus[]>;
+    refresh(): Promise<UsageScanSummary>;
+    rescan(): Promise<UsageScanSummary>;
+    prices(): Promise<UsagePriceInfo>;
+    updatePrices(): Promise<UsagePriceInfo>;
+    onChange(cb: (event: { scannedAt: number }) => void): Disposer;
+    onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
+  };
+  /** 订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存
+   *  60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429
+   *  退避。 */
+  limits: {
+    get(options?: {
+      providers?: UsageLimitProviderId[];
+      refresh?: boolean;
+    }): Promise<UsageLimitsResult>;
   };
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件走独立的

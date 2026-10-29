@@ -16,13 +16,14 @@ pub struct SessionPage {
     pub subagent_history: Vec<Message>,
 }
 
-/// Lock the db, run a parameterless query, and collect rows through `map_row`.
+/// Run a parameterless query on the WAL read connection, so a background
+/// index write cannot stall session/workspace enumeration.
 fn query_rows<T>(
-    state: &crate::AppState,
+    db: &crate::db::Db,
     sql: &str,
     map_row: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 ) -> Result<Vec<T>, String> {
-    let conn = state.db.0.lock();
+    let conn = db.read();
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], map_row).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -35,23 +36,22 @@ fn query_rows<T>(
     Ok(out)
 }
 
-/// Run a sessions-table mutation, then notify listeners.
+/// Run a sessions-table mutation. The caller emits the change notification
+/// after its blocking task completes, so the async command does not hold a
+/// `State` borrow across the await.
 fn mutate_sessions(
-    state: &crate::AppState,
+    db: &crate::db::Db,
     sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<(), String> {
-    let conn = state.db.0.lock();
+    let conn = db.0.lock();
     conn.execute(sql, params).map_err(|e| e.to_string())?;
-    drop(conn);
-    state.sink.emit_sessions_changed();
     Ok(())
 }
 
-#[tauri::command]
-pub fn list_sessions(state: tauri::State<'_, crate::AppState>) -> Result<Vec<SessionMeta>, String> {
+fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, String> {
     query_rows(
-        &state,
+        db,
         "SELECT s.engine, s.session_id, s.workspace_path, s.file_path, s.file_size, s.file_mtime_ms,
                 s.title, s.preview, s.created_at, s.updated_at, s.message_count, s.pinned, s.custom_title,
                 m.model, e.effort, p.provider_id
@@ -89,8 +89,18 @@ pub fn list_sessions(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Ses
     )
 }
 
+#[tauri::command]
+pub async fn list_sessions(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<SessionMeta>, String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || list_sessions_from(&db))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn list_archived_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     let mut stmt = conn
         .prepare("SELECT snapshot_json FROM session_archives ORDER BY archived_at DESC")
         .map_err(|e| e.to_string())?;
@@ -111,10 +121,13 @@ fn list_archived_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, S
 }
 
 #[tauri::command]
-pub fn list_archived_sessions(
+pub async fn list_archived_sessions(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<SessionMeta>, String> {
-    list_archived_sessions_from(&state.db)
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || list_archived_sessions_from(&db))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn archive_session_in(db: &crate::db::Db, session: &SessionMeta) -> Result<(), String> {
@@ -150,12 +163,16 @@ fn archive_session_in(db: &crate::db::Db, session: &SessionMeta) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn archive_session(
+pub async fn archive_session(
     state: tauri::State<'_, crate::AppState>,
     session: SessionMeta,
 ) -> Result<(), String> {
-    archive_session_in(&state.db, &session)?;
-    state.sink.emit_sessions_changed();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || archive_session_in(&db, &session))
+        .await
+        .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
@@ -170,13 +187,17 @@ fn restore_session_in(db: &crate::db::Db, engine: &str, session_id: &str) -> Res
 }
 
 #[tauri::command]
-pub fn restore_session(
+pub async fn restore_session(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
 ) -> Result<(), String> {
-    restore_session_in(&state.db, &engine, &session_id)?;
-    state.sink.emit_sessions_changed();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || restore_session_in(&db, &engine, &session_id))
+        .await
+        .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
@@ -185,7 +206,7 @@ pub fn restore_session(
 /// name, so this row is what keeps a session's provider and model across
 /// clients and restarts — see [`SessionMeta::model`].
 #[tauri::command]
-pub fn remember_session_model(
+pub async fn remember_session_model(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
@@ -194,21 +215,22 @@ pub fn remember_session_model(
     if model.trim().is_empty() {
         return Ok(());
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    state
-        .db
-        .remember_session_model(&engine, &session_id, &model, now)?;
-    state.sink.emit_sessions_changed();
+    let now = crate::db::next_write_stamp();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.remember_session_model(&engine, &session_id, &model, now)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
 /// Remember the reasoning effort a session ran, beside its model and for the
 /// same reason — see [`SessionMeta::effort`].
 #[tauri::command]
-pub fn remember_session_effort(
+pub async fn remember_session_effort(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
@@ -217,21 +239,22 @@ pub fn remember_session_effort(
     if effort.trim().is_empty() {
         return Ok(());
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    state
-        .db
-        .remember_session_effort(&engine, &session_id, &effort, now)?;
-    state.sink.emit_sessions_changed();
+    let now = crate::db::next_write_stamp();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.remember_session_effort(&engine, &session_id, &effort, now)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
 /// Remember the in-app channel a session ran. Spawn injects env from this id
 /// and never rewrites the CLI's own files — see [`SessionMeta::provider`].
 #[tauri::command]
-pub fn remember_session_provider(
+pub async fn remember_session_provider(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
@@ -257,14 +280,15 @@ pub fn remember_session_provider(
     {
         return Err("invalid provider id".into());
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    state
-        .db
-        .remember_session_provider(&engine, &session_id, &provider_id, now)?;
-    state.sink.emit_sessions_changed();
+    let now = crate::db::next_write_stamp();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.remember_session_provider(&engine, &session_id, &provider_id, now)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
@@ -282,7 +306,7 @@ fn find_session_file_path(
     engine: &str,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
-    let conn = db.0.lock();
+    let conn = db.read();
     conn.query_row(
         "SELECT file_path FROM sessions WHERE engine=?1 AND session_id=?2",
         rusqlite::params![engine, session_id],
@@ -1328,21 +1352,29 @@ pub async fn delete_remote_session(
 }
 
 #[tauri::command]
-pub fn pin_session(
+pub async fn pin_session(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    mutate_sessions(
-        &state,
-        "UPDATE sessions SET pinned=?3 WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![engine, session_id, pinned as i64],
-    )
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        mutate_sessions(
+            &db,
+            "UPDATE sessions SET pinned=?3 WHERE engine=?1 AND session_id=?2",
+            rusqlite::params![engine, session_id, pinned as i64],
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
+    Ok(())
 }
 
 #[tauri::command]
-pub fn rename_session(
+pub async fn rename_session(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
@@ -1353,11 +1385,19 @@ pub fn rename_session(
     } else {
         Some(title.trim().to_string())
     };
-    mutate_sessions(
-        &state,
-        "UPDATE sessions SET custom_title=?3 WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![engine, session_id, value],
-    )
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        mutate_sessions(
+            &db,
+            "UPDATE sessions SET custom_title=?3 WHERE engine=?1 AND session_id=?2",
+            rusqlite::params![engine, session_id, value],
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1499,6 +1539,7 @@ pub struct Workspace {
     pub name: String,
     pub last_opened_at: Option<i64>,
     pub sort_order: Option<i64>,
+    pub pinned: bool,
     /// Sidebar group (工作区分组) this workspace belongs to; None = ungrouped.
     pub group_id: Option<String>,
     /// "worktree" = git worktree child hanging under its parent workspace
@@ -1515,11 +1556,10 @@ pub struct Workspace {
     pub meta: Option<serde_json::Value>,
 }
 
-#[tauri::command]
-pub fn list_workspaces(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Workspace>, String> {
+fn list_workspaces_from(db: &crate::db::Db) -> Result<Vec<Workspace>, String> {
     query_rows(
-        &state,
-        "SELECT id, path, name, last_opened_at, sort_order, group_id, kind, parent_id, meta FROM workspaces
+        db,
+        "SELECT id, path, name, last_opened_at, sort_order, group_id, kind, parent_id, meta, pinned FROM workspaces
          ORDER BY sort_order IS NULL, sort_order, COALESCE(last_opened_at, 0) DESC",
         |r| {
             let meta_json: Option<String> = r.get(8)?;
@@ -1529,6 +1569,7 @@ pub fn list_workspaces(state: tauri::State<'_, crate::AppState>) -> Result<Vec<W
                 name: r.get(2)?,
                 last_opened_at: r.get(3)?,
                 sort_order: r.get(4)?,
+                pinned: r.get::<_, i64>(9)? != 0,
                 group_id: r.get(5)?,
                 kind: r.get(6)?,
                 parent_id: r.get(7)?,
@@ -1536,6 +1577,16 @@ pub fn list_workspaces(state: tauri::State<'_, crate::AppState>) -> Result<Vec<W
             })
         },
     )
+}
+
+#[tauri::command]
+pub async fn list_workspaces(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<Workspace>, String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || list_workspaces_from(&db))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1573,7 +1624,7 @@ pub async fn add_workspace(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "kind=\"worktree\" requires parent_id".to_string())?;
             let exists = {
-                let conn = state.db.0.lock();
+                let conn = state.db.read();
                 conn.query_row(
                     "SELECT 1 FROM workspaces WHERE id=?1",
                     rusqlite::params![pid],
@@ -1688,6 +1739,7 @@ pub(crate) async fn add_workspace_inner(
         name,
         last_opened_at: Some(now),
         sort_order: None,
+        pinned: false,
         group_id: None,
         kind,
         parent_id,
@@ -1697,7 +1749,7 @@ pub(crate) async fn add_workspace_inner(
 /// Assign a workspace to a sidebar group (None = ungrouped). The group must
 /// exist in app settings so a deleted group never lingers on a row.
 #[tauri::command]
-pub fn set_workspace_group(
+pub async fn set_workspace_group(
     state: tauri::State<'_, crate::AppState>,
     id: String,
     group_id: Option<String>,
@@ -1711,50 +1763,95 @@ pub fn set_workspace_group(
             return Err(format!("unknown group: {gid}"));
         }
     }
-    let conn = state.db.0.lock();
-    conn.execute(
-        "UPDATE workspaces SET group_id=?2 WHERE id=?1",
-        rusqlite::params![id, group_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db.0.lock();
+        conn.execute(
+            "UPDATE workspaces SET group_id=?2 WHERE id=?1",
+            rusqlite::params![id, group_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn reorder_workspaces(
-    state: tauri::State<'_, crate::AppState>,
-    ids: Vec<String>,
-) -> Result<(), String> {
-    let conn = state.db.0.lock();
+fn reorder_workspaces_blocking(db: &crate::db::Db, ids: &[String]) -> Result<(), String> {
+    let mut conn = db.0.lock();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
     for (index, id) in ids.iter().enumerate() {
-        conn.execute(
+        tx.execute(
             "UPDATE workspaces SET sort_order=?2 WHERE id=?1",
             rusqlite::params![id, index as i64],
         )
         .map_err(|e| e.to_string())?;
     }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn reorder_workspaces(
+    state: tauri::State<'_, crate::AppState>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || reorder_workspaces_blocking(&db, &ids))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Worktree children follow their parent row, so only top-level workspaces
+/// (parent_id IS NULL) can be pinned.
+fn set_workspace_pinned_blocking(db: &crate::db::Db, id: &str, pinned: bool) -> Result<(), String> {
+    let conn = db.0.lock();
+    let changed = conn
+        .execute(
+            "UPDATE workspaces SET pinned=?2 WHERE id=?1 AND parent_id IS NULL",
+            rusqlite::params![id, pinned],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("workspace not found or is a worktree child".into());
+    }
     Ok(())
+}
+
+/// Async + spawn_blocking like the other workspace writes: a sync command
+/// runs on the main thread and would freeze the window while a background
+/// index pass holds the writer lock.
+#[tauri::command]
+pub async fn set_workspace_pinned(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || set_workspace_pinned_blocking(&db, &id, pinned))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Sync body of `remove_workspace`. Split out so the identity reclamation
 /// below is reachable from a test without a Tauri `State`.
 fn remove_workspace_blocking(db: &crate::db::Db, id: &str) -> Result<(), String> {
-    let conn = db.0.lock();
-    let path: Option<String> = conn
+    let mut conn = db.0.lock();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let path: Option<String> = tx
         .query_row(
             "SELECT path FROM workspaces WHERE id=?1",
             rusqlite::params![id],
             |r| r.get(0),
         )
         .ok();
-    conn.execute("DELETE FROM workspaces WHERE id=?1", rusqlite::params![id])
+    tx.execute("DELETE FROM workspaces WHERE id=?1", rusqlite::params![id])
         .map_err(|e| e.to_string())?;
     if let Some(path) = path {
         // Same cleanup as delete_session: these identities are scoped to
         // sessions that no longer exist. Remote sessions have no `sessions`
         // row, so the workspace the frame was accepted in is matched directly
         // — without it their identities would never be reclaimed.
-        conn.execute(
+        tx.execute(
             "DELETE FROM accepted_internal_frames
               WHERE workspace_path=?1
                  OR (engine, session_id) IN
@@ -1762,24 +1859,28 @@ fn remove_workspace_blocking(db: &crate::db::Db, id: &str) -> Result<(), String>
             rusqlite::params![path],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM sessions WHERE workspace_path=?1",
             rusqlite::params![path],
         )
         .map_err(|e| e.to_string())?;
         // 审批记录不声明 FK(sessions 行可能晚于计划到达),由清理路径级联。
-        crate::engine::plan_review::delete_reviews_for_workspace(&conn, &path)?;
+        crate::engine::plan_review::delete_reviews_for_workspace(&tx, &path)?;
     }
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn remove_workspace(
+pub async fn remove_workspace(
     state: tauri::State<'_, crate::AppState>,
     id: String,
 ) -> Result<(), String> {
-    remove_workspace_blocking(&state.db, &id)?;
-    state.sink.emit_sessions_changed();
+    let db = Arc::clone(&state.db);
+    let sink = Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || remove_workspace_blocking(&db, &id))
+        .await
+        .map_err(|e| e.to_string())??;
+    sink.emit_sessions_changed();
     Ok(())
 }
 
@@ -1892,6 +1993,37 @@ mod tests {
         });
         std::fs::write(&path, format!("{line}\n")).unwrap();
         path
+    }
+
+    /// The sidebar list must not queue behind an in-flight index transaction:
+    /// the WAL reader has its own snapshot and mutex.
+    #[test]
+    fn session_list_reads_through_writer_lock() {
+        let home = scratch_dir("list-reader");
+        let db = Arc::new(crate::db::Db::open_at(&home.join("app.db")).unwrap());
+        db.0.lock()
+            .execute(
+                "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title)
+                 VALUES('omp', 'sid-1', '/ws', '/tmp/sid-1.jsonl', 1, 1, 'readable while indexing')",
+                [],
+            )
+            .unwrap();
+
+        let writer = db.0.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_db = Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            tx.send(list_sessions_from(&worker_db)).unwrap();
+        });
+        // A read that took the writer mutex would time out here. Drop the
+        // writer before asserting so the old implementation still terminates.
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(writer);
+        worker.join().unwrap();
+
+        let sessions = result.expect("list_sessions blocked on the writer").unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sid-1");
     }
 
     /// One omp rollout whose assistant turn carries two look-alike frames.
@@ -2210,6 +2342,130 @@ mod tests {
                 .len(),
             1
         );
+
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_pin_only_applies_to_top_level_rows() {
+        let home = scratch_dir("workspace-pin");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        {
+            let conn = db.0.lock();
+            conn.execute_batch(
+                "INSERT INTO workspaces(id, path, name) VALUES('p', '/ws/p', 'p');
+                 INSERT INTO workspaces(id, path, name, kind, parent_id)
+                   VALUES('c', '/ws/p-wt', 'c', 'worktree', 'p');",
+            )
+            .unwrap();
+        }
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        // Writing the same value again still matches the row.
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        assert!(set_workspace_pinned_blocking(&db, "c", true).is_err());
+        assert!(set_workspace_pinned_blocking(&db, "missing", true).is_err());
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(rows.iter().find(|w| w.id == "p").unwrap().pinned);
+        assert!(!rows.iter().find(|w| w.id == "c").unwrap().pinned);
+
+        set_workspace_pinned_blocking(&db, "p", false).unwrap();
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(!rows.iter().find(|w| w.id == "p").unwrap().pinned);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_removal_and_reorder_commit_atomically() {
+        let home = scratch_dir("workspace-atomic");
+        let ws1 = home.join("ws1");
+        let ws2 = home.join("ws2");
+        std::fs::create_dir_all(&ws1).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        let ws1_path = ws1.to_string_lossy().to_string();
+        let ws2_path = ws2.to_string_lossy().to_string();
+        {
+            let conn = db.0.lock();
+            conn.execute(
+                "INSERT INTO workspaces(id, path, name, sort_order) VALUES('w1', ?1, 'ws1', 0)",
+                rusqlite::params![ws1_path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspaces(id, path, name, sort_order) VALUES('w2', ?1, 'ws2', 1)",
+                rusqlite::params![ws2_path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title)
+                 VALUES('omp', 's1', ?1, 's1.jsonl', 1, 1, 'session in ws1')",
+                rusqlite::params![ws1_path],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TEMP TRIGGER abort_session_delete
+                 BEFORE DELETE ON sessions
+                 BEGIN
+                     SELECT RAISE(ABORT, 'stop mid workspace removal');
+                 END;",
+                [],
+            )
+            .unwrap();
+        }
+        db.record_accepted_internal_frame_hash("omp", "s1", &"a".repeat(64), &ws1_path)
+            .unwrap();
+
+        assert!(remove_workspace_blocking(&db, "w1").is_err());
+        // Reader snapshot must never see the workspace gone while its sessions
+        // and accepted frame identities remain.
+        assert_eq!(list_workspaces_from(&db).unwrap().len(), 2);
+        assert_eq!(list_sessions_from(&db).unwrap().len(), 1);
+        assert_eq!(
+            db.accepted_internal_frames("omp", "s1").unwrap().0.len(),
+            1
+        );
+
+        {
+            let conn = db.0.lock();
+            conn.execute("DROP TRIGGER abort_session_delete", []).unwrap();
+            conn.execute(
+                "CREATE TEMP TRIGGER abort_second_workspace_reorder
+                 BEFORE UPDATE OF sort_order ON workspaces
+                 WHEN NEW.id = 'w1' AND NEW.sort_order = 1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'stop mid workspace reorder');
+                 END;",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(reorder_workspaces_blocking(&db, &["w2".to_string(), "w1".to_string()]).is_err());
+        let order: Vec<(String, Option<i64>)> = list_workspaces_from(&db)
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.id, w.sort_order))
+            .collect();
+        assert_eq!(order, vec![("w1".to_string(), Some(0)), ("w2".to_string(), Some(1))]);
+
+        {
+            let conn = db.0.lock();
+            conn.execute("DROP TRIGGER abort_second_workspace_reorder", [])
+                .unwrap();
+        }
+        reorder_workspaces_blocking(&db, &["w2".to_string(), "w1".to_string()]).unwrap();
+        let reordered: Vec<String> = list_workspaces_from(&db)
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(reordered, vec!["w2".to_string(), "w1".to_string()]);
+
+        remove_workspace_blocking(&db, "w1").unwrap();
+        assert_eq!(list_workspaces_from(&db).unwrap().len(), 1);
+        assert!(list_sessions_from(&db).unwrap().is_empty());
 
         drop(db);
         std::fs::remove_dir_all(&home).ok();

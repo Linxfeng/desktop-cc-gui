@@ -551,20 +551,25 @@ export function deriveTodoList(messages: Message[]): TodoItem[] {
     const payload = parseTodoFromResult(message.result) ?? message.todos;
     if (!payload) continue;
     if (payload.replace) {
-      items = payload.items.filter((item: TodoItem) => item.status !== "dropped");
+      items = payload.items
+        .filter((item) => item.status !== "dropped")
+        .map((item) => ({ ...item, status: item.status ?? "pending" }));
       continue;
     }
     for (const patch of payload.items) {
+      // Content is the fallback key for id-less items only: two tasks that
+      // share a subject but carry different ids are two tasks.
+      const mayBe = (item: TodoItem) => !patch.id || !item.id || item.id === patch.id;
       let idx = -1;
       if (patch.id) {
         idx = items.findIndex((item) => item.id === patch.id);
         if (idx < 0 && taskIdToContent.has(patch.id)) {
           const mappedContent = taskIdToContent.get(patch.id);
-          idx = items.findIndex((item) => item.content === mappedContent);
+          idx = items.findIndex((item) => item.content === mappedContent && mayBe(item));
         }
       }
       if (idx < 0 && patch.content) {
-        idx = items.findIndex((item) => item.content === patch.content);
+        idx = items.findIndex((item) => item.content === patch.content && mayBe(item));
       }
 
       if (patch.status === "dropped") {
@@ -576,13 +581,14 @@ export function deriveTodoList(messages: Message[]): TodoItem[] {
         items[idx] = {
           ...existing,
           ...patch,
+          status: patch.status ?? existing.status,
           content: patch.content ? patch.content : existing.content,
           phase: patch.phase ?? existing.phase,
           reason: patch.reason ?? existing.reason,
           detail: patch.detail ?? existing.detail,
         };
       } else if (patch.content) {
-        items = [...items, patch];
+        items = [...items, { ...patch, status: patch.status ?? "pending" }];
       }
     }
   }

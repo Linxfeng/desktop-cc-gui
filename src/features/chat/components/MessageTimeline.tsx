@@ -22,7 +22,7 @@ import { MESSAGE_ANCHOR_RAIL_BAND_CLASS, MessageAnchorRail } from "./MessageAnch
 import { createAnchorRowsBuilder } from "./timeline-anchors";
 import { buildRows, collectToolKeys, rowKey, type TimelineRow } from "./timeline-rows";
 import { formatDuration } from "./format-duration";
-import { modelDisplayName } from "@/features/settings/usage-model";
+import { modelDisplayName } from "@/features/chat/model-display-name";
 import { ProcessDisclosure, type ProcessSearchTarget } from "./ProcessDisclosure";
 import { ResponseCheckBadge } from "./response-check-badge";
 import { CollapsibleMessage } from "./CollapsibleMessage";
@@ -103,6 +103,7 @@ const TimelineRowView = memo(function TimelineRowView({
         processId={row.firstSeq}
         seenTools={seenTools}
         searchTarget={searchTarget}
+        workspacePath={workspacePath}
       />
     );
   }

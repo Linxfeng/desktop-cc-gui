@@ -125,11 +125,29 @@ export interface SessionMenuItemDef {
   run: (target: SessionMenuTarget) => void;
 }
 
+/** The file link the user right-clicked, not the active editor or workspace.
+ * `path` preserves the link text; `resolvedPath` is re-resolved before run.
+ * The host never dispatches run with a null resolvedPath. */
+export interface FileLinkMenuTarget {
+  readonly path: string;
+  readonly resolvedPath: string | null;
+  readonly workspacePath: string;
+}
+
+/** Chat file-link actions, rendered after Open File and before the selected
+ * external editor. order sorts only plugin entries; ties use scoped ids. */
+export interface FileLinkMenuItemDef {
+  id: string;
+  label: (target: FileLinkMenuTarget) => string;
+  icon?: ComponentType<{ className?: string }>;
+  visible?: (target: FileLinkMenuTarget) => boolean;
+  run: (target: FileLinkMenuTarget) => void | Promise<void>;
+  order?: number;
+}
+
 /** Markdown pipeline contributions (plan §4.2 #5): extra remark/rehype
- *  plugins and react-markdown component overrides, merged over the host
- *  defaults at render time. remark/rehype arrays are typed loosely — plugin
- *  bundles can't share the host's unified type identities across a blob
- *  import. */
+ * plugins and react-markdown component overrides, merged over host defaults.
+ * Arrays are loosely typed because blob bundles cannot share host types. */
 export interface MarkdownRendererDef {
   id: string;
   remarkPlugins?: unknown[];
@@ -286,6 +304,9 @@ export const commandRegistry = new Registry<CommandDef>();
 
 /** Sidebar session context-menu item registry. */
 export const sessionMenuRegistry = new Registry<SessionMenuItemDef>();
+
+/** Chat file-link context-menu contributions (0.3.23). */
+export const fileLinkMenuRegistry = new Registry<FileLinkMenuItemDef>();
 
 /** Markdown pipeline registry (plan §4.2 #5). */
 export const markdownRegistry = new Registry<MarkdownRendererDef>();

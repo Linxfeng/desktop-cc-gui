@@ -1785,14 +1785,7 @@ mod tests {
         );
 
         let _guard = HomeGuard::set(&home);
-        // A stray KIMI_HOME on the host would redirect the legacy home.
-        let prev_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::remove_var("KIMI_HOME");
         let found = discover_kimi(&workspace);
-        match &prev_kimi_home {
-            Some(value) => std::env::set_var("KIMI_HOME", value),
-            None => std::env::remove_var("KIMI_HOME"),
-        }
         let mut ids: Vec<&str> = found.iter().map(|f| f.session_id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, ["managed", "old-cli"]);
@@ -2044,13 +2037,7 @@ mod tests {
         std::fs::write(managed.join("rollout-2026-08-19T00-00-00-old.jsonl"), "").unwrap();
 
         let _guard = HomeGuard::set(&home);
-        let prev_codex_home = std::env::var_os("CODEX_HOME");
-        std::env::remove_var("CODEX_HOME");
         let found = codex_candidates();
-        match &prev_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         let names: Vec<String> = found
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))

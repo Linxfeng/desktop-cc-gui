@@ -1,7 +1,7 @@
 import Globe from "lucide-react/dist/esm/icons/globe";
 import MessageSquarePlus from "lucide-react/dist/esm/icons/message-square-plus";
 import Plus from "lucide-react/dist/esm/icons/plus";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
 import { needsWindowControls, useTitlebarStyle } from "@/features/settings/titlebar";
@@ -176,6 +176,14 @@ export function SessionTabStrip({
   const handleShowTabMenu = useCallback((tab: SessionTabItem, position: { x: number; y: number }) => {
     setMenu({ ...position, tab });
   }, []);
+  // The menu holds a snapshot of the right-clicked tab. If that tab leaves
+  // the strip while the menu is open (⌘W, an external close, a new chat
+  // re-keyed to its native id), drop the menu instead of letting Close
+  // Others / Split act on a tab that no longer exists.
+  const menuTargetOpen = menu !== null && tabs.some((tab) => tab.key === menu.tab.key);
+  useEffect(() => {
+    if (menu && !menuTargetOpen) setMenu(null);
+  }, [menu, menuTargetOpen]);
   // "+" button right-click menu (新建会话 / 新建浏览器), separate anchor
   // state from the tab menu.
   const [newMenu, setNewMenu] = useState<{ x: number; y: number } | null>(null);
@@ -248,7 +256,7 @@ export function SessionTabStrip({
         </div>
       )}
       <TabStripContextMenu
-        menu={menu}
+        menu={menuTargetOpen ? menu : null}
         tabs={tabs}
         onCloseAll={onCloseAll}
         onCloseInactive={onCloseInactive}

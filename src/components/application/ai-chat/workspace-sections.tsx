@@ -242,10 +242,13 @@ export function WorkspaceSection({
      *  see the keepMounted disclosure) while their thread lists fold shut, so
      *  pagination is still recycled like any other collapsed region. */
     groupCollapsed = false,
-  ) =>
-    repos.length > 0 && (
+  ) => {
+    const pinned = repos.filter((repo) => repo.pinned);
+    const regular = repos.filter((repo) => !repo.pinned);
+    const renderPart = (items: AiChatRepo[], isPinned: boolean) => items.length > 0 && (
       <WorkspaceSortableList
-        items={repos}
+        key={isPinned ? "pinned" : "regular"}
+        items={items}
         sectionId={sectionId}
         onDropToSection={onDropWorkspaceToSection}
         onDragActiveChange={onWorkspaceDragActiveChange}
@@ -254,17 +257,20 @@ export function WorkspaceSection({
             ? (orderedIds) => {
                 // Rebuild the global order: other sections keep theirs, the
                 // dragged section takes the new one.
+                const sectionOrder = isPinned
+                  ? [...orderedIds, ...regular.map((repo) => repo.id)]
+                  : [...pinned.map((repo) => repo.id), ...orderedIds];
                 const all = (sections ?? [{ id: null, name: "", repos }]).flatMap(
                   (section) =>
                     section.id === sectionId
-                      ? orderedIds
+                      ? sectionOrder
                       : section.repos.map((repo) => repo.id),
                 );
                 onReorderWorkspaces(all.filter((id): id is string => Boolean(id)));
               }
             : undefined
         }
-        className="flex w-full flex-col gap-1"
+        className={`flex w-full flex-col gap-1${!isPinned && pinned.length > 0 ? " mt-1" : ""}`}
         renderItem={(repo, drag) => (
           <RepoItem
             repo={repo}
@@ -291,6 +297,8 @@ export function WorkspaceSection({
         )}
       />
     );
+    return <>{renderPart(pinned, true)}{renderPart(regular, false)}</>;
+  };
 
   return (
     <div className="flex w-full flex-col gap-2.5">

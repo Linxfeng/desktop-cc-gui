@@ -13,11 +13,71 @@ import {
   type RepositorySummary,
 } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
-import { writeStored } from "@/lib/storage";
+import { readStoredJson, writeStored } from "@/lib/storage";
 import { installFilesBridge, readRemoteAware } from "./remote-files";
+import { nextChainDir } from "./tree-chain";
+import { useFileTreePreferencesStore } from "./tree-preferences";
 
 export const FILES_ROOT_KEY = "ccgui-next.filesRoot";
+export const fileTreeWorkspaceKey = (root: string) =>
+  `ccgui-next.fileTreeWorkspace:${encodeURIComponent(root)}`;
 let treeGeneration = 0;
+
+/** `root` and every folder from it down to `path`, or null when `path` is
+ *  outside the tree. Tree paths are built with joinPath, so below the root
+ *  each segment is "/"-separated, under a drive root (`C:\`) too. */
+export function treeLineage(root: string, path: string): string[] | null {
+  if (!root) return null;
+  if (path === root) return [root];
+  const prefix = joinPath(root, "");
+  if (!path.startsWith(prefix)) return null;
+  const lineage = [root];
+  for (const name of path.slice(prefix.length).split("/")) {
+    if (!name) return null;
+    lineage.push(joinPath(lineage[lineage.length - 1], name));
+  }
+  return lineage;
+}
+
+/** `expanded` without `dir` and every folder beneath it. */
+function withoutSubtree(expanded: Record<string, true>, dir: string): Record<string, true> {
+  const prefix = joinPath(dir, "");
+  return Object.fromEntries(
+    Object.entries(expanded).filter(([key]) => key !== dir && !key.startsWith(prefix)),
+  );
+}
+
+/** The listing entry for a tree path, from its parent's loaded level. */
+function treeEntry(
+  state: { root: string; children: Record<string, DirEntry[]> },
+  path: string,
+): DirEntry | undefined {
+  const lineage = treeLineage(state.root, path);
+  const parent = lineage?.[lineage.length - 2];
+  if (parent === undefined) return undefined;
+  // Sliced, not fileName(): on macOS/Linux a name may contain "\".
+  const name = path.slice(joinPath(parent, "").length);
+  return state.children[parent]?.find((entry) => entry.name === name);
+}
+
+/** Expanded paths whose every folder from the root down is expanded too. */
+function reachableExpanded(root: string, expanded: Record<string, true>): Record<string, true> {
+  const reachable: Record<string, true> = {};
+  for (const path of Object.keys(expanded)) {
+    if (treeLineage(root, path)?.every((dir) => expanded[dir])) reachable[path] = true;
+  }
+  return reachable;
+}
+
+function readWorkspaceExpanded(root: string): Record<string, true> {
+  const saved = root ? readStoredJson(fileTreeWorkspaceKey(root), (value) => {
+    if (!value || typeof value !== "object" || !Array.isArray((value as { expanded?: unknown }).expanded)) return null;
+    const paths = (value as { expanded: unknown[] }).expanded;
+    if (!paths.every((path) => typeof path === "string")) return null;
+    return reachableExpanded(root, Object.fromEntries(paths.map((path) => [path, true])));
+  }) : null;
+  return saved ?? (root ? { [root]: true } : {});
+}
 
 /** Newest listing request per directory. list_dir runs off the main thread,
  *  so two listings of one directory (a refresh and a post-rename
@@ -61,6 +121,12 @@ export function parentPath(path: string): string {
 export interface TreeClipboard {
   path: string;
   isDir: boolean;
+  /** OS clipboard generation read right after this item's Copy tried to put
+   *  it on the system clipboard, whether or not that write landed. `null`:
+   *  the platform keeps no generation; absent: not known. Rename remaps
+   *  `path` and keeps this, so Paste can tell the item is still the newest
+   *  copy (`choosePasteSource`). */
+  osChangeCount?: number | null;
 }
 
 export interface OpenFileState {
@@ -105,9 +171,16 @@ interface FilesStore {
   setRoot: (path: string) => void;
   ensureDir: (path: string) => Promise<void>;
   toggleDir: (path: string) => Promise<void>;
+  toggleCompactDir: (paths: string[]) => Promise<void>;
+  /** Expand `path` and every folder above it, then load it. A merged
+   *  single-chain row only opens when all of its folders are expanded. */
+  revealDir: (path: string) => Promise<void>;
+  expandLoadedDirs: () => void;
+  collapseAllDirs: () => void;
   /** Re-fetch a directory only if it has been loaded before. */
   invalidateDir: (path: string) => Promise<void>;
-  /** Re-fetch every loaded/expanded directory (titlebar refresh button). */
+  /** Re-fetch every loaded level the tree can still show, collapsed ones
+   *  included, plus open folders not loaded yet (titlebar refresh button). */
   refreshTree: () => Promise<void>;
   /** True while refreshTree is in flight. */
   refreshing: boolean;
@@ -154,12 +227,39 @@ function dismissNonFileSurfaces() {
   useReleaseNotesTabStore.getState().deactivate();
 }
 
+/** Levels a refresh re-reads: the root, every loaded level reachable through
+ *  entries the tree shows (collapsed ones too, so they never reopen with an
+ *  old listing; Git actions rely on this), and open folders that have not
+ *  loaded or failed to (the retry path). Folders hidden by the Git-ignore
+ *  switch, and everything under them, are skipped. */
+function refreshTargets(
+  s: Pick<FilesStore, "root" | "children" | "expanded">,
+  hideIgnored: boolean,
+): Set<string> {
+  const dirs = new Set([s.root]);
+  const visit = (dir: string, open: boolean) => {
+    for (const entry of s.children[dir] ?? []) {
+      if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+      const path = joinPath(dir, entry.name);
+      const isOpen = open && !!s.expanded[path];
+      if (s.children[path]) {
+        dirs.add(path);
+        visit(path, isOpen);
+      } else if (isOpen) {
+        dirs.add(path);
+      }
+    }
+  };
+  visit(s.root, !!s.expanded[s.root]);
+  return dirs;
+}
+
 export const useFilesStore = create<FilesStore>((set, get) => ({
   root: localStorage.getItem(FILES_ROOT_KEY) ?? "",
   children: {},
   loadingDirs: {},
   dirErrors: {},
-  expanded: {},
+  expanded: readWorkspaceExpanded(localStorage.getItem(FILES_ROOT_KEY) ?? ""),
   repositories: {},
   fileColors: {},
   selectedPath: null,
@@ -190,7 +290,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       children: {},
       loadingDirs: {},
       dirErrors: {},
-      expanded: {},
+      expanded: readWorkspaceExpanded(root),
       repositories: {},
       fileColors: {},
       selectedPath: null,
@@ -267,13 +367,75 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   toggleDir: async (path) => {
     const s = get();
     if (s.expanded[path]) {
-      const expanded = { ...s.expanded };
-      delete expanded[path];
-      set({ expanded });
+      set({ expanded: withoutSubtree(s.expanded, path) });
       return;
     }
     set((s) => ({ expanded: { ...s.expanded, [path]: true } }));
     await get().ensureDir(path);
+  },
+
+  toggleCompactDir: async (paths) => {
+    if (paths.length === 0) return;
+    const generation = treeGeneration;
+    if (paths.every((path) => get().expanded[path])) {
+      set((s) => ({ expanded: withoutSubtree(s.expanded, paths[0]) }));
+      return;
+    }
+    let path = paths[paths.length - 1];
+    // Every folder of one chain shares a Git-ignore state (nextChainDir).
+    const ignored = !!treeEntry(get(), path)?.ignored;
+    set((s) => ({ expanded: { ...s.expanded, ...Object.fromEntries(paths.map((part) => [part, true])) } }));
+    while (true) {
+      await get().ensureDir(path);
+      // A refresh that started meanwhile superseded this first listing and
+      // may land later; list once more so the chain does not stop here.
+      if (!get().children[path] && !get().dirErrors[path]) await get().ensureDir(path);
+      if (generation !== treeGeneration) return;
+      const state = get();
+      // The synthetic root row is never merged, so it opens one level only.
+      if (!state.expanded[path] || path === state.root) return;
+      const next = nextChainDir(path, ignored, {
+        children: state.children,
+        loadingDirs: state.loadingDirs,
+        dirErrors: state.dirErrors,
+        repositories: state.repositories,
+        hideIgnored: useFileTreePreferencesStore.getState().hideIgnored,
+      });
+      if (!next) return;
+      path = joinPath(path, next.name);
+      set((s) => ({ expanded: { ...s.expanded, [path]: true } }));
+    }
+  },
+
+  revealDir: async (path) => {
+    const lineage = treeLineage(get().root, path);
+    if (!lineage) return;
+    set((s) => ({ expanded: { ...s.expanded, ...Object.fromEntries(lineage.map((dir) => [dir, true])) } }));
+    await get().ensureDir(path);
+  },
+
+  expandLoadedDirs: () => {
+    const { root, children, expanded: current } = get();
+    if (!root) return;
+    const hideIgnored = useFileTreePreferencesStore.getState().hideIgnored;
+    // Folders already open stay open, ones still loading included.
+    const expanded: Record<string, true> = { ...current, [root]: true };
+    const visit = (dir: string) => {
+      for (const entry of children[dir] ?? []) {
+        if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+        const path = joinPath(dir, entry.name);
+        if (!children[path]) continue;
+        expanded[path] = true;
+        visit(path);
+      }
+    };
+    visit(root);
+    set({ expanded });
+  },
+
+  collapseAllDirs: () => {
+    const root = get().root;
+    set({ expanded: root ? { [root]: true } : {} });
   },
 
   invalidateDir: async (path) => {
@@ -294,7 +456,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const generation = treeGeneration;
     set({ refreshing: true });
     try {
-      const dirs = new Set([s.root, ...Object.keys(s.children), ...Object.keys(s.expanded)]);
+      const hideIgnored = useFileTreePreferencesStore.getState().hideIgnored;
+      const dirs = refreshTargets(s, hideIgnored);
       const levels: Record<string, DirEntry[]> = {};
       await Promise.all(
         [...dirs].map(async (dir) => {
@@ -315,7 +478,26 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
           }
         }),
       );
-      if (generation === treeGeneration) await get().loadGitStatus(levels);
+      if (generation !== treeGeneration) return;
+      // Judged on the fresh listings: levels the tree can no longer show
+      // (hidden by the Git-ignore switch, or no longer listed by their
+      // parent, e.g. deleted by a checkout) are dropped and load fresh when
+      // shown again, instead of reappearing with an old listing.
+      const live = refreshTargets(get(), hideIgnored);
+      const dropped = Object.keys(get().children).filter((dir) => !live.has(dir));
+      if (dropped.length > 0) {
+        set((state) => {
+          const children = { ...state.children };
+          const fileColors = { ...state.fileColors };
+          for (const dir of dropped) {
+            delete children[dir];
+            delete fileColors[dir];
+          }
+          return { children, fileColors };
+        });
+      }
+      const liveLevels = Object.fromEntries(Object.entries(levels).filter(([dir]) => live.has(dir)));
+      await get().loadGitStatus(liveLevels);
     } finally {
       if (generation === treeGeneration) set({ refreshing: false });
     }
@@ -477,7 +659,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       loadingDirs: remap(s.loadingDirs),
       dirErrors: remap(s.dirErrors),
       selectedPath: s.selectedPath ? mapPath(s.selectedPath) : s.selectedPath,
-      clipboard: s.clipboard ? { ...s.clipboard, path: mapPath(s.clipboard.path) } : s.clipboard,
+      // Keep the object unless its own path moved: a Copy whose OS write is
+      // still in flight records its generation onto that same object.
+      clipboard:
+        s.clipboard && mapPath(s.clipboard.path) !== s.clipboard.path
+          ? { ...s.clipboard, path: mapPath(s.clipboard.path) }
+          : s.clipboard,
       repositories: remap(s.repositories),
       fileColors: remap(s.fileColors),
     }));
@@ -498,6 +685,13 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
 
   closeSearch: () => set({ searchRoot: null }),
 }));
+
+useFilesStore.subscribe((state, previous) => {
+  if (!state.root || state.expanded === previous.expanded) return;
+  writeStored(fileTreeWorkspaceKey(state.root), JSON.stringify({
+    expanded: Object.keys(reachableExpanded(state.root, state.expanded)),
+  }));
+});
 
 // WSL 插件(独立 bundle)经 window.__ccguiFiles 拿到中央编辑器的打开入口,
 // 并注册远程读取器 —— 见 remote-files.ts。

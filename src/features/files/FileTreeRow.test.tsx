@@ -26,18 +26,24 @@ const childNode: VisibleNode = {
   depth: 1,
 };
 
-describe("TreeRow tree refresh", () => {
+describe("TreeRow root-row actions", () => {
   let container: HTMLDivElement;
   let root: Root;
   const refreshTree = vi.fn(async () => {});
+  const expandLoadedDirs = vi.fn();
+  const collapseAllDirs = vi.fn();
   const onToggleDir = vi.fn();
+  const onSelectDir = vi.fn();
   const onMention = vi.fn();
 
   beforeEach(() => {
     refreshTree.mockClear();
+    expandLoadedDirs.mockClear();
+    collapseAllDirs.mockClear();
     onToggleDir.mockClear();
+    onSelectDir.mockClear();
     onMention.mockClear();
-    useFilesStore.setState({ refreshTree });
+    useFilesStore.setState({ refreshTree, expandLoadedDirs, collapseAllDirs });
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -57,7 +63,7 @@ describe("TreeRow tree refresh", () => {
           isRoot={isRoot}
           onToggleDir={onToggleDir}
           onOpenFile={() => {}}
-          onSelectDir={() => {}}
+          onSelectDir={onSelectDir}
           onContextMenu={() => {}}
           onMention={onMention}
           mentionLabel="添加到聊天"
@@ -90,6 +96,55 @@ describe("TreeRow tree refresh", () => {
     });
     expect(refreshTree).toHaveBeenCalledTimes(1);
     expect(onToggleDir).not.toHaveBeenCalled();
+  });
+
+  it("根行同样带展开/收起，随悬停露出，其他行没有", () => {
+    render(childNode, false);
+    expect(container.querySelector('button[aria-label="展开已加载的文件夹"]')).toBeNull();
+    render(rootNode, true);
+    const expand = container.querySelector<HTMLButtonElement>('button[aria-label="展开已加载的文件夹"]');
+    const collapse = container.querySelector<HTMLButtonElement>('button[aria-label="收起全部文件夹"]');
+    for (const button of [expand, collapse]) {
+      expect(button).not.toBeNull();
+      // 与刷新同一槽位：行悬停或键盘聚焦才出现，不额外占一行。
+      expect(button!.className).toContain("group-hover:flex");
+      expect(button!.className).toContain("focus-visible:flex");
+    }
+    expect(expand!.title).toMatch(/^展开已加载的文件夹 \((⌥⇧→|Alt\+Shift\+.+)\)$/);
+    expect(collapse!.title).toMatch(/^收起全部文件夹 \((⌥⇧←|Alt\+Shift\+.+)\)$/);
+    expect(expand!.getAttribute("aria-keyshortcuts")).toBe("Alt+Shift+ArrowRight");
+    expect(collapse!.getAttribute("aria-keyshortcuts")).toBe("Alt+Shift+ArrowLeft");
+  });
+
+  it("点击展开/收起只做批量操作，不切换目录", () => {
+    render(rootNode, true);
+    act(() => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="展开已加载的文件夹"]')!.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="收起全部文件夹"]')!.click();
+    });
+    expect(expandLoadedDirs).toHaveBeenCalledTimes(1);
+    expect(collapseAllDirs).toHaveBeenCalledTimes(1);
+    expect(onToggleDir).not.toHaveBeenCalled();
+  });
+
+  it("合并目录行展开整条路径，选择与路径操作指向末级目录", () => {
+    render({
+      ...childNode,
+      name: "src/features/files",
+      path: "/ws/desktop-cc-gui/src/features/files",
+      compactPaths: [
+        "/ws/desktop-cc-gui/src",
+        "/ws/desktop-cc-gui/src/features",
+        "/ws/desktop-cc-gui/src/features/files",
+      ],
+    }, false);
+    act(() => container.querySelector<HTMLButtonElement>("button")?.click());
+    expect(onSelectDir).toHaveBeenCalledWith("/ws/desktop-cc-gui/src/features/files");
+    expect(onToggleDir).toHaveBeenCalledWith([
+      "/ws/desktop-cc-gui/src",
+      "/ws/desktop-cc-gui/src/features",
+      "/ws/desktop-cc-gui/src/features/files",
+    ]);
   });
 });
 

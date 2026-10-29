@@ -1,16 +1,26 @@
 import { memo, useCallback, useMemo, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
+import ChevronsDown from "lucide-react/dist/esm/icons/chevrons-down";
+import ChevronsUp from "lucide-react/dist/esm/icons/chevrons-up";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import Plus from "lucide-react/dist/esm/icons/plus";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import { ActionFeedbackIcon, useRunningFeedback } from "@/components/base/action-feedback";
+import { formatShortcutForPlatform } from "@/features/shortcuts/shortcuts";
 import { cx } from "@/utils/cx";
 import type { DirEntry, FileTreeColor, RepositorySummary } from "@/lib/ipc";
 import { getFileTreeIconSvg } from "./fileIcons";
 import { useFilesStore } from "./store";
+import { COLLAPSE_ALL_SHORTCUT, EXPAND_LOADED_SHORTCUT } from "./tree-shortcuts";
+
+/** Root-row action slot: hidden until the row's group hover (or keyboard
+ *  focus) shows it, same rule as the row's mention "+". */
+const ROOT_ACTION_CLASSES =
+  "hidden size-5 shrink-0 cursor-pointer items-center justify-center rounded text-foreground-icon-tertiary hover:bg-background-primary-active hover:text-text-primary group-hover:flex focus-visible:flex";
 
 export interface VisibleNode extends DirEntry {
   path: string;
+  compactPaths?: string[];
   depth: number;
   expanded: boolean;
   loading: boolean;
@@ -46,7 +56,7 @@ function TreeRootRefreshButton() {
         e.stopPropagation();
         void useFilesStore.getState().refreshTree();
       }}
-      className="hidden size-5 shrink-0 cursor-pointer items-center justify-center rounded text-foreground-icon-tertiary hover:bg-background-primary-active hover:text-text-primary group-hover:flex focus-visible:flex disabled:opacity-50"
+      className={cx(ROOT_ACTION_CLASSES, "disabled:opacity-50")}
     >
       <ActionFeedbackIcon
         icon={RefreshCw}
@@ -58,12 +68,53 @@ function TreeRootRefreshButton() {
   );
 }
 
+/** Root-row bulk actions for the whole tree. They used to live in a 32px
+ *  toolbar above the list — an empty strip of its own above the panel's tab
+ *  strip — so the only always-present row (the synthetic root) carries them
+ *  beside refresh; `Alt+Shift+←/→` still work while focus is inside the tree
+ *  (FileTree's keydown), and the tooltips spell them out. */
+function TreeRootViewActions() {
+  const { t } = useTranslation();
+  const expandLabel = t("files.expandLoadedFolders");
+  const collapseLabel = t("files.collapseAllFolders");
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={expandLabel}
+        title={`${expandLabel} (${formatShortcutForPlatform(EXPAND_LOADED_SHORTCUT)})`}
+        aria-keyshortcuts="Alt+Shift+ArrowRight"
+        onClick={(e) => {
+          e.stopPropagation();
+          useFilesStore.getState().expandLoadedDirs();
+        }}
+        className={ROOT_ACTION_CLASSES}
+      >
+        <ChevronsDown className="size-3.5" aria-hidden />
+      </button>
+      <button
+        type="button"
+        aria-label={collapseLabel}
+        title={`${collapseLabel} (${formatShortcutForPlatform(COLLAPSE_ALL_SHORTCUT)})`}
+        aria-keyshortcuts="Alt+Shift+ArrowLeft"
+        onClick={(e) => {
+          e.stopPropagation();
+          useFilesStore.getState().collapseAllDirs();
+        }}
+        className={ROOT_ACTION_CLASSES}
+      >
+        <ChevronsUp className="size-3.5" aria-hidden />
+      </button>
+    </>
+  );
+}
+
 interface TreeRowProps {
   node: VisibleNode;
   selected: boolean;
   /** Workspace-root row: carries the tree-wide refresh (hover-revealed). */
   isRoot: boolean;
-  onToggleDir: (path: string) => void;
+  onToggleDir: (paths: string[]) => void;
   onOpenFile: (path: string) => void;
   onSelectDir: (path: string) => void;
   onContextMenu: (event: MouseEvent<HTMLElement>, node: VisibleNode) => void;
@@ -86,11 +137,11 @@ export const TreeRow = memo(function TreeRow({
   const handleClick = useCallback(() => {
     if (node.isDir) {
       onSelectDir(node.path);
-      onToggleDir(node.path);
+      onToggleDir(node.compactPaths ?? [node.path]);
     } else {
       onOpenFile(node.path);
     }
-  }, [node.isDir, node.path, onToggleDir, onOpenFile, onSelectDir]);
+  }, [node.isDir, node.path, node.compactPaths, onToggleDir, onOpenFile, onSelectDir]);
 
   // Icon SVGs are static string constants; selection is a map/set lookup.
   const iconSvg = useMemo(
@@ -113,6 +164,7 @@ export const TreeRow = memo(function TreeRow({
       <button
         type="button"
         onClick={handleClick}
+        aria-expanded={node.isDir ? node.expanded : undefined}
         className={cx(
           "flex min-w-0 flex-1 items-center gap-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring",
           // Git-ignored entries (`.git`, `.idea`, build output…) stay usable
@@ -182,7 +234,12 @@ export const TreeRow = memo(function TreeRow({
           </span>
         ) : null}
       </button>
-      {isRoot && <TreeRootRefreshButton />}
+      {isRoot && (
+        <>
+          <TreeRootRefreshButton />
+          <TreeRootViewActions />
+        </>
+      )}
       <button
         type="button"
         aria-label={mentionLabel}

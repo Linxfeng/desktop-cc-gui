@@ -6,7 +6,7 @@ import { ipc } from "@/lib/ipc";
 import { ComposerEditable } from "./composer-editable";
 
 vi.mock("@/lib/transport", () => ({ isWeb: false }));
-vi.mock("@/lib/ipc", () => ({ ipc: { clipboardFilePaths: vi.fn(async () => []) } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { clipboardFileSnapshot: vi.fn(async () => ({ paths: [] })) } }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -174,11 +174,11 @@ describe("ComposerEditable 粘贴文件", () => {
   let root: Root;
   let editable: HTMLDivElement;
   let props: ComponentProps<typeof ComposerEditable>;
-  const clipboardFilePaths = vi.mocked(ipc.clipboardFilePaths);
+  const clipboardFileSnapshot = vi.mocked(ipc.clipboardFileSnapshot);
 
   beforeEach(async () => {
-    clipboardFilePaths.mockReset();
-    clipboardFilePaths.mockResolvedValue([]);
+    clipboardFileSnapshot.mockReset();
+    clipboardFileSnapshot.mockResolvedValue({ paths: [], changeCount: null });
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -225,9 +225,9 @@ describe("ComposerEditable 粘贴文件", () => {
   }
 
   it("Finder 复制的文件：路径交给宿主，正文不插入文件名", async () => {
-    clipboardFilePaths.mockResolvedValue(["/tmp/notes.md", "/tmp/pic.png"]);
+    clipboardFileSnapshot.mockResolvedValue({ paths: ["/tmp/notes.md", "/tmp/pic.png"], changeCount: 7 });
     await paste({});
-    expect(clipboardFilePaths).toHaveBeenCalledTimes(1);
+    expect(clipboardFileSnapshot).toHaveBeenCalledTimes(1);
     expect(props.onPastePaths).toHaveBeenCalledWith(["/tmp/notes.md", "/tmp/pic.png"]);
     expect(props.onPasteImages).not.toHaveBeenCalled();
     expect(editable.textContent).toBe("中文😀");
@@ -238,9 +238,38 @@ describe("ComposerEditable 粘贴文件", () => {
     expect(props.onPastePaths).toHaveBeenCalledWith(["/tmp/a b.md"]);
   });
 
+  it("原生剪贴板读取失败时不引用 uri-list 里的旧路径", async () => {
+    clipboardFileSnapshot.mockRejectedValue(new Error("clipboard is occupied"));
+    const stale = new File(["old"], "old.md", { type: "text/plain" });
+
+    await paste({
+      items: [{ kind: "file", type: "text/plain", file: stale }],
+      uriList: "file:///tmp/old.md",
+    });
+
+    expect(props.onPastePaths).not.toHaveBeenCalled();
+    expect(editable.textContent).toBe("中文😀");
+  });
+
+  it("原生读取失败但事件带截图和其他文件时仍保留截图", async () => {
+    clipboardFileSnapshot.mockRejectedValue(new Error("clipboard is occupied"));
+    const png = new File(["x"], "shot.png", { type: "image/png" });
+    const file = new File(["x"], "old.md", { type: "text/plain" });
+
+    await paste({
+      items: [
+        { kind: "file", type: "image/png", file: png },
+        { kind: "file", type: "text/plain", file },
+      ],
+      uriList: "file:///tmp/old.md",
+    });
+
+    expect(props.onPasteImages).toHaveBeenCalledWith([png]);
+    expect(props.onPastePaths).not.toHaveBeenCalled();
+  });
   it("非图片文件丢进输入框时走剪贴板探测而不是塞文件名", async () => {
     const md = new File(["x"], "notes.md");
-    clipboardFilePaths.mockResolvedValue(["/tmp/notes.md"]);
+    clipboardFileSnapshot.mockResolvedValue({ paths: ["/tmp/notes.md"], changeCount: 7 });
     await paste({ items: [{ kind: "file", type: "", file: md }], text: "notes.md" });
     expect(props.onPastePaths).toHaveBeenCalledWith(["/tmp/notes.md"]);
     expect(editable.textContent).toBe("中文😀");
@@ -251,13 +280,13 @@ describe("ComposerEditable 粘贴文件", () => {
     await paste({ items: [{ kind: "file", type: "image/png", file: png }] });
     expect(props.onPasteImages).toHaveBeenCalledWith([png]);
     expect(props.onPastePaths).not.toHaveBeenCalled();
-    expect(clipboardFilePaths).not.toHaveBeenCalled();
+    expect(clipboardFileSnapshot).not.toHaveBeenCalled();
   });
 
   it("普通文本仍作为纯文本插入", async () => {
     await paste({ text: "hello" });
     expect(editable.textContent).toBe("中文😀hello");
-    expect(clipboardFilePaths).not.toHaveBeenCalled();
+    expect(clipboardFileSnapshot).not.toHaveBeenCalled();
     expect(props.onPastePaths).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,7 @@ describe("describePermission", () => {
   it("names ui:* capabilities and falls back for unknown ui ids", () => {
     expect(describePermission("ui:status-bar").key).toBe("plugins.hub.permissions.uiStatusBar");
     expect(describePermission("ui:center-tab").key).toBe("plugins.hub.permissions.uiCenterTab");
+    expect(describePermission("ui:file-link-menu").key).toBe("plugins.hub.permissions.uiFileLinkMenu");
     expect(describePermission("ui:future-thing").key).toBe("plugins.hub.permissions.ui");
   });
 

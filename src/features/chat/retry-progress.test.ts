@@ -12,7 +12,6 @@ import { EMPTY_SESSION, runRouting } from "./store/stream";
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     rescanSessions: vi.fn(async () => {}),
-    usageRecord: vi.fn(async () => {}),
   },
 }));
 vi.mock("@/lib/events", () => ({

@@ -81,6 +81,8 @@ import {
   isInternalMessageCaptureActive,
   runBeforeSwitch,
 } from "@/features/plugins/runtime/hooks";
+import { emitSessionActivated } from "@/features/plugins/runtime/events";
+import { sessionSelection } from "./selection";
 import type { RuntimeSwitchEvent } from "@ccgui/plugin-sdk";
 import type { ChatStore } from "./types";
 import type {
@@ -483,6 +485,14 @@ export function createMessagingActions(
             ?.catch(() => {});
         }
         settleOrphanedRuns(set, routeRun(result.runId, newKey));
+        // Whether this set is the one that hands the active tab its native
+        // id: when the session event beat this response, onSession already
+        // adopted it and announced the activation.
+        const before = get().active;
+        const activeWasPending =
+          before?.engine === engine &&
+          before.sessionId === null &&
+          before.workspacePath === tab.workspacePath;
         set((s) => {
           const bySession = { ...s.bySession };
           if (bySession[key]) {
@@ -533,6 +543,24 @@ export function createMessagingActions(
           };
         });
         persistTabs(get().openTabs, get().active);
+        // The adopting tab may be the active one: its sessionId just went
+        // null → native id, so the retained activation (emitted when the
+        // pending tab was focused) is stale and can never be repaired by
+        // emitSessionSelectionChanged, which matches on engine+sessionId.
+        // Re-emit with the current selection.
+        const adoptedActive = get().active;
+        if (
+          activeWasPending &&
+          adoptedActive?.engine === engine &&
+          adoptedActive.sessionId === result.sessionId &&
+          adoptedActive.workspacePath === tab.workspacePath
+        ) {
+          emitSessionActivated(
+            engine,
+            result.sessionId,
+            sessionSelection(get(), engine, result.sessionId, tab.workspacePath),
+          );
+        }
         // Sidebar row + tab title pick the new session up immediately
         // instead of waiting for the post-turn rescan.
         upsertSessionMetaInto(

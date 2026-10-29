@@ -216,6 +216,21 @@ body {
 .prose-chat > * + * {
   margin-top: 1.5em;
 }
+/* Large replies are parsed as several sibling trees. The wrapper keeps
+ * block rhythm identical to the single-tree path, including the larger gap
+ * before a heading that opens a new chunk. */
+.prose-chat > .md-chunk > * {
+  margin: 0;
+}
+.prose-chat > .md-chunk > * + * {
+  margin-top: 1.5em;
+}
+.prose-chat > .md-chunk:not(:first-child) > :where(h1, h2):first-child {
+  margin-top: 2em;
+}
+.prose-chat > .md-chunk:not(:first-child) > :where(h3, h4, h5, h6):first-child {
+  margin-top: 1.6em;
+}
 
 .prose-chat :where(strong) {
   font-weight: min(900, calc(600 + var(--ui-font-weight-offset, 0)));
@@ -226,6 +241,19 @@ body {
 /* thematic break (---): spacing alone separates blocks, no visible rule. */
 .prose-chat :where(hr) {
   display: none;
+}
+
+/* ---- Images: local workspace files and remote URLs share one frame ---- */
+.prose-chat :where(img.md-image) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--md-border);
+  border-radius: 10px;
+}
+.prose-chat :where(.md-image-fallback) {
+  color: var(--color-text-secondary);
+  font-size: 0.9em;
 }
 
 /* ---- Headings: chat-scaled doc hierarchy, h1/h2 get a hairline ---- */
@@ -261,10 +289,12 @@ body {
   padding-bottom: 0.3em;
   border-bottom: 1px solid var(--md-border);
 }
-.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h1, h2) {
+.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h1, h2),
+.prose-chat > .md-chunk > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h1, h2) {
   margin-top: 2em;
 }
-.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h3, h4, h5, h6) {
+.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h3, h4, h5, h6),
+.prose-chat > .md-chunk > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h3, h4, h5, h6) {
   margin-top: 1.6em;
 }
 

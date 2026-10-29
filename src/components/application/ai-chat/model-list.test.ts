@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { filterModels, groupModelsByProvider } from "./model-list";
+import {
+  filterModels,
+  groupModelsByProvider,
+  isEnterpriseGroup,
+  orderModelGroups,
+} from "./model-list";
 import type { ModelOption } from "./cli-menu";
 
 const model = (
@@ -56,5 +61,59 @@ describe("filterModels", () => {
     expect(filterModels(RELAYS, "v4-pro").map((m) => m.id)).toEqual([
       "agentrouter/deepseek-v4-pro",
     ]);
+  });
+});
+
+/** CodeBuddy catalog as the backend ships it: the configured default leads
+ *  (here an enterprise model), enterprise rows share one provider key. */
+const CODEBUDDY: ModelOption[] = [
+  model("custom:glm-5.3", "GLM 5.3", "enterprise"),
+  model("hy4-preview", "Hunyuan 4 Preview", "hunyuan"),
+  model("glm-5.3", "GLM 5.3", "chatglm"),
+  model("custom:kimi-k3.1-pro", "Kimi K3.1 Pro", "enterprise"),
+];
+const keys = (engineId: string, selected: string, rows = CODEBUDDY) =>
+  orderModelGroups(groupModelsByProvider(rows), engineId, selected).map((g) => g.key);
+
+describe("orderModelGroups", () => {
+  it("sinks CodeBuddy's enterprise section below the vendor sections", () => {
+    // Catalog order leads with the enterprise default; the panel still files
+    // that section last while the pick lives elsewhere.
+    expect(keys("codebuddy", "glm-5.3")).toEqual(["chatglm", "hunyuan", "enterprise"]);
+    expect(keys("codebuddy", "")).toEqual(["hunyuan", "chatglm", "enterprise"]);
+  });
+
+  it("lets the section holding the pick lead, enterprise included", () => {
+    // A 240px list with the picked enterprise row sunk to the bottom opened
+    // with the selection scrolled out of view.
+    expect(keys("codebuddy", "custom:kimi-k3.1-pro")).toEqual([
+      "enterprise",
+      "hunyuan",
+      "chatglm",
+    ]);
+  });
+
+  it("leaves another engine's relay named enterprise in catalog order", () => {
+    const relays = [
+      model("enterprise/gpt-5.4", "gpt-5.4", "enterprise"),
+      model("openai/gpt-5.4", "gpt-5.4", "openai"),
+    ];
+    expect(keys("omp", "", relays)).toEqual(["enterprise", "openai"]);
+    expect(isEnterpriseGroup("omp", "enterprise")).toBe(false);
+    expect(isEnterpriseGroup("codebuddy", "enterprise")).toBe(true);
+    expect(isEnterpriseGroup("codebuddy", "custom")).toBe(false);
+  });
+});
+
+describe("filterModels section titles", () => {
+  it("matches the header the panel shows, not just the provider key", () => {
+    const title = (provider: string) => (provider === "enterprise" ? "企业模型" : provider);
+    expect(filterModels(CODEBUDDY, "企业", title).map((m) => m.id)).toEqual([
+      "custom:glm-5.3",
+      "custom:kimi-k3.1-pro",
+    ]);
+    // Without a title resolver only the raw key matches, as before.
+    expect(filterModels(CODEBUDDY, "企业")).toEqual([]);
+    expect(filterModels(CODEBUDDY, "enterprise", title)).toHaveLength(2);
   });
 });

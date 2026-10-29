@@ -833,9 +833,31 @@ pub async fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
     if let Some(unc) = wsl_repo(&path) {
         return crate::git_wsl::stage(&unc, &files).await;
     }
-    let repo = open_repo(&path)?;
+    tauri::async_runtime::spawn_blocking(move || git_stage_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Index and ref writers used to queue on the IPC main thread. Off it, two
+/// clicks in the changes panel (stage while an unstage is in flight) overlap,
+/// and libgit2 fails the loser with "the index is locked". One gate per
+/// repository path queues them instead; separate worktrees keep separate
+/// gates because each has its own index.
+fn repo_write_gate(path: &str) -> std::sync::Arc<parking_lot::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parking_lot::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let mut gates = GATES.get_or_init(Default::default).lock();
+    std::sync::Arc::clone(gates.entry(key).or_default())
+}
+
+fn git_stage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    for file in &files {
+    for file in files {
         let file_path = std::path::Path::new(file);
         if repo
             .workdir()
@@ -856,13 +878,21 @@ pub async fn git_unstage(path: String, files: Vec<String>) -> Result<(), String>
     if let Some(unc) = wsl_repo(&path) {
         return crate::git_wsl::unstage(&unc, &files).await;
     }
-    let repo = open_repo(&path)?;
+    tauri::async_runtime::spawn_blocking(move || git_unstage_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn git_unstage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
+    let repo = open_repo(path)?;
     let head = repo.head().and_then(|h| h.peel_to_commit());
     let mut index = repo.index().map_err(|e| e.to_string())?;
     match head {
         Ok(commit) => {
             let tree = commit.tree().map_err(|e| e.to_string())?;
-            for file in &files {
+            for file in files {
                 let file_path = std::path::Path::new(file);
                 match tree.get_path(file_path) {
                     Ok(entry) => {
@@ -892,7 +922,7 @@ pub async fn git_unstage(path: String, files: Vec<String>) -> Result<(), String>
         }
         Err(_) => {
             // No HEAD yet: clearing the index for these files un-stages them.
-            for file in &files {
+            for file in files {
                 let _ = index.remove_path(std::path::Path::new(file));
             }
         }
@@ -910,12 +940,20 @@ pub async fn git_discard(path: String, files: Vec<String>) -> Result<(), String>
     if let Some(unc) = wsl_repo(&path) {
         return crate::git_wsl::discard(&unc, &files).await;
     }
-    let repo = open_repo(&path)?;
+    tauri::async_runtime::spawn_blocking(move || git_discard_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn git_discard_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
+    let repo = open_repo(path)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| "bare repository".to_string())?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    for file in &files {
+    for file in files {
         let file_path = Path::new(file);
         if index.get_path(file_path, 0).is_some() {
             let mut checkout = git2::build::CheckoutBuilder::new();
@@ -935,15 +973,14 @@ pub async fn git_discard(path: String, files: Vec<String>) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn git_commit(path: String, message: String) -> Result<String, String> {
-    if let Some(unc) = wsl_repo(&path) {
-        return crate::git_wsl::commit(&unc, &message).await;
-    }
+fn git_commit_blocking(path: &str, message: &str) -> Result<String, String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("empty commit message".to_string());
     }
-    let repo = open_repo(&path)?;
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     let tree_id = index.write_tree().map_err(|e| e.to_string())?;
     let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
@@ -958,6 +995,15 @@ pub async fn git_commit(path: String, message: String) -> Result<String, String>
     Ok(oid.to_string())
 }
 
+#[tauri::command]
+pub async fn git_commit(path: String, message: String) -> Result<String, String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::commit(&unc, &message).await;
+    }
+    tauri::async_runtime::spawn_blocking(move || git_commit_blocking(&path, &message))
+        .await
+        .map_err(|e| e.to_string())?
+}
 /// Push/pull run over the network; credential failures should read as
 /// actionable guidance, not a libgit2 error dump.
 fn map_remote_error(e: git2::Error) -> String {
@@ -1278,7 +1324,13 @@ pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
     if let Some(unc) = wsl_repo(&path) {
         return crate::git_wsl::branches(&unc).await;
     }
-    let repo = open_repo(&path)?;
+    tauri::async_runtime::spawn_blocking(move || git_branches_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn git_branches_blocking(path: &str) -> Result<Vec<BranchInfo>, String> {
+    let repo = open_repo(path)?;
     // No is_current flag: consumers compare against the live status branch —
     // a cached flag here goes stale on external (CLI) checkouts.
     let mut out = Vec::new();
@@ -1308,6 +1360,7 @@ pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
     Ok(out)
 }
 
+#[tauri::command]
 /// Local branch name git creates for `origin/release/1.0`: the remote name
 /// (the longest configured one that prefix-matches — remote names may contain
 /// slashes) is stripped, the rest is the local name.
@@ -1381,17 +1434,25 @@ pub async fn git_checkout(path: String, branch: String) -> Result<(), String> {
     if let Some(unc) = wsl_repo(&path) {
         return crate::git_wsl::checkout(&unc, &branch).await;
     }
-    let repo = open_repo(&path)?;
+    tauri::async_runtime::spawn_blocking(move || git_checkout_blocking(&path, &branch))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn git_checkout_blocking(path: &str, branch: &str) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
+    let repo = open_repo(path)?;
     // A remote-tracking branch never receives HEAD directly (that would
     // detach it): it is materialized as a local tracking branch instead.
     // A same-named local branch wins, matching `git checkout` resolution.
-    if repo.find_branch(&branch, git2::BranchType::Local).is_err() {
-        if let Ok(remote) = repo.find_branch(&branch, git2::BranchType::Remote) {
-            return checkout_remote_branch(&repo, &branch, &remote);
+    if repo.find_branch(branch, git2::BranchType::Local).is_err() {
+        if let Ok(remote) = repo.find_branch(branch, git2::BranchType::Remote) {
+            return checkout_remote_branch(&repo, branch, &remote);
         }
     }
     let (object, reference) = repo
-        .revparse_ext(&branch)
+        .revparse_ext(branch)
         .map_err(|e| format!("unknown branch {branch}: {e}"))?;
     repo.checkout_tree(&object, None)
         .map_err(|e| e.to_string())?;
@@ -1444,15 +1505,14 @@ fn init_repository(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn git_create_branch(path: String, name: String) -> Result<(), String> {
-    if let Some(unc) = wsl_repo(&path) {
-        return crate::git_wsl::create_branch(&unc, &name).await;
-    }
+fn git_create_branch_blocking(path: &str, name: &str) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("empty branch name".to_string());
     }
-    let repo = open_repo(&path)?;
+    let repo = open_repo(path)?;
     let head = repo
         .head()
         .and_then(|h| h.peel_to_commit())
@@ -1468,6 +1528,16 @@ pub async fn git_create_branch(path: String, name: String) -> Result<(), String>
     repo.checkout_tree(&object, None)
         .map_err(|e| e.to_string())?;
     repo.set_head(&refname).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn git_create_branch(path: String, name: String) -> Result<(), String> {
+    if let Some(unc) = wsl_repo(&path) {
+        return crate::git_wsl::create_branch(&unc, &name).await;
+    }
+    tauri::async_runtime::spawn_blocking(move || git_create_branch_blocking(&path, &name))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -1963,6 +2033,56 @@ mod tests {
         .unwrap();
     }
 
+    /// Index writes used to queue on the IPC main thread. Off it, two clicks
+    /// in the changes panel (stage while an unstage is in flight) overlap,
+    /// and libgit2 fails the loser with "the index is locked". Both must land.
+    #[test]
+    fn overlapping_index_writes_on_one_repo_both_land() {
+        let scratch = Scratch::new();
+        let repo = Repository::init(&scratch.0).unwrap();
+        {
+            // A larger index widens the read-modify-write window.
+            let mut index = repo.index().unwrap();
+            for i in 0..2000 {
+                let relative = format!("f{i}.txt");
+                std::fs::write(scratch.0.join(&relative), format!("{i}\n")).unwrap();
+                index.add_path(Path::new(&relative)).unwrap();
+            }
+            index.write().unwrap();
+        }
+        commit_file(&repo, "a.txt", "base\n");
+        commit_file(&repo, "b.txt", "base\n");
+        let path = scratch.0.to_string_lossy().into_owned();
+
+        for round in 0..10 {
+            std::fs::write(scratch.0.join("a.txt"), format!("a{round}\n")).unwrap();
+            std::fs::write(scratch.0.join("b.txt"), format!("b{round}\n")).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let stage = |file: &'static str| {
+                let path = path.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    git_stage_blocking(&path, &[file.to_string()])
+                })
+            };
+            let (a, b) = (stage("a.txt"), stage("b.txt"));
+            a.join().unwrap().expect("staging a.txt");
+            b.join().unwrap().expect("staging b.txt");
+
+            let index = Repository::open(&scratch.0).unwrap().index().unwrap();
+            let head = repo.head().unwrap().peel_to_tree().unwrap();
+            for file in ["a.txt", "b.txt"] {
+                assert_ne!(
+                    index.get_path(Path::new(file), 0).unwrap().id,
+                    head.get_path(Path::new(file)).unwrap().id(),
+                    "{file} staged in round {round}"
+                );
+            }
+            git_unstage_blocking(&path, &["a.txt".to_string(), "b.txt".to_string()]).unwrap();
+        }
+    }
+
     /// Clone with the initial checkout skipped, pin `core.autocrlf=false`, then
     /// check out. The CI Windows runner's global `core.autocrlf=true` otherwise
     /// rewrites the LF blobs to CRLF during clone, so a never-touched file reads
@@ -2383,9 +2503,7 @@ mod tests {
             .reference_symbolic("refs/remotes/origin/HEAD", &remote_head, true, "test")
             .unwrap();
 
-        let branches = git_branches(local_path.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        let branches = git_branches_blocking(local_path.to_str().unwrap()).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"origin/v1.0.9"), "names={names:?}");
         assert!(!names.contains(&"origin/HEAD"), "names={names:?}");
@@ -2413,12 +2531,7 @@ mod tests {
         let local_path = scratch.0.join("local");
         let local = Repository::clone(origin_path.to_str().unwrap(), &local_path).unwrap();
 
-        git_checkout(
-            local_path.to_string_lossy().into_owned(),
-            "origin/v1.0.9".to_string(),
-        )
-        .await
-        .unwrap();
+        git_checkout_blocking(local_path.to_str().unwrap(), "origin/v1.0.9").unwrap();
 
         let head_ref = local.head().unwrap();
         assert_eq!(head_ref.shorthand(), Some("v1.0.9"));
@@ -2458,12 +2571,7 @@ mod tests {
         let local_tip = local.head().unwrap().target().unwrap();
         assert_ne!(local_tip, base.id());
 
-        git_checkout(
-            local_path.to_string_lossy().into_owned(),
-            "origin/feature".to_string(),
-        )
-        .await
-        .unwrap();
+        git_checkout_blocking(local_path.to_str().unwrap(), "origin/feature").unwrap();
 
         assert_eq!(local.head().unwrap().target(), Some(local_tip));
         assert!(local_path.join("local.txt").exists());
@@ -2497,12 +2605,7 @@ mod tests {
                 .id;
             std::fs::write(scratch.0.join("a.txt"), "unstaged\n").unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["a.txt".to_string()],
-            )
-            .await
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["a.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
@@ -2534,12 +2637,7 @@ mod tests {
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
             std::fs::remove_file(scratch.0.join("a.txt")).unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["a.txt".to_string()],
-            )
-            .await
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["a.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
@@ -2568,12 +2666,7 @@ mod tests {
             }
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["new.txt".to_string()],
-            )
-            .await
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["new.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("new.txt")).unwrap(),
@@ -2591,12 +2684,7 @@ mod tests {
         std::fs::create_dir_all(scratch.0.join("sub")).unwrap();
         std::fs::write(scratch.0.join("sub/new.txt"), "x\n").unwrap();
 
-        git_discard(
-            scratch.0.to_string_lossy().into_owned(),
-            vec!["sub/new.txt".to_string()],
-        )
-        .await
-        .unwrap();
+        git_discard_blocking(scratch.0.to_str().unwrap(), &["sub/new.txt".to_string()]).unwrap();
 
         assert!(!scratch.0.join("sub/new.txt").exists());
         assert_eq!(

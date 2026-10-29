@@ -9,6 +9,7 @@ import {
 } from "./persistence";
 import { moveRetryingFlag, moveStreamingFlag } from "./stream";
 import { emitSessionActivated } from "@/features/plugins/runtime/events";
+import { sessionSelection } from "./selection";
 import { dispatchSessionClosed } from "@/features/plugins/runtime/hooks";
 import { clearScopedContributions, sessionLifecycleBase } from "./lifecycle";
 import { getConversationModeState } from "@/features/plugins/conversation/state";
@@ -87,7 +88,11 @@ export function createTabActions(
           : { active: tab },
       );
       persistTabs(get().openTabs, tab);
-      emitSessionActivated(tab.engine, null);
+      emitSessionActivated(
+        tab.engine,
+        null,
+        sessionSelection(get(), tab.engine, null, tab.workspacePath),
+      );
     }
   }
 
@@ -197,6 +202,7 @@ export function createTabActions(
     startNewChat: (workspacePath) => {
       // One pending chat per workspace+engine: re-focus it instead of
       // piling up empty "new" tabs.
+      const previous = get().active;
       set((s) => {
         const existing = s.openTabs.find(
           (t) =>
@@ -241,6 +247,22 @@ export function createTabActions(
         delete drafts[UNBOUND_DRAFT_KEY];
         return { openTabs, active: tab, pendingRuntimeSwitch, drafts };
       });
+      // New-chat entry points (sidebar, ⌘N, workspace plus) skip activateTab,
+      // so announce the switch here — otherwise plugins keep the previous
+      // session's provider/model (and its sessionId) as the active one.
+      // Re-focusing the same pending tab is not a switch: no event.
+      const tab = get().active;
+      if (
+        tab &&
+        (!previous ||
+          !sameTab(previous, tab.engine, tab.sessionId, tab.workspacePath))
+      ) {
+        emitSessionActivated(
+          tab.engine,
+          tab.sessionId,
+          sessionSelection(get(), tab.engine, tab.sessionId, tab.workspacePath),
+        );
+      }
     },
 
     closeTab: (engine, sessionId, workspacePath) => {
@@ -380,7 +402,19 @@ export function createTabActions(
           retryingByKey: moveRetryingFlag(s.retryingByKey, oldKey, newKey),
         };
       });
-      if (retargets) emitSessionActivated(engine, null);
+      if (retargets) {
+        const nextActive = get().active;
+        emitSessionActivated(
+          engine,
+          null,
+          sessionSelection(
+            get(),
+            engine,
+            null,
+            nextActive?.workspacePath ?? beforeActive.workspacePath,
+          ),
+        );
+      }
     },
   };
 }

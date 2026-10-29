@@ -73,12 +73,16 @@ async fn git_smoke() {
     );
     println!("untracked diff: ok ({} bytes)", diff.len());
 
-    git::git_stage(path.clone(), vec!["a.txt".into(), "b.txt".into()]).unwrap();
+    git::git_stage(path.clone(), vec!["a.txt".into(), "b.txt".into()])
+        .await
+        .unwrap();
     let status = git::git_status(path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 2, "two staged after stage: {status:?}");
     println!("stage: ok");
 
-    git::git_unstage(path.clone(), vec!["b.txt".into()]).unwrap();
+    git::git_unstage(path.clone(), vec!["b.txt".into()])
+        .await
+        .unwrap();
     let status = git::git_status(path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 1);
     assert_eq!(
@@ -88,20 +92,29 @@ async fn git_smoke() {
     );
     println!("unstage: ok");
 
-    let oid = git::git_commit(path.clone(), "second commit".into()).unwrap();
+    let oid = git::git_commit(path.clone(), "second commit".into())
+        .await
+        .unwrap();
     println!("commit: ok ({oid})");
     let status = git::git_status(path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 0);
 
-    git::git_create_branch(path.clone(), "feature-x".into()).unwrap();
+    git::git_create_branch(path.clone(), "feature-x".into())
+        .await
+        .unwrap();
     let status = git::git_status(path.clone()).await.unwrap();
     assert_eq!(status.branch, "feature-x");
     println!("create_branch+checkout: ok");
 
-    git::git_checkout(path.clone(), "master".into())
-        .or_else(|_| git::git_checkout(path.clone(), "main".into()))
-        .unwrap();
-    let branches = git::git_branches(path.clone()).unwrap();
+    if git::git_checkout(path.clone(), "master".into())
+        .await
+        .is_err()
+    {
+        git::git_checkout(path.clone(), "main".into())
+            .await
+            .unwrap();
+    }
+    let branches = git::git_branches(path.clone()).await.unwrap();
     assert!(branches.iter().any(|b| b.name == "feature-x"));
     println!(
         "branches: {:?}",

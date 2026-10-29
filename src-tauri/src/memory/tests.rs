@@ -218,3 +218,24 @@ fn view_reports_usage_and_limits_for_both_ledgers() {
     // 没有选中 Bot 时不产生 MEMORY 账本。
     assert!(view(&db, None).unwrap().memory.is_none());
 }
+
+#[test]
+fn view_and_list_do_not_block_when_writer_mutex_is_held() {
+    let (_scratch, db) = scratch_db();
+    add(&db, Target::Memory, Some("bot-1"), "已有笔记", "agent").unwrap();
+    pending::stage(
+        &db,
+        Target::Memory,
+        Some("bot-1"),
+        pending::OP_ADD,
+        Some("待审批笔记"),
+        None,
+        "agent",
+    )
+    .unwrap();
+
+    let _writer_guard = db.0.lock();
+    let snapshot = view(&db, Some("bot-1")).unwrap();
+    assert_eq!(snapshot.memory.unwrap().entries.len(), 1);
+    assert_eq!(snapshot.pending.len(), 1);
+}

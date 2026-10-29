@@ -53,9 +53,39 @@ describe("ResponseCheckBadge", () => {
     expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应一致");
   });
 
-  it("renders nothing until a side was reported", () => {
+  it("keeps the request visible and marks an unreported response", async () => {
+    vi.useFakeTimers();
+    try {
+      render({
+        requested: { model: "claude-opus-5-5", effort: "xhigh" },
+        served: { model: null, effort: null },
+        reportsServed: true,
+      });
+      expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：无法确认");
+      await act(async () => {
+        trigger()!.focus();
+        vi.advanceTimersByTime(400);
+      });
+      const text = document.querySelector('[role="tooltip"]')!.textContent;
+      expect(text).toContain("请求模型");
+      expect(text).toContain("claude-opus-5-5");
+      expect(text).toContain("未上报");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders nothing for an engine that never reports the response", () => {
     render({
-      requested: { model: "claude-opus-5-5", effort: "xhigh" },
+      requested: { model: "kimi-k2", effort: "high" },
+      served: { model: null, effort: null },
+    });
+    expect(trigger()).toBeNull();
+  });
+
+  it("renders nothing when the run has no request side", () => {
+    render({
+      requested: { model: null, effort: null },
       served: { model: null, effort: null },
     });
     expect(trigger()).toBeNull();
@@ -71,12 +101,22 @@ describe("ResponseCheckBadge", () => {
     expect(button.className).toContain("text-foreground-icon-quaternary");
   });
 
-  it("treats a dated snapshot as the requested family, not a substitution", () => {
+  it("shows a date-suffixed id as a neutral build difference", () => {
     render({
       requested: { model: "claude-opus-4-5", effort: null },
       served: { model: "claude-opus-4-5-20251101", effort: null },
     });
-    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应一致");
+    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：构建版本不同");
+    expect(trigger()!.className).not.toContain("text-text-warning-primary");
+  });
+
+  it("shows a daily build suffix as a neutral build difference", () => {
+    render({
+      requested: { model: "ds/deepseek-v4.1-flash", effort: null },
+      served: { model: "deepseek/deepseek-v4.1-flash-1017", effort: null },
+    });
+    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：构建版本不同");
+    expect(trigger()!.className).not.toContain("text-text-warning-primary");
   });
 
   it("keeps a green check when the model matches but effort is unreported", () => {

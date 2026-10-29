@@ -5,6 +5,21 @@
 //! absolute paths never reach JavaScript. The chat composer asks the host
 //! after such a paste so copied files route exactly like dropped ones
 //! (`@path` mentions for files, the attachment pipeline for images).
+//!
+//! The same bridge carries the file tree's Copy/Paste: the menu writes the
+//! item here so Finder / Explorer can paste the real file, and reads it back
+//! so a copy made in another app can be pasted into the tree.
+
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardFileSnapshot {
+    pub paths: Vec<String>,
+    /// Native clipboard generation, used to distinguish an unchanged stale
+    /// file list from a newer copy made outside the app.
+    pub change_count: Option<u64>,
+}
 
 /// Absolute paths of the files on the general clipboard, in pasteboard
 /// order. Empty when the clipboard holds no file (plain text, a screenshot's
@@ -13,19 +28,143 @@
 /// Runs on the command's thread; Tauri executes synchronous commands on the
 /// main thread, which is what the AppKit pasteboard wants.
 #[tauri::command]
-pub fn clipboard_file_paths() -> Vec<String> {
-    platform::file_paths()
+pub fn clipboard_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
+    os_file_snapshot()
+}
+
+/// The clipboard generation alone (macOS `changeCount`, Windows
+/// `GetClipboardSequenceNumber`). Neither call opens the clipboard, so this
+/// still answers while another program holds it open — exactly when the
+/// tree's Copy fails to write and must record whether anything changed.
+/// `None` where the platform keeps no generation.
+#[tauri::command]
+pub fn clipboard_change_count() -> Option<u64> {
+    platform::change_count()
+}
+
+/// Replace the general clipboard with a file list, so another app's paste
+/// inserts the actual items (Explorer / Finder semantics, not a path string).
+///
+/// The renderer may only name paths inside the registered roots
+/// (`ensure_allowed`): anything outside is dropped, so this command cannot
+/// become a write-then-paste bridge that smuggles arbitrary host files into
+/// a workspace. Disallowed and missing paths are dropped alike — the outcome
+/// must not reveal whether an outside path exists.
+#[tauri::command]
+pub fn clipboard_set_file_paths(
+    db: tauri::State<'_, std::sync::Arc<crate::db::Db>>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|path| crate::files::ensure_allowed(path, &db).is_ok())
+        .collect();
+    set_existing_file_paths(paths, platform::set_file_paths)
+}
+
+fn set_existing_file_paths(
+    paths: Vec<String>,
+    write: impl FnOnce(&[String]) -> Result<(), String>,
+) -> Result<(), String> {
+    let existing: Vec<String> = paths
+        .into_iter()
+        .filter(|path| !path.is_empty() && std::path::Path::new(path).exists())
+        .collect();
+    if existing.is_empty() {
+        return Err("no existing path to put on the clipboard".to_string());
+    }
+    write(&existing)
+}
+
+/// Host-side read used by file commands: the clipboard is the source of
+/// truth for "paste", and its paths must never travel through the renderer
+/// (that would turn a paste command into an arbitrary-filesystem read).
+pub(crate) fn os_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
+    platform::file_snapshot()
+}
+
+/// [`os_file_snapshot`] for async commands: the read itself runs on the main
+/// thread (what the AppKit pasteboard wants), so the caller's file work can
+/// stay off it.
+pub(crate) async fn os_file_snapshot_on_main_thread(
+    app: &tauri::AppHandle,
+) -> Result<ClipboardFileSnapshot, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(os_file_snapshot());
+    })
+    .map_err(|e| format!("cannot reach the main thread: {e}"))?;
+    receiver
+        .await
+        .map_err(|_| "the clipboard read was dropped".to_string())?
+}
+
+/// The path list of a `DROPFILES` block: each path as UTF-16 plus its NUL,
+/// then the empty name that ends the list. File-tree paths join children
+/// with `/` (`C:\ws/src/a.md`); Win32 file APIs accept that, but the
+/// clipboard's readers (Explorer's paste among them) get native separators.
+#[cfg(any(windows, test))]
+fn hdrop_path_list(paths: &[String]) -> Vec<u16> {
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.replace('/', "\\").encode_utf16());
+        names.push(0);
+    }
+    // Empty list terminator; also keeps the block non-empty for no paths.
+    names.push(0);
+    names
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
     use objc2::ClassType;
-    use objc2_app_kit::NSPasteboard;
-    use objc2_foundation::{NSArray, NSURL};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSString, NSURL};
 
-    pub(super) fn file_paths() -> Vec<String> {
+    type Writing = ProtocolObject<dyn NSPasteboardWriting>;
+
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
         let pasteboard = NSPasteboard::generalPasteboard();
-        read_file_urls(&pasteboard)
+        Ok(super::ClipboardFileSnapshot {
+            paths: read_file_urls(&pasteboard),
+            change_count: generation(&pasteboard),
+        })
+    }
+
+    pub(super) fn change_count() -> Option<u64> {
+        generation(&NSPasteboard::generalPasteboard())
+    }
+
+    fn generation(pasteboard: &NSPasteboard) -> Option<u64> {
+        u64::try_from(pasteboard.changeCount()).ok()
+    }
+
+    pub(super) fn set_file_paths(paths: &[String]) -> Result<(), String> {
+        write_file_urls(&NSPasteboard::generalPasteboard(), paths)
+    }
+
+    /// Replace `pasteboard`'s contents with file URLs (Finder's own paste
+    /// flavour for a copied item). A plain-text path would paste as text in
+    /// editors, so it is not written alongside.
+    pub(super) fn write_file_urls(
+        pasteboard: &NSPasteboard,
+        paths: &[String],
+    ) -> Result<(), String> {
+        pasteboard.clearContents();
+        let objects: Vec<Retained<Writing>> = paths
+            .iter()
+            .map(|path| {
+                let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+                ProtocolObject::from_retained(url)
+            })
+            .collect();
+        if pasteboard.writeObjects(&NSArray::from_retained_slice(&objects)) {
+            Ok(())
+        } else {
+            Err("the system refused the clipboard write".to_string())
+        }
     }
 
     /// File URLs on `pasteboard`, as absolute paths. Non-file URLs (a copied
@@ -61,33 +200,116 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, POINT};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
     };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_HDROP;
-    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
-    pub(super) fn file_paths() -> Vec<String> {
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
         // SAFETY: the clipboard is opened for the shortest possible window
-        // and closed on every path; a concurrent owner just means this read
-        // returns nothing instead of blocking.
+        // and closed on every path; failure to open it is a real read error,
+        // not an empty file list.
         unsafe {
-            if OpenClipboard(None).is_err() {
-                return Vec::new();
-            }
+            OpenClipboard(None).map_err(|e| format!("cannot open the clipboard: {e}"))?;
             let paths = read_hdrop();
+            let change_count = change_count();
             let _ = CloseClipboard();
-            paths
+            Ok(super::ClipboardFileSnapshot {
+                paths: paths?,
+                change_count,
+            })
         }
     }
 
-    unsafe fn read_hdrop() -> Vec<String> {
-        if IsClipboardFormatAvailable(u32::from(CF_HDROP.0)).is_err() {
-            return Vec::new();
+    pub(super) fn change_count() -> Option<u64> {
+        // SAFETY: a plain query that does not open the clipboard.
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        // Zero means this window station has no clipboard access.
+        (sequence != 0).then(|| u64::from(sequence))
+    }
+
+    pub(super) fn set_file_paths(paths: &[String]) -> Result<(), String> {
+        // SAFETY: every pointer below comes from one GlobalAlloc block, which
+        // is either handed to the system by SetClipboardData or freed here.
+        unsafe {
+            let handle = alloc_hdrop(paths)?;
+            if let Err(e) = OpenClipboard(None) {
+                let _ = GlobalFree(Some(handle));
+                return Err(format!("cannot open the clipboard: {e}"));
+            }
+            if let Err(e) = EmptyClipboard() {
+                let _ = CloseClipboard();
+                let _ = GlobalFree(Some(handle));
+                return Err(format!("cannot clear the clipboard: {e}"));
+            }
+            let written = SetClipboardData(u32::from(CF_HDROP.0), Some(HANDLE(handle.0)));
+            let _ = CloseClipboard();
+            match written {
+                // Past a successful SetClipboardData the system owns the
+                // block; freeing it here would corrupt the clipboard.
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let _ = GlobalFree(Some(handle));
+                    Err(format!("cannot set the clipboard: {e}"))
+                }
+            }
         }
-        let Ok(handle) = GetClipboardData(u32::from(CF_HDROP.0)) else {
-            return Vec::new();
+    }
+
+    /// A moveable `DROPFILES` block: header, then the paths as a
+    /// double-NUL-terminated UTF-16 list (`fWide`), which is exactly what
+    /// Explorer puts on the clipboard for a copied file.
+    unsafe fn alloc_hdrop(paths: &[String]) -> Result<HGLOBAL, String> {
+        let payload = hdrop_bytes(paths);
+        let handle = GlobalAlloc(GMEM_MOVEABLE, payload.len())
+            .map_err(|e| format!("cannot allocate the clipboard payload: {e}"))?;
+        let base = GlobalLock(handle);
+        if base.is_null() {
+            let _ = GlobalFree(Some(handle));
+            return Err("cannot lock the clipboard payload".to_string());
+        }
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), base.cast::<u8>(), payload.len());
+        let _ = GlobalUnlock(handle);
+        Ok(handle)
+    }
+
+    /// `DROPFILES` header plus the double-NUL-terminated UTF-16 path list.
+    pub(super) fn hdrop_bytes(paths: &[String]) -> Vec<u8> {
+        let names = super::hdrop_path_list(paths);
+
+        let header = DROPFILES {
+            pFiles: std::mem::size_of::<DROPFILES>() as u32,
+            pt: POINT { x: 0, y: 0 },
+            fNC: BOOL(0),
+            fWide: BOOL(1),
         };
+        let mut payload = Vec::with_capacity(std::mem::size_of::<DROPFILES>() + names.len() * 2);
+        // SAFETY: `DROPFILES` is a plain data struct (integers and a POINT);
+        // reinterpreting it as bytes copies exactly its initialized size.
+        payload.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const DROPFILES).cast::<u8>(),
+                std::mem::size_of::<DROPFILES>(),
+            )
+        });
+        // SAFETY: every `u16` in `names` is initialized.
+        payload.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(names.as_ptr().cast::<u8>(), names.len() * 2)
+        });
+        payload
+    }
+
+    unsafe fn read_hdrop() -> Result<Vec<String>, String> {
+        if IsClipboardFormatAvailable(u32::from(CF_HDROP.0)).is_err() {
+            return Ok(Vec::new());
+        }
+        let handle = GetClipboardData(u32::from(CF_HDROP.0))
+            .map_err(|e| format!("cannot read the clipboard file list: {e}"))?;
         let drop = HDROP(handle.0);
         // `0xFFFFFFFF` asks for the file count, not a name.
         let count = DragQueryFileW(drop, u32::MAX, None);
@@ -102,7 +324,7 @@ mod platform {
             buf.truncate(written as usize);
             paths.push(String::from_utf16_lossy(&buf));
         }
-        paths
+        Ok(paths)
     }
 }
 
@@ -111,14 +333,70 @@ mod platform {
     /// Linux clipboard file lists would need the GTK/X11 selection stack,
     /// which this app does not link against; the browser side sees file URLs
     /// via `text/uri-list` there, and the composer falls back to that.
-    pub(super) fn file_paths() -> Vec<String> {
-        Vec::new()
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
+        Ok(super::ClipboardFileSnapshot {
+            paths: Vec::new(),
+            change_count: None,
+        })
+    }
+
+    pub(super) fn change_count() -> Option<u64> {
+        None
+    }
+
+    /// Writing a file list needs the same GTK/X11 selection stack the read
+    /// path does not have; the in-app clipboard still carries the item, so
+    /// Copy/Paste inside the tree keeps working and only the OS round trip
+    /// is unavailable.
+    pub(super) fn set_file_paths(_paths: &[String]) -> Result<(), String> {
+        Err("this platform has no native file clipboard bridge".to_string())
+    }
+}
+#[cfg(test)]
+mod path_tests {
+    /// Explorer reads the list back as shell paths: the tree's `/` joins
+    /// become `\`, spaces and the double-NUL end stay intact.
+    #[test]
+    fn hdrop_path_list_uses_windows_separators() {
+        let wide = super::hdrop_path_list(&[
+            r"C:\ws/src/notes with space.md".to_string(),
+            r"D:\top.txt".to_string(),
+        ]);
+        let expected: Vec<u16> = "C:\\ws\\src\\notes with space.md\0D:\\top.txt\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(wide, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_space_is_part_of_the_existing_path_not_input_to_trim() {
+        let directory = std::env::temp_dir().join(format!(
+            "ccgui-clipboard-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let selected = directory.join("report ");
+        let other = directory.join("report");
+        std::fs::write(&selected, b"selected").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        let mut written = Vec::new();
+        super::set_existing_file_paths(
+            vec![selected.to_string_lossy().into_owned(), String::new()],
+            |paths| {
+                written.extend_from_slice(paths);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(written, [selected.to_string_lossy()]);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::platform::read_file_urls;
+    use super::platform::{read_file_urls, write_file_urls};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
@@ -145,12 +423,22 @@ mod tests {
         pasteboard
     }
 
+    /// The write path the file tree's Copy uses: what Finder reads back is
+    /// the file list, in order, with spaces intact.
+    #[test]
+    fn writes_file_urls_that_read_back() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let paths = vec![
+            "/tmp/notes with space.md".to_string(),
+            "/tmp/pic.png".to_string(),
+        ];
+        write_file_urls(&pasteboard, &paths).expect("write file urls");
+        assert_eq!(read_file_urls(&pasteboard), paths);
+    }
+
     #[test]
     fn reads_file_urls_in_order() {
-        let pasteboard = write_test_pasteboard(
-            &["/tmp/notes with space.md", "/tmp/pic.png"],
-            None,
-        );
+        let pasteboard = write_test_pasteboard(&["/tmp/notes with space.md", "/tmp/pic.png"], None);
         assert_eq!(
             read_file_urls(&pasteboard),
             vec![
@@ -163,7 +451,10 @@ mod tests {
     #[test]
     fn ignores_web_urls() {
         let pasteboard = write_test_pasteboard(&["/tmp/keep.txt"], Some("https://example.com/a"));
-        assert_eq!(read_file_urls(&pasteboard), vec!["/tmp/keep.txt".to_string()]);
+        assert_eq!(
+            read_file_urls(&pasteboard),
+            vec!["/tmp/keep.txt".to_string()]
+        );
     }
 
     #[test]
@@ -171,9 +462,50 @@ mod tests {
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         pasteboard.clearContents();
         let text = NSString::from_str("just text");
-        pasteboard.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(
-            text,
-        )]));
+        pasteboard.writeObjects(&NSArray::from_retained_slice(&[
+            ProtocolObject::from_retained(text),
+        ]));
         assert!(read_file_urls(&pasteboard).is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::platform::hdrop_bytes;
+    use windows::Win32::UI::Shell::DROPFILES;
+
+    /// What Explorer reads back: the header points past itself and flags
+    /// wide chars, then the paths form one double-NUL-terminated list.
+    #[test]
+    fn dropfiles_block_is_a_wide_double_null_list() {
+        let paths = vec![
+            r"C:\work\notes.md".to_string(),
+            r"C:\work\a b.txt".to_string(),
+        ];
+        let payload = hdrop_bytes(&paths);
+
+        // SAFETY: the first `size_of::<DROPFILES>()` bytes are exactly the
+        // header `hdrop_bytes` wrote. `DROPFILES` is `repr(packed)`, so its
+        // fields are copied out before asserting (no unaligned references).
+        let header = unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<DROPFILES>()) };
+        let header_len = std::mem::size_of::<DROPFILES>();
+        let files_offset = header.pFiles;
+        let f_nc = header.fNC;
+        let f_wide = header.fWide;
+        assert_eq!(files_offset as usize, header_len);
+        assert_eq!(f_nc.0, 0);
+        assert_eq!(f_wide.0, 1);
+
+        let wide: Vec<u16> = payload[header_len..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let mut expected: Vec<u16> = Vec::new();
+        for path in &paths {
+            expected.extend(path.encode_utf16());
+            expected.push(0);
+        }
+        expected.push(0);
+        assert_eq!(wide, expected);
     }
 }

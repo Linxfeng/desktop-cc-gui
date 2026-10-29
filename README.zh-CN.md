@@ -114,7 +114,7 @@ MiniMax Code（命令 `mcode`）走它的原生 ACP 传输（`mcode acp`）：�
 - **局域网网页访问**：通过 token 鉴权的 WebSocket 桥接，把界面共享给局域网内其他设备，设置页提供二维码入口。
 - **工作区管理**：给项目分组，快速切换。
 - 应用内**自动更新**（Tauri updater，对接 GitHub Releases）、版本记录对话框、macOS 签名构建。
-- 中英双语界面。
+- 中文、英文、韩语三语界面。
 
 ---
 
@@ -149,7 +149,7 @@ MiniMax Code（命令 `mcode`）走它的原生 ACP 传输（`mcode acp`）：�
 
 | 工具 | 版本要求 | 用来干嘛 |
 | --- | --- | --- |
-| [Node.js](https://nodejs.org/) | 20 或更新 | 跑前端工具链 |
+| [Node.js](https://nodejs.org/) | 22.13 或更新 | 跑前端工具链（只构建的话 20+ 也行；`pnpm test` 需要 22.13+） |
 | [pnpm](https://pnpm.io/) | 10（`packageManager` 字段已锁定） | 安装依赖 |
 | [Rust](https://rustup.rs/) | stable（用 rustup 装） | 编译后端 |
 
@@ -200,7 +200,7 @@ Windows 与 Linux 安装包由 `.github/workflows/` 下的 CI 工作流产出（
 | 界面 | React 18 + TypeScript + Tailwind CSS 4 + zustand |
 | 构建 | Vite 6 |
 | 桌面框架 | Tauri 2（Rust 后端：git2、rusqlite、portable-pty、axum） |
-| 测试 | Vitest（前端）+ cargo test（Rust） |
+| 测试 | Vitest + node:test（前端）+ cargo test（Rust） |
 
 ### 目录结构
 
@@ -210,14 +210,14 @@ desktop-cc-gui/
 │   ├── features/           # ★ 功能模块：chat / files / git / terminal /
 │   │                       #   settings / plugins / commands / update / open-app
 │   ├── components/         # 跨功能共享的通用 UI 组件（含引擎品牌图标）
-│   ├── i18n/               # zh + en 两套 locale bundle
+│   ├── i18n/               # zh + en + ko 三套 locale bundle
 │   ├── styles/             # 全局样式
 │   └── lib/ utils/         # 工具函数
 ├── src-tauri/              # Rust 后端
 │   └── src/                # engine/（每个 CLI 一个模块）、history/、plugins/、
 │                           # git.rs、terminal.rs、web.rs（局域网桥接）……
 ├── packages/plugin-sdk/    # @ccgui/plugin-sdk —— 插件开发套件
-├── tests/                  # 前端集成向测试（Vitest）
+├── tests/                  # node:test 回归套件 + browser/ 验证页面
 ├── scripts/                # 构建与打包脚本
 └── docs/                   # 插件开发指南、引擎模式说明
 ```
@@ -226,7 +226,7 @@ desktop-cc-gui/
 
 1. **只改界面**：找到 `src/features/` 下对应的模块改就行。新组件直接放在该模块自己的目录里。
 2. **需要后端配合**：在 `src-tauri/src/` 对应模块里加 `#[tauri::command]`，前端通过 Tauri API 调用。
-3. **改了界面文字**：必须走 i18n，并同步两套 bundle（`src/i18n/zh.ts`、`src/i18n/en.ts`）；界面文字不允许硬编码。
+3. **改了界面文字**：必须走 i18n，并同步三套 bundle（`src/i18n/zh.ts`、`src/i18n/en.ts`、`src/i18n/ko.ts`）；界面文字不允许硬编码。
 
 ### 常用命令
 
@@ -234,13 +234,14 @@ desktop-cc-gui/
 | --- | --- |
 | `pnpm dev` | 启动完整应用（Tauri 开发模式） |
 | `pnpm build` | TypeScript 类型检查 + 前端生产构建 |
-| `pnpm test` | 跑 Vitest 测试套件 |
+| `pnpm test` | 先跑 `tests/` 下的 node:test 套件，再跑 Vitest 套件 |
+| `pnpm test:node` | 只跑 `tests/` 下的 node:test 套件 |
 | `pnpm preview` | 预览生产构建的前端 |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | 跑 Rust 测试 |
 
 ### 测试怎么写
 
-- 前端测试用 [Vitest](https://vitest.dev/)——源码旁边放 `xxx.test.ts(x)` 同位测试，较重的套件统一放 `tests/` 目录。
+- 前端单元测试用 [Vitest](https://vitest.dev/)——源码旁边放 `xxx.test.ts(x)` 同位测试；较重的套件放在 `tests/*.test.ts`，用 Node 自带的 `node:test` 跑（`pnpm test:node`；`pnpm test` 会先跑它们）。
 - Rust 端测试照常写在模块里，用 `cargo test --manifest-path src-tauri/Cargo.toml` 跑。
 
 ---
@@ -250,7 +251,7 @@ desktop-cc-gui/
 规矩不多，但都有原因，提交前过一遍：
 
 1. **提 PR 前跑通本地验证**：`pnpm build`（类型检查）和 `pnpm test` 全绿；动了 Rust 再加 `cargo test`。
-2. **界面文字必须走 i18n**：所有用户可见文案都从 `src/i18n/` 取，并保持两套 locale bundle 同步，不许硬编码。
+2. **界面文字必须走 i18n**：所有用户可见文案都从 `src/i18n/` 取，并保持三套 locale bundle（zh、en、ko）同步，不许硬编码。
 3. **组件就近放**：新组件先放自己 feature 的目录里；确实被多个功能复用了，再挪到 `src/components/`。
 4. **TypeScript 严格模式**：别用 `any` 糊弄，类型写明白。
 5. **优先通过插件 SDK 扩展**：新增设置区块与界面，尽量走内建界面同款扩展点注册。
@@ -285,9 +286,11 @@ perf(chat): reveal streamed text per frame without reparsing markdown
 ## 怎么提交你的代码（贡献流程）
 
 1. **Fork** 本仓库，clone 到本地。
-2. 从 `main` 切一个分支，名字按 `feat/xxx`、`fix/xxx` 这种风格起。
+2. 从版本号最高的 **`vX.Y.Z` 开发分支**切一个分支，名字按 `feat/xxx`、`fix/xxx` 这种风格起。
 3. 改代码，本地把 `pnpm build` + `pnpm test` 跑绿。
-4. 提 PR 到本仓库的 **`main` 分支**。标题按 commit 格式写，描述里说清楚：改了什么、为什么改、怎么验证的。
+4. 提 PR 到这个 **`vX.Y.Z` 分支**（不要提到 `main`，`main` 只接收发版合并）。标题按 commit 格式写，描述里说清楚：改了什么、为什么改、怎么验证的。
+
+完整的分支规则、自测清单和 PR 要求见 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私密报告。
 
 不知道从哪下手？看看 [Issues](https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues)，挑一个感兴趣的开干。发现 Bug 或有新点子，也欢迎直接开 Issue 聊。
 
@@ -328,6 +331,8 @@ perf(chat): reveal streamed text per frame without reparsing markdown
 ## 参考项目说明
 
 本项目最初源自 [CodexMonitor](https://github.com/Dimillian/CodexMonitor)。自 v1.0.0 起代码库已从零完全重写，不再包含 CodexMonitor 的任何代码，但仍感谢其最初带来的启发。
+
+本机用量统计与订阅限额查询（供「用量与限额」插件使用）参考了 [TokenTracker](https://github.com/xiufengsun/tokentracker)（MIT），内置的模型价格表来自 [LiteLLM](https://github.com/BerriAI/litellm)（MIT），详见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 
 ---
 

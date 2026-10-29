@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>用量与限额插件 · 交互设计稿</title>
+<!--
+  交互设计稿（不是产品代码）。覆盖：状态栏芯片 + 弹出面板、用量概览页、限额页、插件设置页。
+  打开方式：直接双击本文件（纯静态，无构建、无网络请求）。数字由固定种子生成，是示例数据。
+  URL hash 可直达某个状态，例如 #view=limits&claude=expired&dark=1
+
+  参考：TokenTracker（MIT © 2026 xiufengsun）的信息架构与交互思路。
+  视觉沿用 CC GUI 自己的 token，文案、像素吉祥物与实现均为原创，不复用其素材。
+-->
+<link rel="stylesheet" href="./usage-limits.css" />
+</head>
+<body>
+
+<!-- ============================================================ 评审栏 -->
+<header class="review">
+  <div class="review__lead">
+    <span class="review__kicker">design review · v1 · 用量与限额插件</span>
+    <h1>状态栏用量 · 用量概览 · 订阅限额</h1>
+    <p>数据由宿主的只读数据层提供（扫描本机各 CLI 会话日志、只读查询 Claude / Codex 限额），界面由插件注册。界面里能点的地方都可以点；右侧是逐条交互说明、待决策项与落地对应。</p>
+  </div>
+
+  <div class="review__ctrl">
+    <div class="seg" role="tablist" aria-label="场景">
+      <button type="button" role="tab" data-view="statusbar" data-action="view">1 · 状态栏与面板</button>
+      <button type="button" role="tab" data-view="dashboard" data-action="view">2 · 用量概览</button>
+      <button type="button" role="tab" data-view="limits" data-action="view">3 · 限额</button>
+      <button type="button" role="tab" data-view="settings" data-action="view">4 · 插件设置</button>
+    </div>
+
+    <div class="toggles" role="group" aria-label="预览开关">
+      <span class="toggles__label">预览</span>
+      <button type="button" class="tg" data-toggle="dark" data-action="toggle">深色</button>
+      <button type="button" class="tg" data-toggle="tight" data-action="toggle">限额告急</button>
+      <button type="button" class="tg" data-toggle="running" data-action="toggle">会话运行中</button>
+      <button type="button" class="tg" data-toggle="scanning" data-action="toggle">首次扫描</button>
+      <button type="button" class="tg" data-toggle="empty" data-action="toggle">无数据</button>
+      <button type="button" class="tg" data-toggle="reduced" data-action="toggle">减少动效</button>
+      <button type="button" class="tg" data-toggle="pins" data-action="toggle">标注编号</button>
+    </div>
+
+    <div class="selects">
+      <label>Claude
+        <select data-select="claude">
+          <option value="ok">正常</option>
+          <option value="loading">读取中</option>
+          <option value="signedOut">未登录</option>
+          <option value="expired">登录过期</option>
+          <option value="rateLimited">接口限流</option>
+          <option value="offline">网络失败</option>
+        </select>
+      </label>
+      <label>Codex
+        <select data-select="codex">
+          <option value="ok">正常</option>
+          <option value="weekly">仅每周窗口</option>
+          <option value="loading">读取中</option>
+          <option value="signedOut">未登录</option>
+          <option value="expired">登录过期</option>
+          <option value="offline">网络失败</option>
+        </select>
+      </label>
+    </div>
+  </div>
+</header>
+<p class="review__hint">按 <kbd>1</kbd>–<kbd>4</kbd> 切换场景 · <kbd>Esc</kbd> 关闭弹层 · 打开「标注编号」后，界面上的数字对应右侧说明 · 地址栏 hash 会记住当前场景与预览开关</p>
+<div class="err" id="err" role="alert" hidden></div>
+
+<!-- ============================================================ 舞台 -->
+<div class="stage">
+  <div class="app" id="app">
+    <div class="app__chrome">
+      <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+      <span class="app__title">CC GUI</span>
+    </div>
+    <div class="app__body">
+      <aside class="side" id="side"></aside>
+      <main class="main">
+        <div class="tabs" id="tabs"></div>
+        <div class="center" id="center"></div>
+      </main>
+    </div>
+    <footer class="status" id="status"></footer>
+    <div id="layer"></div>
+  </div>
+  <aside class="notes" id="notes" aria-live="polite"></aside>
+</div>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+
+<script src="./usage-limits.data.js"></script>
+<script src="./usage-limits.views.js"></script>
+<script src="./usage-limits.overview.js"></script>
+<script src="./usage-limits.notes.js"></script>
+<script src="./usage-limits.js"></script>
+</body>
+</html>

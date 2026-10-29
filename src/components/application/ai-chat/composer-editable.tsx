@@ -100,20 +100,26 @@ export function ComposerEditable({
   const { t } = useTranslation();
   /** Resolve pasted files to absolute paths and hand them over: the webview
    *  hides Finder / Explorer paths behind opaque blobs, so the host reads the
-   *  OS clipboard; `text/uri-list` paths cover clipboard stacks that expose
-   *  them directly. A probe that finds no file falls back to `fallback`
-   *  (image bytes, which need no path). */
+   *  OS clipboard. `text/uri-list` is used only after a successful empty
+   *  native read; a failed read must not resurrect stale event paths. */
   const routePastedFiles = useCallback(
     (uriPaths: string[], fallback?: () => void) => {
       if (!onPastePaths) return;
       const native = isWeb
-        ? Promise.resolve<string[]>([])
-        : ipc.clipboardFilePaths().catch(() => []);
-      void native.then((nativePaths) => {
-        const paths = nativePaths.length > 0 ? nativePaths : uriPaths;
-        if (paths.length > 0) onPastePaths(paths);
-        else fallback?.();
-      });
+        ? Promise.resolve({ paths: [] as string[], changeCount: null })
+        : ipc.clipboardFileSnapshot();
+      void native.then(
+        ({ paths: nativePaths }) => {
+          const paths = nativePaths.length > 0 ? nativePaths : uriPaths;
+          if (paths.length > 0) onPastePaths(paths);
+          else fallback?.();
+        },
+        () => {
+          // Image bytes belong to this paste event and remain a valid
+          // fallback; uri-list paths do not prove the current OS contents.
+          fallback?.();
+        },
+      );
     },
     [onPastePaths],
   );

@@ -32,21 +32,56 @@ export function groupModelsByProvider(models: ModelOption[]): ModelGroup[] {
 }
 
 /**
+ * CodeBuddy files its `custom:` (enterprise) models under this provider key
+ * (`src-tauri/src/engine/models/codebuddy.rs`). Other engines' provider keys
+ * are relay or channel names the user typed, so the same word there is just a
+ * name: it keeps its own header and its catalog position.
+ */
+export function isEnterpriseGroup(engineId: string, key: string): boolean {
+  return engineId === "codebuddy" && key === "enterprise";
+}
+
+/**
+ * Section order for a layered list. The section holding the current pick
+ * leads so the selection is never scrolled out of view; otherwise CodeBuddy's
+ * enterprise section sinks below the vendor sections. Everything else keeps
+ * catalog order (the sort is stable).
+ */
+export function orderModelGroups(
+  groups: ModelGroup[],
+  engineId: string,
+  selectedModelId: string,
+): ModelGroup[] {
+  const rank = (group: ModelGroup) => {
+    if (group.rows.some((m) => m.id === selectedModelId)) return 0;
+    return isEnterpriseGroup(engineId, group.key) ? 2 : 1;
+  };
+  return [...groups].sort((a, b) => rank(a) - rank(b));
+}
+
+/**
  * Case-insensitive label/id/description/provider match; an empty query passes
  * the catalog through untouched (identity, so memoized groups stay stable).
  * Provider is part of the match because several relays serve the same model
- * id — typing the channel is how you narrow to one of them.
+ * id — typing the channel is how you narrow to one of them. `sectionTitle`
+ * is what the header reads for a provider (CodeBuddy's `enterprise` is titled
+ * through i18n), so typing the text on screen finds the section too.
  */
 export function filterModels(
   models: ModelOption[],
   normalizedQuery: string,
+  sectionTitle?: (provider: string) => string,
 ): ModelOption[] {
   if (!normalizedQuery) return models;
-  return models.filter(
-    (m) =>
+  return models.filter((m) => {
+    const provider = m.provider ?? "";
+    return (
       m.label.toLowerCase().includes(normalizedQuery) ||
       m.id.toLowerCase().includes(normalizedQuery) ||
       (m.description ?? "").toLowerCase().includes(normalizedQuery) ||
-      (m.provider ?? "").toLowerCase().includes(normalizedQuery),
-  );
+      provider.toLowerCase().includes(normalizedQuery) ||
+      (provider !== "" &&
+        (sectionTitle?.(provider) ?? "").toLowerCase().includes(normalizedQuery))
+    );
+  });
 }

@@ -3,6 +3,34 @@ import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
 
+// Async Tauri commands can start out of call order. Preserve the caller's
+// order only where an older write would otherwise overwrite a newer choice.
+// Other resources and read commands remain independent.
+const persistenceTails = new Map<string, Promise<unknown>>();
+
+function invokePersisted<T>(
+  key: string,
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  const previous = persistenceTails.get(key) ?? Promise.resolve();
+  const result = previous.then(
+    () => invoke<T>(command, args),
+    () => invoke<T>(command, args),
+  );
+  // A failed request rejects its own caller, not every later write. Remove
+  // the tail once idle so session/plugin keys do not accumulate indefinitely.
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  persistenceTails.set(key, settled);
+  void settled.then(() => {
+    if (persistenceTails.get(key) === settled) persistenceTails.delete(key);
+  });
+  return result;
+}
+
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
 export interface SessionMeta {
@@ -112,10 +140,15 @@ export interface TodoItem {
   detail?: string | null;
 }
 
+/** One entry of a todo payload. A patch entry may leave `status` out: the
+ *  update did not set one (a TaskUpdate that only renames), so the item
+ *  keeps its current status. */
+export type TodoPayloadItem = Omit<TodoItem, "status"> & { status?: TodoStatus };
+
 /** Todo-list payload on todo-class tool rows: replace = full snapshot,
- * otherwise a patch matched by content (status "dropped" removes). */
+ * otherwise a patch matched by id, then content (status "dropped" removes). */
 export interface TodosPayload {
-  items: TodoItem[];
+  items: TodoPayloadItem[];
   replace: boolean;
 }
 
@@ -138,6 +171,11 @@ export interface Message {
   args?: unknown;
   /** Tool execution result/output; shown in the tool panel. */
   result?: unknown;
+  /** The engine's id for this tool call, when it reported one. Runtime-only:
+   *  a live result patch pairs to its call on this, so parallel calls of one
+   *  tool (four `TaskCreate` in a batch) each settle their own row. History
+   *  rows do not carry it — the backend pairs results by id while folding. */
+  toolCallId?: string;
   todos?: TodosPayload;
   ts: string | null;
   usage?: unknown;
@@ -154,6 +192,7 @@ export interface Message {
       comparisonModel?: string | null;
     };
     served: { model: string | null; effort: string | null };
+    reportsServed?: boolean;
   } | null;
   /** Turn duration in milliseconds (measured from prompt send to turn completion) */
   durationMs?: number | null;
@@ -196,6 +235,7 @@ export interface Workspace {
   name: string;
   lastOpenedAt: number | null;
   sortOrder: number | null;
+  pinned?: boolean;
   /** Sidebar group id (工作区分组); null = ungrouped. */
   groupId: string | null;
   /** "worktree" = git worktree child under its parent workspace row;
@@ -656,6 +696,20 @@ export interface FileOpResult {
   isDir: boolean;
 }
 
+/** Result of `paste_clipboard_items`: what the OS clipboard's file list
+ *  produced, plus the reason each rejected item stayed behind. */
+export interface PasteClipboardResult {
+  created: FileOpResult[];
+  failed: string[];
+}
+
+/** Host-read OS file clipboard, including its native generation counter.
+ *  The counter is null where no native file clipboard bridge exists. */
+export interface ClipboardFileSnapshot {
+  paths: string[];
+  changeCount: number | null;
+}
+
 export interface SearchHit {
   path: string;
   line: number;
@@ -1108,36 +1162,6 @@ export interface WebAccessInfo {
   availableIps?: LanIpEntry[];
 }
 
-/** One finished turn as it enters the usage ledger. */
-export interface UsageEntryInput {
-  /** Epoch ms when the turn settled. */
-  ts: number;
-  engine: string;
-  model: string | null;
-  sessionId: string | null;
-  workspacePath: string | null;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  durationMs: number | null;
-  /** Model responses this turn reported (>= 1). */
-  reports: number;
-}
-
-/** Ledger totals for one (local day, engine, model) bucket. */
-export interface UsageRow {
-  /** Local "YYYY-MM-DD". */
-  day: string;
-  engine: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Model responses in this bucket — the request total. */
-  requests: number;
-}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1624,10 +1648,19 @@ export const ipc = {
    * new paths (same order). Picked paths live outside the sandbox, so the
    * engines' path-based image pipeline cannot read them in place. */
   importAttachments: (paths: string[]) => invoke<string[]>("import_attachments", { paths }),
-  /** Absolute paths of the files on the OS clipboard (Finder / Explorer
-   * copies expose no path to the webview). Empty when the clipboard holds no
-   * file; the web bridge has no OS pasteboard and always answers empty. */
-  clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
+  /** Host-read OS clipboard snapshot (Finder / Explorer file copies expose
+   *  no path to the webview). Rejects on a real read failure; the web bridge
+   *  has no OS pasteboard and returns an empty snapshot with no generation. */
+  clipboardFileSnapshot: () => invoke<ClipboardFileSnapshot>("clipboard_file_snapshot"),
+  /** The OS clipboard generation alone. Unlike a snapshot it never opens the
+   *  clipboard, so it answers while another program holds it; null where no
+   *  native generation exists (Linux, the web bridge). */
+  clipboardChangeCount: () => invoke<number | null>("clipboard_change_count"),
+  /** Replace the OS clipboard with a file list, so Finder / Explorer paste
+   *  the actual items. Rejects when the host cannot write; the in-app tree
+   *  clipboard still carries the item (Linux has no native bridge). */
+  setClipboardFilePaths: (paths: string[]) =>
+    invoke<void>("clipboard_set_file_paths", { paths }),
   listEngineModels: (engine: string, workspace?: string) =>
     withGrantRetry(() =>
       invoke<EngineCatalog>("list_engine_models", { engine, workspace: workspace ?? null }),
@@ -1734,7 +1767,11 @@ export const ipc = {
   /** Remember the reasoning level a session ran, so reopening it — here, in
    *  another window, or on the phone — keeps that level. */
   rememberSessionEffort: (engine: string, sessionId: string, effort: string) =>
-    invoke<void>("remember_session_effort", { engine, sessionId, effort }),
+    invokePersisted<void>(`session-effort:${engine}\0${sessionId}`, "remember_session_effort", {
+      engine,
+      sessionId,
+      effort,
+    }),
   /** Remember the in-app channel a session ran, so reopening it keeps that
    *  channel without rewriting the CLI's own config file. */
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
@@ -1759,6 +1796,7 @@ export const ipc = {
   pluginAddWorkspace: (pluginId: string, path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
   reorderWorkspaces: (ids: string[]) => invoke<void>("reorder_workspaces", { ids }),
+  setWorkspacePinned: (id: string, pinned: boolean) => invoke<void>("set_workspace_pinned", { id, pinned }),
   removeWorkspace: (id: string) => invoke<void>("remove_workspace", { id }),
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
@@ -1794,6 +1832,13 @@ export const ipc = {
     withGrantRetry(() => invoke<FileOpResult>("duplicate_item", { path })),
   pasteItem: (source: string, targetDir: string) =>
     withGrantRetry(() => invoke<FileOpResult>("paste_item", { source, targetDir })),
+  /** Copy whatever file list the OS clipboard holds into `targetDir`. The
+   *  host reads the clipboard itself — source paths never come over IPC —
+   *  and the web bridge answers with an empty list. */
+  pasteClipboardItems: (targetDir: string) =>
+    withGrantRetry(() =>
+      invoke<PasteClipboardResult>("paste_clipboard_items", { targetDir }),
+    ),
   searchText: (path: string, query: string) =>
     withGrantRetry(() => invoke<SearchHit[]>("search_text", { path, query })),
   /** Whole-tree file index for the composer @-mention picker (relative
@@ -2025,9 +2070,9 @@ export const ipc = {
   pluginStorageGet: (id: string, key: string) =>
     invoke<unknown>("plugin_storage_get", { id, key }),
   pluginStorageSet: (id: string, key: string, value: unknown) =>
-    invoke<void>("plugin_storage_set", { id, key, value }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_set", { id, key, value }),
   pluginStorageDelete: (id: string, key: string) =>
-    invoke<void>("plugin_storage_delete", { id, key }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_delete", { id, key }),
   pluginWorkspaceMetadata: (pluginId: string, workspacePath: string) =>
     invoke<PluginWorkspaceMetadata>("workspace_metadata", { pluginId, workspacePath }),
   pluginDocumentStorageGetLocation: (pluginId: string) =>
@@ -2128,11 +2173,6 @@ export const ipc = {
   webAccessStatus: () => invoke<WebAccessInfo | null>("web_access_status"),
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
-  // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invoke<void>("usage_record", { entry }),
-  usageSummary: (days: number, tzOffsetMinutes: number) =>
-    invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invoke<void>("usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

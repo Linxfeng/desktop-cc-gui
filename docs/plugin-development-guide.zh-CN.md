@@ -250,6 +250,7 @@ interface PluginContext {
     registerOverlay(d: Omit<OverlayDef, "id"> & { key?: string }): Disposer;
     registerCommand(d: CommandDef): Disposer;
     registerSessionMenuItem(d: Omit<SessionMenuItemDef, "id"> & { key?: string }): Disposer;
+    registerFileLinkMenuItem(d: Omit<FileLinkMenuItemDef, "id"> & { key?: string }): Disposer; // 聊天文件链接右键（0.3.23 起）
     openSettings(key?: string): void; // 跳转到本插件设置页（0.3.6 起）
     registerMarkdownRenderer(d: MarkdownRendererDef): Disposer;
     registerPage(d: PageDef): Disposer;
@@ -264,6 +265,19 @@ interface PluginContext {
     delete(key: string): Promise<void>;
   };
   events: { on(topic: string, cb: (data: unknown) => void): Disposer; emit(topic: string, data: unknown): void };
+  usage: { // 本机用量统计（usage.read，0.3.25 起）
+    query(q: UsageStatsQuery): Promise<UsageStatsResult>;
+    sources(): Promise<UsageSourceStatus[]>;
+    refresh(): Promise<UsageScanSummary>;
+    rescan(): Promise<UsageScanSummary>;
+    prices(): Promise<UsagePriceInfo>;
+    updatePrices(): Promise<UsagePriceInfo>;
+    onChange(cb: (e: { scannedAt: number }) => void): Disposer;
+    onScanProgress(cb: (p: UsageScanProgress) => void): Disposer;
+  };
+  limits: { // 订阅限额（limits.read，0.3.25 起）
+    get(o?: { providers?: UsageLimitProviderId[]; refresh?: boolean }): Promise<UsageLimitsResult>;
+  };
   agent: {
     catalog(workspacePath: string): Promise<PluginAgentCatalogEntry[]>;
     start(def: {
@@ -290,7 +304,8 @@ interface PluginContext {
 |---|---|---|
 | `usage://updated` | 完整 EngineEventPayload `{ runId, sessionId, engine, seq, kind: "usage", data, ts?, genMs? }`；`data` 为引擎原始 usage JSON（字段因引擎而异，如 claude 的 `cache_read_input_tokens`、codex 的 `cached_input_tokens`、pi/omp 的 `cacheRead`）；`ts` 为宿主发射时刻 Unix 毫秒（SDK 0.3.8 起）；`genMs` 为宿主实测的生成窗口毫秒（SDK 0.3.15 起，仅 `usage`/`done` 事件携带，工具执行与等待不计入） | `events` |
 | `usage://done`（SDK 0.3.8 起） | 同上形状，`kind: "done"`；`data.usage` 携带该轮最终用量——claude/grok 等不发独立 usage 事件的引擎只经此上报，其它引擎用作轮结束信号；`genMs` 为该轮生成窗口合计 | `events` |
-| `session://activated`（SDK 0.3.8 起） | `{ engine, sessionId }`；pending 标签 `sessionId` 为 null，无活动标签两者皆 null | `events` |
+| `session://activated`（SDK 0.3.8 起；`provider` / `model` 自 0.3.24 起） | `{ engine, sessionId, provider, model }`；`provider` 为会话所用渠道 id，引擎使用自身配置时为 null；`model` 为输入框显示的模型（picker 选择器如 `deepseek/deepseek-flash`，或引擎回报的实际模型），CLI 默认且无记录时为 null；pending 标签 `sessionId` 为 null，无活动标签全为 null | `events` |
+| `session://selection-changed`（SDK 0.3.24 起） | 当前会话的 `provider` / `model` 变化：输入框选择、设置页改默认渠道、历史加载出会话模型、其他窗口修改、引擎回报实际模型都会触发，同值不重发；切换会话只发 `session://activated`。payload 同上，`session://activated` 的保留值同步更新 | `events` |
 | `composer://draft` | `{ text }`；草稿变化/清空/会话切换均发射 | `events` |
 
 SDK 0.4.2 起，`RuntimeSwitchEvent` 包含必填 `switchId`，同一次启动的 `beforeSwitch` 与 `afterSwitch` 共享此身份。插件应同时核对切换身份与原生命周期，不能让停用前的迟到完成覆盖重新启用后的切换状态。
@@ -303,11 +318,19 @@ SDK 0.4.2 起，`RuntimeSwitchEvent` 包含必填 `switchId`，同一次启动�
 
 `ctx.ui.registerSessionMenuItem`（权限 `ui:session-menu`，0.3.5 起）向侧栏会话右键菜单追加行；`run` 接收打开菜单的目标会话 `{ engine, sessionId }`，`label` 是随语言切换重新求值的函数。它与工作区菜单是独立的扩展点。`ctx.ui.openSettings(key?)`（复用权限 `ui:settings-section`，0.3.6 起）跳转到本插件设置页；`key` 对应 `registerSettingsSection` 的子 key，省略时打开主 section。SDK 0.4.1 同时保留这两项能力和工作区菜单。
 
+`ctx.ui.registerFileLinkMenuItem({ key?, label(target), icon?, visible?(target), run(target), order? })`（权限 `ui:file-link-menu`，0.3.23 起）向聊天消息里文件链接的右键菜单追加行。宿主把插件项放在「打开文件」「在浏览器中打开」（仅 HTML）之后、所选外部编辑器之前；`order` 只在插件项之间排序，同序再按 scoped id。`target` 是冻结快照 `{ path, resolvedPath, workspacePath }`：`path` 为消息里的原始链接文本（可能带 `:12` 行号），`workspacePath` 为该消息所在会话的工作区，不是当前编辑器或活动工作区。不可解析的链接（`~/`、`../`）插件项可见但禁用；点击后宿主按「打开文件」同一链路重新解析，只在得到非 null 路径时调用 `run`，解析沿用候选路径回退，不保证文件存在。`label` 必须返回非空字符串；`label`/`visible` 抛错、`run` 抛错或 Promise 拒绝都只影响本插件项，图标包在 PluginBoundary 内。返回的 Disposer 及插件卸载均会移除菜单项，解析期间被卸载或同 key 重新注册的旧回调不再派发。同一插件注册多项时各给一个 `key`，否则后注册的会覆盖前一项（都落在 `plugin:<id>`）。
+
+注意两点：`label`/`visible` 在每次打开菜单时求值，用户不点该项插件也会收到被右键的路径与会话工作区路径，不要把它们记录或外传；web 访问模式下插件项照常显示而动作在宿主机执行，需要时在 `visible` 里用 `ctx.host.isWeb` 隐藏。本接口不带任何应用或进程能力，启动外部应用仍须声明并使用 `exec:<bin>` bridge。依赖它的插件声明 `sdkVersion: ">=0.3.23"`：0.3.22 宿主（1.1.8）没有该接口。
+
 `ctx.documentStorage` 是 `ctx.storage` KV 之外的受控 UTF-8 文档存储：根目录固定隔离在 `<所选位置>/plugin-data/<plugin-id>/`，路径必须相对且不能逃逸；`writeTextAtomic(path, content, expectedVersion)` 使用不透明版本做 CAS，`expectedVersion: null` 表示要求文件尚不存在。`selectLocation('custom')` 由宿主打开目录选择器；SDK 不接受插件提供的路径，IPC 边界另对敏感根做纵深防护（`$HOME` 本身、文件系统根、`.ssh`/`.aws`/`.gnupg`/`.ccgui-next` 及其祖先一律拒绝）。该黑名单不是与选择器结果的加密绑定：绕过 SDK 直接调用 IPC 提交路径属审核违规，宿主不承诺拦截任意非黑名单目录。
 
 路径使用 `/` 分隔；检查原始输入中的空段、`.`、`..`，不接受 `a/./b`、`a//b` 或末尾 `/` 的别名写法。`list()` 的空前缀仍表示列出根目录。
 
 `documentStorage` 是内容寻址（CAS）文本存储：`readText` 返回 `{ content, version }`，`version` 是不透明比较令牌，仅用于回传，不要解析或据其推断顺序。`remove(path, expectedVersion?)` 与写入同样走 CAS——传入上一次读取到的 `version` 即为条件删除，若磁盘上的版本已被其它写入推进（stale），删除以 conflict 被拒绝并保留较新的文档；省略或传 `null` 为无条件删除。据此模式：读到版本 → 基于该版本删除，可保证「只删除我刚读到的那份内容」，避免误删他处并发写入的新版本。
+
+`ctx.usage`（权限 `usage.read`，0.3.25 起）是宿主算好的只读用量统计：从各 CLI 自己的会话日志增量读取（Claude Code / Codex / Pi / oh-my-pi），不上传，也不要求插件解析日志格式。`query({ from, to, bucket? })` 按「本地日期（或小时）× 引擎 × 模型 × 会话 cwd」分组，含输入 / 输出 / 缓存读 / 缓存写 / 推理 tokens、请求数、会话数与按 LiteLLM 价格快照估算的 `cost`（查不到价格为 `null`，不拿别的型号猜价）；`sources()` 列出各来源根目录、环境变量覆盖与状态（`ok` / `missing` / `denied` / `error`）；`refresh()` 增量扫描，`rescan()` 从头重读磁盘上全部日志（已 CLI 清理的旧日志对应用量保留，60 秒冷却），进度经 `onScanProgress`、数据变化经 `onChange`；`prices()` / `updatePrices()` 读或更新内置价格表，下载只在用户显式操作或开启自动更新时调用（10 分钟冷却）。宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。
+
+`ctx.limits.get({ providers?, refresh? })`（权限 `limits.read`，0.3.25 起）返回 Claude / Codex 的订阅限额窗口。宿主只读本机 CLI 的登录状态、只请求厂商官方接口，不刷新也不改写凭据，插件拿不到凭据；缓存 60 秒，`refresh` 20 秒内重复调用仍复用上次结果，429 按退避并保留上次数据，只有 401 视为登录过期（Codex 的 403 多为 Cloudflare 质询，报错误而非过期）。
 
 ### 6.3 标准化运行时事件（只读）
 
@@ -368,7 +391,7 @@ interface PluginAssets {
 | 权限 | 能力 | 审核强度 |
 |---|---|---|
 | `storage` | 使用 `ctx.storage` KV | 低 |
-| `ui:*`（`ui:settings-section`、`ui:add-menu`、`ui:composer-status`、`ui:panel-tab`、`ui:status-bar`、`ui:page`、`ui:command`、`ui:markdown`、`ui:timeline-row`、`ui:workspace-menu`、`ui:session-menu`、`ui:sidebar-entry`、`ui:center-tab`、`ui:worktree-badge`） | 对应 UI 扩展点；`registerComposerSlot` 与 `registerComposerStatusItem` 共享 `ui:composer-status`，`openSettings` 复用 `ui:settings-section`。`ui:worktree-badge` 只推文字/颜色/纯文本 tooltip，渲染由宿主负责 | 低 |
+| `ui:*`（`ui:settings-section`、`ui:add-menu`、`ui:composer-status`、`ui:panel-tab`、`ui:status-bar`、`ui:page`、`ui:command`、`ui:markdown`、`ui:timeline-row`、`ui:workspace-menu`、`ui:session-menu`、`ui:file-link-menu`、`ui:sidebar-entry`、`ui:center-tab`、`ui:worktree-badge`） | 对应 UI 扩展点；`registerComposerSlot` 与 `registerComposerStatusItem` 共享 `ui:composer-status`，`openSettings` 复用 `ui:settings-section`。`ui:worktree-badge` 只推文字/颜色/纯文本 tooltip，渲染由宿主负责；`ui:file-link-menu` 的 `label`/`visible` 每次打开菜单都会收到被右键的文件路径与会话工作区路径 | 低 |
 | `ui:overlay` | 常驻视口悬浮内容；不得遮挡宿主关键操作 | 中 |
 | `assets:bundle` | 读取本插件包内二进制资源和已审核脚本 | 中 |
 | `assets:directory` | 用户选择的每插件只读目录与范围内 reveal | 高（必须明确告知目录范围） |
@@ -378,6 +401,8 @@ interface PluginAssets {
 | `session.lifecycle.read` | 观察 session 新建、恢复、关闭 | 中 |
 | `runtime.events.read` | 只读回合开始、结算及标准化运行时事实 | 中 |
 | `runtime.switch.observe` | 观察切换前后生命周期；失败不阻断切换 | 中 |
+| `usage.read` | 读取宿主从本机 CLI 会话日志算出的用量统计（只读、不上传，含按价格表估算的费用） | 中 |
+| `limits.read` | 读取本机 CLI 登录状态对应的 Claude / Codex 订阅限额（只返回窗口与用量，不返回凭据） | 中 |
 | `workspace.metadata.read` | 读取稳定 workspace ID 与绝对路径 | 中 |
 | `plugin.storage` | 使用受控文档存储和位置选择 | 中 |
 | `prompt.contribute.internal` | 向有效 CLI 请求加入用户不可见的内部提示，并接收捕获的内部消息 | 高（安装时必须明确告知） |

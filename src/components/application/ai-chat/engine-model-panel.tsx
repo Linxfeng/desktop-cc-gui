@@ -2,6 +2,7 @@
 
 import { useMemo, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import Check from "lucide-react/dist/esm/icons/check";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
@@ -15,7 +16,13 @@ import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { supportsOmpFastMode, type OmpServiceTier } from "@/lib/omp-service-tier";
 import { cx } from "@/utils/cx";
 import { OmpSpeedSection } from "./omp-speed-section";
-import { filterModels, groupModelsByProvider, type ModelGroup } from "./model-list";
+import {
+  filterModels,
+  groupModelsByProvider,
+  isEnterpriseGroup,
+  orderModelGroups,
+  type ModelGroup,
+} from "./model-list";
 import { EFFORT_LABEL_KEYS, supportsEffort, type EffortLevel } from "./effort-levels";
 import { EffortSlider } from "./effort-slider";
 import type { MenuOption, ModelOption } from "./cli-menu";
@@ -376,7 +383,7 @@ function ModelGroupList({
         <div key={group.key || "__flat__"} className="flex w-full flex-col">
           {group.key && (
             <span className="sticky top-0 z-10 bg-background-primary-default px-2 pt-1.5 pb-0.5 text-body-2-medium text-text-tertiary">
-              {group.key}
+              {sectionTitle(engineId, group.key, t)}
             </span>
           )}
           {group.rows.map((model) => (
@@ -404,6 +411,12 @@ function ModelGroupList({
   );
 }
 
+/** What a section header reads: the provider key, except CodeBuddy's
+ *  enterprise section, which is titled through i18n. */
+function sectionTitle(engineId: string, key: string, t: TFunction): string {
+  return isEnterpriseGroup(engineId, key) ? t("chat.modelGroupEnterprise") : key;
+}
+
 /** Filters the catalog by the search query and shapes the rows for
  *  ModelGroupList: provider sections layer the list whenever the engine's
  *  catalog mixes sources (OMP serving several relays) — including while
@@ -411,26 +424,28 @@ function ModelGroupList({
  *  into identical rows. Pinning the active row to the top would tear it out
  *  of its section, so a grouped list keeps the catalog order and marks the
  *  pick in place; only a flat single-source list reorders to surface the
- *  pick. The section holding the current pick leads so the selection is
- *  never scrolled out of view; within sections the catalog order stands. */
+ *  pick. Section order comes from `orderModelGroups`: the section holding the
+ *  pick leads so the selection is never scrolled out of view, and CodeBuddy's
+ *  enterprise section otherwise sits last. The search also matches what a
+ *  header reads, so typing 企业模型 finds that section. */
 function useOrderedModelGroups(
   models: ModelOption[],
   query: string,
   selectedModelId: string,
+  engineId: string,
 ): { groups: ModelGroup[]; empty: boolean } {
+  const { t } = useTranslation();
   return useMemo(() => {
-    const filtered = filterModels(models, query.trim().toLowerCase());
+    const filtered = filterModels(models, query.trim().toLowerCase(), (provider) =>
+      sectionTitle(engineId, provider, t),
+    );
     const groups = groupModelsByProvider(filtered);
     // Sectioned whenever the grouping carried keys — a single provider
     // still gets its header (the group is keyless only when no provider is
     // known).
     const layered = groups.length > 0 && groups[0].key !== "";
     if (layered) {
-      const ordered = [...groups].sort(
-        (a, b) =>
-          Number(b.rows.some((m) => m.id === selectedModelId)) -
-          Number(a.rows.some((m) => m.id === selectedModelId)),
-      );
+      const ordered = orderModelGroups(groups, engineId, selectedModelId);
       return { groups: ordered, empty: filtered.length === 0 };
     }
     const flat = [...filtered].sort(
@@ -438,7 +453,7 @@ function useOrderedModelGroups(
         Number(b.id === selectedModelId) - Number(a.id === selectedModelId),
     );
     return { groups: [{ key: "", rows: flat }], empty: flat.length === 0 };
-  }, [models, query, selectedModelId]);
+  }, [models, query, selectedModelId, engineId, t]);
 }
 
 /** The search field filtering the model list. */
@@ -566,7 +581,12 @@ export function EngineModelPanel({
   loading?: boolean;
 }) {
   const { t } = useTranslation();
-  const { groups, empty } = useOrderedModelGroups(models, query, selectedModelId);
+  const { groups, empty } = useOrderedModelGroups(
+    models,
+    query,
+    selectedModelId,
+    option.id,
+  );
   // Header channel filter (empty = the full channel list). Engines without
   // channels (omp until one is added in settings) get no channel UI at all —
   // an empty-array channels prop is still truthy, and a filter box that

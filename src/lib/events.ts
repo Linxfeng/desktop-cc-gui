@@ -70,10 +70,6 @@ export function listenSessionsChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("sessions://changed", () => cb());
 }
 
-/** Fired after a turn lands in the usage ledger; the page re-reads on it. */
-export function listenUsageChanged(cb: () => void): Promise<UnlistenFn> {
-  return listen("usage://changed", () => cb());
-}
 export interface ScanProgress {
   done: number;
   total: number;

@@ -271,7 +271,7 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
                         .rposition(|m| m.role == "tool" && m.result.is_none()),
                 };
                 if let Some(index) = index {
-                    if let Some(todos) = crate::engine::parse_todo_result(&res) {
+                    if let Some(todos) = crate::engine::parse_todo_result(&messages[index].text, &res) {
                         messages[index].todos = Some(todos);
                     }
                     messages[index].result = Some(res);
@@ -1208,12 +1208,23 @@ fn claude_block_rows(
                 path: input.and_then(crate::engine::tool_path_arg),
                 args: input.and_then(crate::engine::parse_tool_args_value),
                 todos: input.and_then(crate::engine::parse_todo_args),
+                // The CLI stamps every call with the id its result comes
+                // back on. Without it `fold_rows` can only guess at the
+                // pairing (latest unanswered row), and parallel calls of
+                // one tool — four `TaskCreate` in a row, say — hand their
+                // results to whichever row happened to be last.
+                tool_call_id: block.get("id").and_then(Value::as_str).map(str::to_string),
                 ..LineRow::new("tool", name, ts.clone())
             });
         }
         Some("tool_result") => {
             let res = block.get("content").cloned();
             out.push(LineRow {
+                tool_call_id: block
+                    .get("tool_use_id")
+                    .or_else(|| block.get("toolUseId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 result: res,
                 ..LineRow::new("__tool_result__", String::new(), ts.clone())
             });
@@ -2374,6 +2385,101 @@ mod tests {
         let statuses: Vec<&str> = todos.items.iter().map(|i| i.status.as_str()).collect();
         assert_eq!(statuses, ["complete", "active", "pending", "blocked"]);
         assert_eq!(todos.items[1].content, "write code");
+    }
+
+    /// A batch of parallel TaskCreate calls
+    /// settles by id. Pairing on "the latest unanswered row" instead hands
+    /// every result to the last call of the batch, which is what left the
+    /// run-status task list stuck on "pending".
+    #[test]
+    fn claude_parallel_tool_results_pair_with_their_call_ids() {
+        let call = |id: &str, subject: &str| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-21T08:10:10Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": "TaskCreate",
+                     "input": {"subject": subject, "description": "", "activeForm": subject}}
+                ]}
+            })
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-21T08:10:11Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                ]}
+            })
+        };
+        let lines = vec![
+            call("call-a", "实测 Python 版"),
+            call("call-b", "打包 exe"),
+            // Results arrive in completion order, not call order.
+            result("call-b", "Task #2 created successfully: 打包 exe"),
+            result("call-a", "Task #1 created successfully: 实测 Python 版"),
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value: &Value| extract_claude_line(value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+
+        assert_eq!(parsed.messages.len(), 2);
+        let (first, second) = (&parsed.messages[0], &parsed.messages[1]);
+        assert_eq!(first.text, "TaskCreate");
+        assert_eq!(first.result, Some(serde_json::json!("Task #1 created successfully: 实测 Python 版")));
+        assert_eq!(second.result, Some(serde_json::json!("Task #2 created successfully: 打包 exe")));
+        // The result also teaches the row the id every later TaskUpdate names.
+        let first_todos = first.todos.as_ref().expect("create payload");
+        assert_eq!(first_todos.items[0].id.as_deref(), Some("1"));
+        let second_todos = second.todos.as_ref().expect("create payload");
+        assert_eq!(second_todos.items[0].id.as_deref(), Some("2"));
+    }
+
+    /// Reading a task back (TaskGet) is not an update: its row carries no todo
+    /// patch, so replaying history cannot reset a finished task to pending.
+    #[test]
+    fn claude_task_get_row_carries_no_todo_patch() {
+        let call = |id: &str, name: &str, input: Value| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-21T08:10:10Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}
+                ]}
+            })
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-21T08:10:11Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                ]}
+            })
+        };
+        let lines = vec![
+            call("call-c", "TaskCreate", serde_json::json!({"subject": "A", "description": ""})),
+            result("call-c", "Task #1 created successfully: A"),
+            call("call-u", "TaskUpdate", serde_json::json!({"taskId": "1", "status": "completed"})),
+            result("call-u", "Updated task #1 status"),
+            call("call-g", "TaskGet", serde_json::json!({"taskId": "1"})),
+            result("call-g", "Task #1: A\nStatus: completed\nDescription: "),
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value: &Value| extract_claude_line(value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].todos.as_ref().unwrap().items[0].id.as_deref(), Some("1"));
+        assert_eq!(parsed.messages[1].todos.as_ref().unwrap().items[0].status, "complete");
+        assert_eq!(parsed.messages[2].text, "TaskGet");
+        assert!(parsed.messages[2].todos.is_none());
     }
 
     #[test]
