@@ -71,6 +71,9 @@ async function render(engine: "claude" | "grok" = "claude") {
   });
 }
 
+// 每个用例都会 resetModules 后重新导入 i18n / use-cli-scope / CliConfigSection;
+// 这套模块图在本机冷导入约 9-10 秒,贴着默认 10 秒的 hook 超时。只放宽这个
+// 准备步骤的时限,断言与用例内容不变。
 beforeEach(async () => {
   localStorage.clear();
   for (const mock of Object.values(mocks)) mock.mockReset();
@@ -92,7 +95,7 @@ beforeEach(async () => {
   mocks.setWslEnginePath.mockResolvedValue(undefined);
   mocks.wslReprobe.mockResolvedValue([]);
   await boot();
-});
+}, 30_000);
 
 afterEach(async () => {
   await act(async () => root?.unmount());

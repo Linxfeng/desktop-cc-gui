@@ -29,6 +29,8 @@ let store: ScopeModule["cliScopeStore"];
 let container: HTMLDivElement;
 let root: Root | null = null;
 
+// 同 CliConfigSection.test.tsx:resetModules 后的冷导入在慢机器上会超过默认
+// 10 秒的 hook 超时,只放宽准备步骤的时限。
 beforeEach(async () => {
   localStorage.clear();
   for (const mock of Object.values(mocks)) mock.mockReset();
@@ -47,7 +49,7 @@ beforeEach(async () => {
   await import("@/lib/i18n");
   store = (await import("./use-cli-scope")).cliScopeStore;
   CliHeaderActions = (await import("./CliHeaderActions")).CliHeaderActions;
-});
+}, 30_000);
 
 afterEach(async () => {
   await act(async () => root?.unmount());
