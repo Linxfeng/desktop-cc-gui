@@ -14,6 +14,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Listener, Manager};
 
+/// 本地 origin:macOS / Linux 是 `tauri://localhost`,Windows 是
+/// `http://tauri.localhost`。写死前一种,Windows 上会被当成非本地请求,
+/// Tauri 的 ACL 检查直接拒绝(app 没有对应的 capability)。
+/// 与 `src-tauri/src/engine/mod.rs` 里 list_engines 的同类用例一致。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn local_origin() -> tauri::Url {
+    if cfg!(windows) {
+        "http://tauri.localhost".parse().unwrap()
+    } else {
+        "tauri://localhost".parse().unwrap()
+    }
+}
+
 fn temp_home(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "ccgui-terminal-test-{}-{}",
@@ -82,7 +95,7 @@ fn invoke(
             cmd: cmd.into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "tauri://localhost".parse().unwrap(),
+            url: local_origin(),
             body: tauri::ipc::InvokeBody::Json(body),
             headers: Default::default(),
             invoke_key: tauri::test::INVOKE_KEY.to_string(),

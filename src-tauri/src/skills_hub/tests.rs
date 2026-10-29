@@ -305,8 +305,11 @@ fn target_skill_path_guards() {
     assert_eq!(target_skill_path(&root, "/etc/x"), None);
     let outside = temp.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
-    symlink_dir(&outside, &root.join("link")).unwrap();
-    assert_eq!(target_skill_path(&root, "link/x"), None);
+    // Windows 未开启开发者模式 / 非管理员时创建目录符号链接会失败
+    // (ERROR_PRIVILEGE_NOT_HELD),那时跳过这一条断言,其余用例照跑。
+    if symlink_dir(&outside, &root.join("link")).is_ok() {
+        assert_eq!(target_skill_path(&root, "link/x"), None);
+    }
     fs::create_dir_all(root.join("group")).unwrap();
     assert!(target_skill_path(&root, "group/x").is_some());
     let file_root = temp.path().join("file-root");
@@ -335,15 +338,18 @@ fn classify_in_dirs_three_states() {
         "synced"
     );
     fs::remove_dir_all(base.join("demo")).unwrap();
-    symlink_dir(
+    // 同 target_skill_path_guards:没有符号链接特权时跳过孤儿链接这一断言。
+    if symlink_dir(
         Path::new("/nonexistent-ccgui-test-target"),
         &base.join("demo"),
     )
-    .unwrap();
-    assert_eq!(
-        classify_in_dirs("demo", std::slice::from_ref(&base)),
-        "orphan"
-    );
+    .is_ok()
+    {
+        assert_eq!(
+            classify_in_dirs("demo", std::slice::from_ref(&base)),
+            "orphan"
+        );
+    }
 }
 
 #[test]
@@ -355,12 +361,15 @@ fn classify_target_skill_with_home_env() {
     fs::create_dir_all(claude_skills.join("demo")).unwrap();
     assert_eq!(classify_target_skill("demo", "claude"), "synced");
     fs::remove_dir_all(claude_skills.join("demo")).unwrap();
-    symlink_dir(
+    // 同 target_skill_path_guards:没有符号链接特权时跳过孤儿链接这一断言。
+    if symlink_dir(
         Path::new("/nonexistent-ccgui-test-target"),
         &claude_skills.join("demo"),
     )
-    .unwrap();
-    assert_eq!(classify_target_skill("demo", "claude"), "orphan");
+    .is_ok()
+    {
+        assert_eq!(classify_target_skill("demo", "claude"), "orphan");
+    }
     assert_eq!(classify_target_skill("demo", "bogus-target"), "off");
 }
 

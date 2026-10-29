@@ -1,6 +1,11 @@
 //! End-to-end send-path test: fake `claude` CLI on PATH emitting stream-json
 //! NDJSON, real send_message command, real EventSink, events captured via
 //! listen_global. Verifies the whole chain the UI depends on.
+//!
+//! The fake CLIs are POSIX shell scripts (`#!/bin/sh`), and the fixtures
+//! redirect the app home through `HOME`, so the streaming / interrupt / OMP
+//! cases only run on unix (same convention as `tests/terminal.rs`). The IPC
+//! shape case does not depend on either and runs everywhere.
 
 use ccgui_next_lib::config::ConfigStore;
 use ccgui_next_lib::db::Db;
@@ -10,6 +15,19 @@ use ccgui_next_lib::AppState;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager};
+
+/// 本地 origin:macOS / Linux 是 `tauri://localhost`,Windows 是
+/// `http://tauri.localhost`。写死前一种,Windows 上会被当成非本地请求,
+/// Tauri 的 ACL 检查直接拒绝(app 没有对应的 capability)。
+/// 与 `src-tauri/src/engine/mod.rs` 里 list_engines 的同类用例一致。
+fn local_origin() -> tauri::Url {
+    if cfg!(windows) {
+        "http://tauri.localhost".parse().unwrap()
+    } else {
+        "tauri://localhost".parse().unwrap()
+    }
+}
+
 /// Tests mutate process-global HOME/PATH; serialize them. Holding the std
 /// guard across awaits is intentional here (test serialization, no deadlock:
 /// each test awaits only its own child processes).
@@ -38,6 +56,9 @@ echo '{"type":"result","subtype":"success","session_id":"fake-session-123","usag
     }
 }
 
+// Only the unix-gated streaming / interrupt / OMP cases build an app; keep it
+// compiled everywhere so those cases work if a Windows fixture is added.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn build_app(
     home: &std::path::Path,
 ) -> (tauri::App<tauri::test::MockRuntime>, Arc<Mutex<Vec<Value>>>) {
@@ -85,6 +106,7 @@ fn build_app(
     (app, events)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn send_message_streams_events_end_to_end() {
@@ -186,6 +208,7 @@ async fn send_message_streams_events_end_to_end() {
         .is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn interrupt_kills_running_child() {
@@ -333,7 +356,7 @@ fn ipc_send_message_accepts_camel_case_args() {
             cmd: "send_message".into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "tauri://localhost".parse().unwrap(),
+            url: local_origin(),
             body: tauri::ipc::InvokeBody::Json(serde_json::json!({
                 "engine": "claude",
                 "workspacePath": workspace.to_string_lossy(),
@@ -353,6 +376,7 @@ fn ipc_send_message_accepts_camel_case_args() {
     assert!(!run_id.is_empty(), "expected runId in response: {value}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn omp_send_uses_persisted_tier_and_model_without_touching_cli_config() {
