@@ -1611,7 +1611,8 @@ fn meta_has_wsl_key(meta_json: Option<&str>) -> bool {
 /// 也不能被本机 WSL 后端接管(§10 P1-3)。路径比较按 Windows 语义做
 /// 大小写不敏感与分隔符归一。
 pub fn path_in_meta_wsl_workspace(db: &crate::db::Db, path: &str) -> bool {
-    let conn = db.0.lock();
+    // 只读:文件列表 / 会话列表每次都要问一次,不能排在后台扫描的写锁后面。
+    let conn = db.read();
     let Ok(mut stmt) = conn.prepare("SELECT path, meta FROM workspaces WHERE meta IS NOT NULL")
     else {
         return false;
@@ -1645,6 +1646,34 @@ fn path_is_under(path: &str, root: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 文件列表 / 会话列表每次都要问一次 meta:只读查询不能排在写锁后面。
+    /// 改回 `db.0.lock()` 时 parking_lot 的互斥锁不可重入,本用例会卡死。
+    #[test]
+    fn meta_lookup_does_not_wait_for_the_writer_mutex() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-wsl-meta-lookup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open_at(&dir.join("app.db")).unwrap();
+        let path = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo";
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name, meta) VALUES('w1', ?1, 'repo', ?2)",
+                rusqlite::params![
+                    path,
+                    json!({"wsl": {"host": "10.0.0.2", "user": "dev", "distro": "Ubuntu"}})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+        let _writer_guard = db.0.lock();
+        assert!(path_in_meta_wsl_workspace(&db, &format!("{path}\\src")));
+        drop(_writer_guard);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tp() -> WslTransport {
         WslTransport {

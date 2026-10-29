@@ -385,7 +385,9 @@ pub fn needs_head(
 
 /// 同一发行版内所有本机 WSL 工作区的 Linux 路径(用于最长前缀归属)。
 fn sibling_linux_workspaces(db: &crate::db::Db, distro: &str) -> Vec<String> {
-    let conn = db.0.lock();
+    // 只读:走读连接,后台扫描持写锁时会话列表不排队(与 history::reader
+    // 的 query_rows 同一约定)。
+    let conn = db.read();
     let Ok(mut stmt) = conn.prepare("SELECT path FROM workspaces") else {
         return Vec::new();
     };
@@ -469,7 +471,7 @@ fn load_db_cache(
     db: &crate::db::Db,
     distro: &str,
 ) -> HashMap<String, (i64, f64, String, String)> {
-    let conn = db.0.lock();
+    let conn = db.read();
     let Ok(mut stmt) = conn.prepare(
         "SELECT remote_path, size, mtime, title, owning_cwd FROM wsl_session_cache WHERE distro=?1",
     ) else {
@@ -690,6 +692,35 @@ const HEAD_BYTES: usize = 16 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只读查询不能排在写锁后面:后台扫描 / 索引事务持写锁时,WSL 会话列表
+    /// 仍要立刻拿到工作区列表与缓存。改回 `db.0.lock()` 时会卡死(同一线程
+    /// 再次加锁,parking_lot 互斥锁不可重入)。
+    #[test]
+    fn workspace_reads_do_not_wait_for_the_writer_mutex() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-wsl-sessions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open_at(&dir.join("app.db")).unwrap();
+        let path = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo";
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'repo')",
+                rusqlite::params![path],
+            )
+            .unwrap();
+        let _writer_guard = db.0.lock();
+        assert_eq!(
+            sibling_linux_workspaces(&db, "ubuntu-24.04"),
+            vec!["/home/me/repo".to_string()]
+        );
+        assert!(load_db_cache(&db, "Ubuntu-24.04").is_empty());
+        drop(_writer_guard);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_find_output_and_rejects_malformed_lines() {
