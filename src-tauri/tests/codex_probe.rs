@@ -1,8 +1,10 @@
 //! Codex adapter probe: drives the REAL send_message + run_reader pipeline
 //! (tokio select + 500ms usage-tail poll) against a fake `codex` CLI that
-//! mimics `codex exec --json` output, to check the turn always settles with a
-//! `done` event - including when the final agent_message is a very long line
-//! that spans multiple pipe reads (the select tick can land mid-line).
+//! speaks the app-server JSON-RPC handshake (`initialize` -> `thread/start` ->
+//! `turn/start` -> notifications), which is the transport the codex adapter
+//! actually uses. Checks the turn always settles with a `done` event -
+//! including when the final agent_message is a very long line that spans
+//! multiple pipe reads (the select tick can land mid-line).
 //!
 //! The fake CLI is placed in `%APPDATA%\npm`, the FIRST extra search path
 //! `resolve::find_cli_binary` probes on Windows (before PATH), so the real
@@ -62,60 +64,123 @@ fn redirect_env(home: &std::path::Path) {
     ccgui_next_lib::engine::resolve::clear_search_paths_cache();
 }
 
-/// Fake codex CLI: `%APPDATA%\npm\codex.cmd` running a Node script that reads
-/// the prompt from stdin and emits codex-exec-style NDJSON, then exits.
+/// Fake codex CLI: `%APPDATA%\npm\codex.cmd` running a Node script that
+/// answers the app-server JSON-RPC handshake and then streams the turn.
+/// The scenario comes from `CODEX_PROBE_SCENARIO`:
+/// - `normal` / `long`: `initialize` -> `thread/start` -> `turn/start`, then
+///   one `item/completed` (agentMessage) and `turn/completed`. In `long` the
+///   notification line is ~400KB written in small chunks with delays, so the
+///   reader's 500ms poll tick lands mid-line.
+/// - `early-error`: the thread request is answered by a `turn/failed`
+///   notification carrying the error and no thread id, so the run keeps the
+///   client's own run id and never gets a session id.
 fn write_fake_codex(home: &std::path::Path) {
     let bin_dir = home.join("appdata").join("npm");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let cmd = bin_dir.join("codex.cmd");
     std::fs::write(&cmd, "@echo off\r\nnode \"%~dp0fake-codex.js\" %*\r\n").unwrap();
     let js = bin_dir.join("fake-codex.js");
-    // Scenario via env: the test process sets it per run. The script reads
-    // all of stdin (prompt), then writes the NDJSON events. In the "long"
-    // scenario the final agent_message is ~400KB written in small chunks
-    // with delays, so the reader's 500ms poll tick lands mid-line.
     std::fs::write(
         &js,
         r#"const process = require("process");
-let prompt = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (c) => (prompt += c));
-process.stdin.on("end", () => {
-  const scenario = process.env.CODEX_PROBE_SCENARIO || "normal";
-  const out = (s) => process.stdout.write(s + "\n");
-  if (scenario === "early-error") {
-    out(JSON.stringify({ type: "turn.failed", error: { message: "failed before thread started" } }));
-    return;
-  }
-  out(JSON.stringify({ type: "thread.started", thread_id: "thread-probe-1" }));
-  if (scenario === "long") {
-    // A very long agent_message line, delivered in chunks with pauses so a
-    // 500ms poll tick lands mid-line.
-    const body = "LONG-ANSWER-START|" + "x".repeat(400 * 1024) + "|LONG-ANSWER-END";
-    const payload = JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: body } });
-    let i = 0;
-    const step = 8192;
-    const finish = () => {
-      out(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 2 } }));
-      setTimeout(() => process.exit(0), 50);
-    };
-    const writeNext = () => {
-      if (i < payload.length) {
-        const chunk = payload.slice(i, i + step);
-        i += step;
-        process.stdout.write(chunk);
-        setTimeout(writeNext, 8);
-      } else {
-        out("");
-        finish();
-      }
-    };
-    writeNext();
-    return;
-  }
-  out(JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: "hello from fake codex" } }));
-  out(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 2 } }));
+const scenario = process.env.CODEX_PROBE_SCENARIO || "normal";
+const THREAD_ID = "thread-probe-1";
+let buffered = "";
+
+// App-server framing: one JSON-RPC object per line on stdout.
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
+const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+
+const finishTurn = () => {
+  notify("turn/completed", {
+    threadId: THREAD_ID,
+    turn: { id: "turn-probe-1", status: "completed" },
+  });
   setTimeout(() => process.exit(0), 50);
+};
+
+const emitAgentMessage = (text) => {
+  notify("item/completed", {
+    threadId: THREAD_ID,
+    item: { id: "item_1", type: "agentMessage", text },
+  });
+};
+
+const streamLongMessage = () => {
+  const body = "LONG-ANSWER-START|" + "x".repeat(400 * 1024) + "|LONG-ANSWER-END";
+  const line = JSON.stringify({
+    jsonrpc: "2.0",
+    method: "item/completed",
+    params: {
+      threadId: THREAD_ID,
+      item: { id: "item_1", type: "agentMessage", text: body },
+    },
+  });
+  const step = 8192;
+  let offset = 0;
+  const writeNext = () => {
+    if (offset < line.length) {
+      process.stdout.write(line.slice(offset, offset + step));
+      offset += step;
+      setTimeout(writeNext, 8);
+    } else {
+      process.stdout.write("\n");
+      finishTurn();
+    }
+  };
+  writeNext();
+};
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffered += chunk;
+  let newline;
+  while ((newline = buffered.indexOf("\n")) >= 0) {
+    const line = buffered.slice(0, newline).trim();
+    buffered = buffered.slice(newline + 1);
+    if (!line) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const { method, id } = message;
+    if (method === "initialize") {
+      reply(id, { userAgent: "codex-cli/0.154.0" });
+      continue;
+    }
+    if (method === "thread/start" || method === "thread/resume") {
+      if (scenario === "early-error") {
+        notify("turn/failed", {
+          threadId: null,
+          turn: {
+            id: "turn-probe-1",
+            status: "failed",
+            error: { message: "failed before thread started" },
+          },
+        });
+        setTimeout(() => process.exit(0), 20);
+        return;
+      }
+      reply(id, { thread: { id: THREAD_ID } });
+      continue;
+    }
+    if (method === "turn/start") {
+      reply(id, { turn: { id: "turn-probe-1" } });
+      if (scenario === "long") {
+        streamLongMessage();
+      } else {
+        emitAgentMessage("hello from fake codex");
+        finishTurn();
+      }
+      continue;
+    }
+    // Any other server request (e.g. a config read): answer it so the client
+    // never waits for a reply that would otherwise time out.
+    if (id !== undefined) reply(id, {});
+  }
 });
 "#,
     )
